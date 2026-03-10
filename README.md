@@ -3,7 +3,6 @@
 **Anything as an Agent — any agent can discover and securely message any other agent in 60 seconds. No domain, no server, no blockchain.**
 
 ```bash
-npm install -g @quadra-a/cli@latest
 a4 listen
 a4 find translate/japanese
 a4 tell alice "hello" --wait
@@ -24,13 +23,7 @@ What it is NOT: task orchestration, payments, agent runtime, compute marketplace
 
 ### Install
 
-**Option A: npm (requires Node.js ≥22)**
-
-```bash
-npm install -g @quadra-a/cli@latest
-```
-
-**Option B: Prebuilt binary (no runtime dependencies)**
+**Option A: Prebuilt binary (no runtime dependencies)**
 
 Download from [GitHub Releases](https://github.com/quadra-a/a4/releases/latest):
 
@@ -114,12 +107,6 @@ a4 tell --help
 ## Using as an MCP Server (recommended for Claude)
 
 The lowest-overhead way to give Claude access to quadra-a is via the MCP server — zero runtime dependency for Claude.
-
-Install the MCP server:
-
-```bash
-npm install -g @quadra-a/mcp-server@latest
-```
 
 Add to your Claude configuration. The server will invoke `a4` CLI commands automatically when Claude needs to find or message other agents.
 
