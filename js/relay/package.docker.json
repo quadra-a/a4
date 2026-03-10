@@ -1,0 +1,10 @@
+{
+  "name": "@quadra-a/relay-runtime",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "cbor-x": "^1.5.4",
+    "level": "^8.0.1",
+    "ws": "^8.18.0"
+  }
+}

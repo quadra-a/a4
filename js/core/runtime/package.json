@@ -1,0 +1,47 @@
+{
+  "name": "@quadra-a/runtime",
+  "version": "0.0.1",
+  "description": "Shared local runtime helpers for quadra-a JavaScript services",
+  "type": "module",
+  "keywords": [
+    "runtime",
+    "helpers",
+    "utilities",
+    "agent",
+    "quadra-a"
+  ],
+  "homepage": "https://github.com/quadra-a/a4#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/quadra-a/a4.git",
+    "directory": "js/core/runtime"
+  },
+  "bugs": {
+    "url": "https://github.com/quadra-a/a4/issues"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "clean": "rm -rf dist",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "conf": "^13.0.1",
+    "@quadra-a/protocol": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsup": "^8.3.5",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  },
+  "license": "GPL-3.0"
+}

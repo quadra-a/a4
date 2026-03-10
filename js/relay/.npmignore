@@ -1,0 +1,5 @@
+test-relay-data-*/
+relay-data/
+*.test.ts
+__tests__/
+test/

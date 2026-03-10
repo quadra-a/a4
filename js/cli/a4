@@ -1,0 +1,3 @@
+#!/bin/bash
+# Wrapper script for TypeScript CLI
+exec node "$(dirname "$0")/dist/index.js" "$@"

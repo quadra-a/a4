@@ -1,0 +1,80 @@
+# Dependencies and package managers
+node_modules/
+.pnpm-store/
+.pnpm/
+.yarn/
+.npm/
+.pnpm-debug.log*
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+
+# Build outputs and artifacts
+dist/
+build/
+coverage/
+*.tsbuildinfo
+*.log
+.next/
+.turbo/
+.parcel-cache/
+.cache/
+.temp/
+.tmp/
+
+# Environment and configuration
+.env
+.env.*
+!.env.example
+.envrc
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+*.sublime-*
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+
+# Rust specific
+target/
+Cargo.lock
+**/*.rs.bk
+*.pdb
+
+# Project specific
+relay-data/
+test-relay-data*/
+release-assets/
+*.pid
+*.seed
+*.pid.lock
+
+# Test output directories (centralized)
+test-output/
+
+# Legacy test directories (for cleanup)
+test-results/
+ci-test-results/
+integration-test-results/
+load-test-results/
+stress-test-results/
+master-test-results/
+test-logs/
+validation-results/
+automation-results/
+test-environment/

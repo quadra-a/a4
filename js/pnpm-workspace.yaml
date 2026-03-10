@@ -1,0 +1,6 @@
+packages:
+  - 'core/protocol'
+  - 'core/runtime'
+  - 'cli'
+  - 'mcp-server'
+  - 'relay'

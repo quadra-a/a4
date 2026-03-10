@@ -1,0 +1,48 @@
+{
+  "name": "@quadra-a/mcp-server",
+  "version": "0.0.1",
+  "description": "MCP server for quadra-a",
+  "type": "module",
+  "keywords": [
+    "mcp",
+    "server",
+    "claude",
+    "agent",
+    "integration",
+    "quadra-a"
+  ],
+  "homepage": "https://github.com/quadra-a/a4#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/quadra-a/a4.git",
+    "directory": "js/mcp-server"
+  },
+  "bugs": {
+    "url": "https://github.com/quadra-a/a4/issues"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "quadra-a-mcp-server": "./dist/index.js"
+  },
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@quadra-a/runtime": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsup": "^8.3.5",
+    "typescript": "^5.7.2"
+  },
+  "license": "GPL-3.0"
+}

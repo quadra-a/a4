@@ -1,0 +1,12 @@
+{
+  "name": "@quadra-a/a4-js-workspace",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "pnpm -r --filter ./core/protocol --filter ./core/runtime --filter ./cli --filter ./mcp-server --filter ./relay build",
+    "test": "pnpm -r --if-present --filter ./core/protocol --filter ./core/runtime --filter ./cli --filter ./mcp-server --filter ./relay test",
+    "clean": "pnpm -r --if-present --filter ./core/protocol --filter ./core/runtime --filter ./cli --filter ./mcp-server --filter ./relay clean && rm -rf node_modules"
+  },
+  "license": "GPL-3.0"
+}

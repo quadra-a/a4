@@ -1,0 +1,57 @@
+{
+  "name": "@quadra-a/relay",
+  "version": "0.0.1",
+  "description": "WebSocket relay server for quadra-a",
+  "type": "module",
+  "keywords": [
+    "relay",
+    "websocket",
+    "server",
+    "agent",
+    "networking",
+    "quadra-a"
+  ],
+  "homepage": "https://github.com/quadra-a/a4#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/quadra-a/a4.git",
+    "directory": "js/relay"
+  },
+  "bugs": {
+    "url": "https://github.com/quadra-a/a4/issues"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "quadra-a-relay": "./dist/index.js",
+    "hw1-relay": "./dist/index.js"
+  },
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "vitest",
+    "clean": "rm -rf dist",
+    "start": "node dist/index.js",
+    "smoke:local": "node --experimental-strip-types scripts/smoke-relay.ts"
+  },
+  "dependencies": {
+    "cbor-x": "^1.5.4",
+    "level": "^8.0.1",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/ws": "^8.5.10",
+    "tsup": "^8.3.5",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8",
+    "@quadra-a/protocol": "workspace:*"
+  },
+  "license": "GPL-3.0"
+}

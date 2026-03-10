@@ -1,0 +1,53 @@
+{
+  "name": "@quadra-a/cli",
+  "version": "0.0.1",
+  "description": "CLI tool for quadra-a network",
+  "type": "module",
+  "keywords": [
+    "agent",
+    "ai",
+    "communication",
+    "p2p",
+    "networking",
+    "cli",
+    "quadra-a"
+  ],
+  "homepage": "https://github.com/quadra-a/a4#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/quadra-a/a4.git",
+    "directory": "js/cli"
+  },
+  "bugs": {
+    "url": "https://github.com/quadra-a/a4/issues"
+  },
+  "bin": {
+    "a4": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@quadra-a/protocol": "workspace:*",
+    "@quadra-a/runtime": "workspace:*",
+    "chalk": "^5.3.0",
+    "cli-table3": "^0.6.5",
+    "commander": "^12.1.0",
+    "conf": "^13.0.1",
+    "inquirer": "^13.3.0",
+    "ora": "^8.1.0",
+    "level": "^8.0.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsup": "^8.3.5",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "license": "GPL-3.0"
+}

@@ -1,0 +1,28 @@
+[package]
+name = "quadra-a-cli-rs"
+version = "0.0.1"
+edition = "2021"
+license = "GPL-3.0"
+
+[[bin]]
+name = "a4"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+ed25519-dalek = { version = "2", default-features = false, features = ["rand_core"] }
+rand = "0.8"
+bs58 = "0.5"
+ciborium = "0.2"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.21", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+hex = "0.4"
+dirs = "5"
+uuid = { version = "1", features = ["v4"] }
+chrono = "0.4"
+colored = "2"
+anyhow = "1"
+futures-util = "0.3"
+

@@ -1,0 +1,29 @@
+quadra-a Relay Performance Benchmark Report
+============================================
+Date: 2026年 3月11日 星期三 02时28分15秒 CST
+Relay URL: ws://relay-sg-1.quadra-a.com:8080
+A4 Binary: /Users/hqzhou/Code/workbench/repos/a4/rust/target/release/a4
+Benchmark Session Mode: daemon
+Benchmark Session Note: started temporary background listener
+Timeout Backend: python3
+Test DID: did:a4:z5m2k4p3QiDQbGc9oi4oKvK2gaDCvcxti8E9aRG7mAFJe
+System: Darwin JacobMacBook-Pro.local 25.2.0 Darwin Kernel Version 25.2.0: Tue Nov 18 21:09:40 PST 2025; root:xnu-12377.61.12~1/RELEASE_ARM64_T6000 arm64
+============================================
+
+Notes:
+- Discovery and messaging numbers measure end-to-end CLI wall-clock time.
+- Direct mode includes process startup and relay session setup on each command.
+- Daemon mode reuses a persistent background listener for lower latency.
+
+
+Discovery Performance:
+=====================
+Basic Discovery: 370ms
+WebSocket Query Discovery: 368ms
+Multi-word Query Discovery: 336ms
+Non-existent Query Discovery: 365ms
+Limited Discovery: 363ms
+
+Message Sending Performance:
+===========================
+Basic Message Send: 351ms
