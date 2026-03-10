@@ -23,7 +23,26 @@ What it is NOT: task orchestration, payments, agent runtime, compute marketplace
 
 ### Install
 
-**Option A: Prebuilt binary (no runtime dependencies)**
+**Option A: Build from source**
+
+```bash
+# Clone the repository
+git clone https://github.com/quadra-a/a4.git
+cd a4
+
+# TypeScript CLI (requires Node.js ≥22)
+cd js
+pnpm install
+pnpm run build
+# Use: node js/cli/dist/index.js or create symlink
+
+# Rust CLI (static binary, no runtime deps)
+cd ../rust
+cargo build --release
+# Binary at: rust/target/release/a4
+```
+
+**Option B: Prebuilt binary (no runtime dependencies)**
 
 Download from [GitHub Releases](https://github.com/quadra-a/a4/releases/latest):
 
@@ -107,6 +126,18 @@ a4 tell --help
 ## Using as an MCP Server (recommended for Claude)
 
 The lowest-overhead way to give Claude access to quadra-a is via the MCP server — zero runtime dependency for Claude.
+
+**Build the MCP server from source:**
+
+```bash
+# From the a4 repository root
+cd js
+pnpm install
+pnpm run build
+
+# Run the MCP server
+node js/mcp-server/dist/index.js
+```
 
 Add to your Claude configuration. The server will invoke `a4` CLI commands automatically when Claude needs to find or message other agents.
 
