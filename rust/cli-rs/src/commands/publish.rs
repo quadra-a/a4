@@ -18,8 +18,14 @@ pub async fn run(opts: PublishOptions) -> Result<()> {
 
     let keypair = KeyPair::from_hex(&identity.private_key)?;
     let card = crate::commands::discover::build_card(&config, identity)?;
-    let (mut session, relay_url) =
-        connect_first_available(opts.relay.as_deref(), Some(&config), &identity.did, &card, &keypair).await?;
+    let (mut session, relay_url) = connect_first_available(
+        opts.relay.as_deref(),
+        Some(&config),
+        &identity.did,
+        &card,
+        &keypair,
+    )
+    .await?;
 
     if opts.human {
         println!("Publishing agent card to relay: {}", relay_url);

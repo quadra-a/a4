@@ -3,7 +3,7 @@ use colored::Colorize;
 
 use crate::config::load_config;
 use crate::identity::KeyPair;
-use crate::protocol::{AgentCard, AgentCardUnsigned, Capability};
+use crate::protocol::AgentCard;
 use crate::relay::connect_first_available;
 use crate::ui::LlmFormatter;
 
@@ -27,8 +27,14 @@ pub async fn run(opts: DiscoverOptions) -> Result<()> {
         eprintln!("Connecting to configured relays...");
     }
 
-    let (mut session, relay_url) =
-        connect_first_available(opts.relay.as_deref(), Some(&config), &identity.did, &card, &keypair).await?;
+    let (mut session, relay_url) = connect_first_available(
+        opts.relay.as_deref(),
+        Some(&config),
+        &identity.did,
+        &card,
+        &keypair,
+    )
+    .await?;
 
     if opts.human {
         eprintln!(
@@ -142,60 +148,5 @@ pub fn build_card(
     config: &crate::config::Config,
     identity: &crate::config::IdentityConfig,
 ) -> Result<AgentCard> {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let keypair = KeyPair::from_hex(&identity.private_key)?;
-
-    let (name, description, capabilities) = if let Some(ac) = &config.agent_card {
-        (
-            ac.name.clone(),
-            ac.description.clone(),
-            ac.capabilities
-                .iter()
-                .map(|c| Capability {
-                    id: c.clone(),
-                    name: c.replace('-', " "),
-                    description: c.clone(),
-                    parameters: None,
-                    metadata: None,
-                })
-                .collect::<Vec<_>>(),
-        )
-    } else {
-        ("Unknown Agent".to_string(), "".to_string(), vec![])
-    };
-
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-
-    let card_unsigned = AgentCardUnsigned {
-        did: identity.did.clone(),
-        name,
-        description,
-        version: "1.0.0".to_string(),
-        capabilities,
-        endpoints: vec![],
-        peer_id: None,
-        trust: None,
-        metadata: None,
-        timestamp,
-    };
-
-    let signature = AgentCard::sign(&card_unsigned, &keypair);
-
-    Ok(AgentCard {
-        did: card_unsigned.did,
-        name: card_unsigned.name,
-        description: card_unsigned.description,
-        version: card_unsigned.version,
-        capabilities: card_unsigned.capabilities,
-        endpoints: card_unsigned.endpoints,
-        peer_id: card_unsigned.peer_id,
-        trust: card_unsigned.trust,
-        metadata: card_unsigned.metadata,
-        timestamp: card_unsigned.timestamp,
-        signature,
-    })
+    quadra_a_runtime::card::build_agent_card_from_config(config, identity)
 }

@@ -4,10 +4,19 @@ This directory contains comprehensive testing scripts for the quadra-a relay imp
 
 ## Test Scripts Overview
 
+### 🔐 Planned E2E Encryption Assets
+- **`e2e/README.md`** - Contract for the future E2E harness surface and artifacts
+- **`e2e/TEST_MATRIX.yaml`** - Shared JS/Rust/relay/real-machine scenario catalog
+- **`e2e/REAL_MACHINE_FULL_CHAIN_TEST.md`** - Full live-environment chain validation plan
+- **`e2e/vectors/README.md`** - Shared vector fixture contract
+- **`e2e/vectors/schema.json`** - Schema for fixture manifests
+
 ### 🚀 Quick Tests
 - **`test-relay-quick.sh`** - Essential functionality validation (5 tests per CLI, ~30 seconds)
+- **`test-quick-agent-groups.sh`** - Overlay smoke test for Quick Agent Groups on a local public relay
+- **`test-relay-deployment.sh`** - Real local deployment validation for startup, federation admission, and quarantine behavior
 - **`run-core-tests.sh`** - Core test suite (quick, comprehensive, benchmark, load tests)
-- **`run-all-tests.sh`** - Complete test suite with ALL 8 test categories
+- **`run-all-tests.sh`** - Complete test suite, including local deployment validation when supported
 - **`test-dual-cli.sh`** - Side-by-side compatibility testing between CLIs (removed)
 
 ### 🔍 Comprehensive Tests
@@ -44,6 +53,9 @@ All test scripts now support both implementations:
 # Test basic relay functionality with both CLIs
 ./test-relay-quick.sh
 
+# Validate Quick Agent Groups overlay behavior on a local public relay
+./test-quick-agent-groups.sh
+
 # With custom relay URL
 ./test-relay-quick.sh ws://your-relay.com:8080
 
@@ -53,7 +65,7 @@ All test scripts now support both implementations:
 
 ### Comprehensive Testing
 ```bash
-# Full test suite for all 8 test categories (recommended)
+# Full test suite, including system-level deployment validation when supported (recommended)
 ./run-all-tests.sh
 
 # Core tests only (quick, comprehensive, benchmark, load)
@@ -66,16 +78,32 @@ All test scripts now support both implementations:
 ./run-all-tests.sh node
 ```
 
+### JavaScript Workspace Validation
+```bash
+# Run the non-watch JS package suite with per-step logs
+./run-js-workspace-tests.sh
+
+# Stop on the first failure
+./run-js-workspace-tests.sh --fail-fast
+```
+
+When local socket binds are blocked by the environment, the runner skips `relay tests` outside CI and still records the skip in the summary.
+
 ### Dual CLI Compatibility
 ```bash
 # Cross-CLI compatibility is now integrated into run-all-tests.sh
 ./run-all-tests.sh both
+
+# Force the full suite to include local deployment validation
+DEPLOYMENT_TEST_MODE=always ./run-all-tests.sh both
 
 # Generates compatibility matrix showing:
 # - Command output comparison across CLIs
 # - Feature parity verification
 # - Performance differences between implementations
 ```
+
+`run-all-tests.sh` now includes `test-relay-deployment.sh` as a system-level stage. By default, `DEPLOYMENT_TEST_MODE=auto` runs it when local port binds are available and skips it otherwise. Use `DEPLOYMENT_TEST_MODE=never` to disable it explicitly.
 
 ### Performance Testing
 ```bash
@@ -84,6 +112,40 @@ All test scripts now support both implementations:
 
 # Load testing with CLI selection
 ./load-test-relay.sh ws://relay-sg-1.quadra-a.com:8080 both 120
+```
+
+### Deployment Validation
+```bash
+# Build js/relay and run smoke + federation + quarantine deployment checks
+./test-relay-deployment.sh
+
+# Reuse current dist/ and run only the two-relay federation check
+./test-relay-deployment.sh federation --skip-build --base-port 9500
+```
+
+### Quick Agent Groups Overlay Validation
+```bash
+# Build protocol/runtime/relay dist and validate overlay discovery + messaging filters
+./test-quick-agent-groups.sh
+
+# Reuse current dist/ and emit JSON only
+./test-quick-agent-groups.sh --skip-build --json
+```
+
+- `test-quick-agent-groups.sh` validates the client-side Quick Agent Groups overlay described alongside CVP-0015.
+- It runs on a normal public relay and checks joined-member discovery, joined-member delivery, and non-member message filtering.
+
+### Deployment Harness Components
+- `test-relay-deployment.sh` orchestrates local relay startup, teardown, and scenario selection.
+- `lib/relay-deployment.sh` provides reusable logging, process cleanup, log-waiting, and JSON summary helpers.
+- `tools/relay-deployment-probe.mjs` provides reusable `federation`, `quarantine`, and `summary` probes for local relay deployments.
+
+```bash
+# Run the reusable federation probe directly against two live relays
+node --experimental-strip-types ./tools/relay-deployment-probe.mjs federation \
+  --relay-dir ../js/relay \
+  --endpoint-a ws://127.0.0.1:9500 \
+  --endpoint-b ws://127.0.0.1:9501
 ```
 
 ## CLI Detection & Auto-Configuration

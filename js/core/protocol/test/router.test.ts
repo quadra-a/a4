@@ -107,6 +107,43 @@ describe('Message Router', () => {
       expect(handler).toHaveBeenCalledWith(expect.objectContaining({ type: 'message' }));
     });
 
+    it('drops envelopes rejected by the acceptance hook', async () => {
+      const keyPair = await generateKeyPair();
+      const did = deriveDID(keyPair.publicKey);
+
+      const envelope = createEnvelope(
+        did,
+        did,
+        'message',
+        '/agent/msg/1.0.0',
+        { text: 'group-only' },
+        undefined,
+        undefined,
+        'grp_blocked',
+      );
+      const signed = await signEnvelope(envelope, (data) => sign(data, keyPair.privateKey));
+      const encoded = encodeMessage(signed);
+
+      const relayClient = makeMockRelayClient();
+      const router = createMessageRouter(relayClient, async () => true, {
+        acceptEnvelope: (incoming) => incoming.groupId !== 'grp_blocked',
+      });
+      await router.start();
+
+      const handler = vi.fn(async () => undefined);
+      router.registerHandler('/agent/msg/1.0.0', handler);
+
+      await relayClient._triggerDeliver({
+        type: 'DELIVER',
+        messageId: 'test-msg-group-blocked',
+        from: did,
+        envelope: encoded,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      expect(handler).not.toHaveBeenCalled();
+    });
+
     it('falls back to the catch-all handler for unregistered protocols', async () => {
       const keyPair = await generateKeyPair();
       const did = deriveDID(keyPair.publicKey);

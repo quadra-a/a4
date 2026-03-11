@@ -236,6 +236,9 @@ run_tests_for_cli() {
     for i in {1..5}; do
         bash -lc "\"$cli_cmd\" tell '$TEST_DID' 'Concurrent test $i from $cli_name' --relay \"$RELAY_URL\"" >/dev/null 2>&1 &
         pids+=("$!")
+
+        # Add small stagger to prevent connection burst
+        sleep 0.02  # 20ms stagger
     done
     for pid in "${pids[@]}"; do
         wait "$pid"

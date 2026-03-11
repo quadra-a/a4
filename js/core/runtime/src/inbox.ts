@@ -1,3 +1,4 @@
+import { compareMessagesBySortTimestamp } from '@quadra-a/protocol';
 import type { MessageFilter, MessagePage, StoredMessage } from '@quadra-a/protocol';
 import { DaemonClient, DaemonSubscriptionClient } from './daemon-client.js';
 
@@ -25,12 +26,8 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function timestampOf(message: StoredMessage): number {
-  return message.receivedAt ?? message.sentAt ?? message.envelope.timestamp ?? 0;
-}
-
 function sortMessagesByTimestamp(messages: StoredMessage[]): StoredMessage[] {
-  return [...messages].sort((left, right) => timestampOf(left) - timestampOf(right));
+  return [...messages].sort(compareMessagesBySortTimestamp);
 }
 
 function getPayloadRecord(payload: unknown): Record<string, unknown> | null {

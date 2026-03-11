@@ -14,6 +14,7 @@ import {
   createTrustSystem,
   createAgentCard,
   signAgentCard,
+  getMessageSortTimestamp,
   MessageQueue,
   DefenseMiddleware,
   type RelayClient,
@@ -893,7 +894,7 @@ export class ClawDaemon {
       const current = messages.messages[i];
       const next = messages.messages[i + 1];
       if (current.direction === 'inbound' && next.direction === 'outbound') {
-        const responseTime = (next.sentAt || next.envelope.timestamp) - (current.receivedAt || current.envelope.timestamp);
+        const responseTime = getMessageSortTimestamp(next) - getMessageSortTimestamp(current);
         totalResponseTime += responseTime;
         responseCount++;
       }
@@ -928,7 +929,7 @@ export class ClawDaemon {
     md += `---\n\n`;
 
     for (const msg of messages) {
-      const timestamp = new Date(msg.receivedAt || msg.sentAt || msg.envelope.timestamp).toISOString();
+      const timestamp = new Date(getMessageSortTimestamp(msg)).toISOString();
       const from = msg.direction === 'outbound' ? 'You' : msg.envelope.from;
       const payload = msg.envelope.payload as Record<string, unknown>;
       const text = payload?.text || payload?.message || JSON.stringify(payload);
@@ -955,7 +956,7 @@ export class ClawDaemon {
     txt += `--------------------------------------------------\n\n`;
 
     for (const msg of messages) {
-      const timestamp = new Date(msg.receivedAt || msg.sentAt || msg.envelope.timestamp).toISOString();
+      const timestamp = new Date(getMessageSortTimestamp(msg)).toISOString();
       const from = msg.direction === 'outbound' ? 'You' : msg.envelope.from;
       const payload = msg.envelope.payload as Record<string, unknown>;
       const text = payload?.text || payload?.message || JSON.stringify(payload);

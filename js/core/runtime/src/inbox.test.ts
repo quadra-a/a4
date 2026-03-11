@@ -71,4 +71,30 @@ describe('findMessageOutcome', () => {
     expect(outcome?.terminal).toBe(true);
     expect(outcome?.message.envelope.id).toBe('msg-success');
   });
+
+  it('uses message timestamp ordering when arrivals are out of order', () => {
+    const running = makeMessage({
+      receivedAt: 2,
+      envelope: {
+        id: 'msg-running',
+        timestamp: 100,
+        replyTo: 'msg-origin',
+        payload: { status: 'running', jobId: 'job-1' },
+      } as StoredMessage['envelope'],
+    });
+    const success = makeMessage({
+      receivedAt: 1,
+      envelope: {
+        id: 'msg-success',
+        timestamp: 200,
+        payload: { status: 'success', jobId: 'job-1', tflops: 0.17 },
+      } as StoredMessage['envelope'],
+    });
+
+    const outcome = findMessageOutcome([success, running], 'msg-origin');
+
+    expect(outcome).not.toBeNull();
+    expect(outcome?.status).toBe('success');
+    expect(outcome?.message.envelope.id).toBe('msg-success');
+  });
 });

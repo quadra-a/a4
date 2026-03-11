@@ -54,13 +54,13 @@ export function handleConnection(
               return;
             }
 
-            const result = await runtime.federationManager.acceptIncomingRelay(ws, msg as FederationHelloMessage);
+            const result = await runtime.federationManager.acceptIncomingRelay(ws, msg as FederationHelloMessage, connectionContext);
             if (result.ok) {
               authenticated = true;
               connectionMode = 'federation';
               federationRelayDid = result.relayDid ?? msg.relayDid;
             } else {
-              ws.close(1008, result.error ?? 'Invalid federation hello');
+              ws.close(result.closeCode ?? 1008, result.error ?? 'Invalid federation hello');
             }
           } else {
             ws.close(1008, 'Must send HELLO first');

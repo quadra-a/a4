@@ -3,6 +3,13 @@ import { WebSocket } from 'ws';
 import { decode as decodeCBOR } from 'cbor-x';
 import { FederationManager } from '../federation-manager.js';
 
+const REQUIRED_RELAY_CAPABILITIES = [
+  'relay/message-routing',
+  'relay/discovery',
+  'relay/health-check',
+  'relay/federation',
+];
+
 function createCard(did: string, metadata: Record<string, unknown> = {}) {
   return {
     did,
@@ -17,13 +24,22 @@ function createCard(did: string, metadata: Record<string, unknown> = {}) {
   };
 }
 
-function createFakeWs() {
+function createRelayCard(did: string, metadata: Record<string, unknown> = {}) {
+  return {
+    ...createCard(did, metadata),
+    capabilities: REQUIRED_RELAY_CAPABILITIES.map((id) => ({ id, name: id, description: id })),
+  };
+}
+
+function createFakeWs(onSend?: (message: any) => void) {
   const sent: any[] = [];
   return {
     sent,
     readyState: WebSocket.OPEN,
     send(payload: Buffer) {
-      sent.push(decodeCBOR(payload));
+      const message = decodeCBOR(payload);
+      sent.push(message);
+      onSend?.(message);
     },
     close() {},
     on() {},
@@ -379,5 +395,165 @@ describe('FederationManager export policy', () => {
 
     expect(connectSpy).toHaveBeenCalledTimes(2);
     expect((manager as any).federatedRelays.has(relayDid)).toBe(false);
+  });
+
+  it('rejects discovered relays that do not satisfy federation eligibility', async () => {
+    const manager = createManager();
+    const openSpy = vi.spyOn(manager as any, 'openFederationConnection').mockResolvedValue(true);
+
+    const connected = await (manager as any).connectToRelay('did:agent:relay-peer', createCard('did:agent:relay-peer'));
+
+    expect(connected).toBe(false);
+    expect(openSpy).not.toHaveBeenCalled();
+  });
+
+  it('rate limits inbound federation handshakes before verification work', () => {
+    const manager = createManager({ handshakeRateLimitWindowMs: 60000, handshakeRateLimitMaxAttempts: 2 });
+    const context = { remoteIp: '203.0.113.10', userAgent: 'RelayProbe/1.0' };
+
+    expect((manager as any).guardIncomingFederationHandshake(context, 'did:agent:relay-peer')).toEqual({ ok: true });
+    expect((manager as any).guardIncomingFederationHandshake(context, 'did:agent:relay-peer')).toEqual({ ok: true });
+    expect((manager as any).guardIncomingFederationHandshake(context, 'did:agent:relay-peer')).toEqual({
+      ok: false,
+      error: 'Federation handshake rate limit exceeded',
+      closeCode: 1013,
+    });
+  });
+
+  it('quarantines repeated failed inbound federation attempts', () => {
+    const manager = createManager({ failedHandshakeWindowMs: 60000, failedHandshakeThreshold: 2, failedHandshakeQuarantineMs: 300000 });
+    const context = { remoteIp: '203.0.113.11', userAgent: 'RelayProbe/1.0' };
+    const relayDid = 'did:agent:relay-peer';
+
+    (manager as any).recordIncomingFederationFailure(relayDid, context.remoteIp, 'Invalid federation hello signature');
+    expect((manager as any).guardIncomingFederationHandshake(context, relayDid)).toEqual({ ok: true });
+
+    (manager as any).recordIncomingFederationFailure(relayDid, context.remoteIp, 'Invalid federation hello signature');
+    expect((manager as any).guardIncomingFederationHandshake(context, relayDid)).toEqual({
+      ok: false,
+      error: 'Federation handshake temporarily quarantined',
+      closeCode: 1013,
+    });
+  });
+
+  it('ignores remote agent updates from relays that are still in probation', async () => {
+    const manager = createManager({ exportPolicy: 'full' });
+    const relayWs = createFakeWs();
+
+    (manager as any).federatedRelays.set('did:agent:relay-b', {
+      did: 'did:agent:relay-b',
+      endpoints: ['ws://relay-b.test'],
+      ws: relayWs,
+      connected: true,
+      admissionState: 'probation',
+      admittedByPeer: false,
+      lastSeen: Date.now(),
+      agentCount: 0,
+      uptime: 0,
+    });
+
+    await manager.handleIncomingMessage(relayWs as any, 'did:agent:relay-b', {
+      type: 'AGENT_JOINED',
+      agentDid: 'did:agent:gpu-remote',
+      agentCard: createCard('did:agent:gpu-remote', { visibility: 'public' }),
+      realm: 'public',
+      timestamp: Date.now(),
+    } as any);
+
+    expect(manager.listRemoteDirectoryEntries()).toEqual([]);
+  });
+
+  it('promotes a relay to admitted only after health and card probes succeed', async () => {
+    const relayDid = 'did:agent:relay-peer';
+    const relayCard = createRelayCard(relayDid);
+    const manager = createManager({ exportPolicy: 'full' });
+    const verifySpy = vi.spyOn(manager as any, 'verifyRelayCard').mockResolvedValue(true);
+
+    const relayWs = createFakeWs((message) => {
+      if (message.type === 'FEDERATION_HEALTH_CHECK') {
+        queueMicrotask(() => {
+          void manager.handleIncomingMessage(relayWs as any, relayDid, {
+            type: 'FEDERATION_HEALTH_RESPONSE',
+            uptime: 100,
+            connectedAgents: 2,
+            queuedMessages: 0,
+            timestamp: Date.now(),
+          } as any);
+        });
+      }
+
+      if (message.type === 'FETCH_CARD') {
+        queueMicrotask(() => {
+          void manager.handleIncomingMessage(relayWs as any, relayDid, {
+            type: 'CARD',
+            did: relayDid,
+            card: relayCard,
+          } as any);
+        });
+      }
+    });
+
+    (manager as any).federatedRelays.set(relayDid, {
+      did: relayDid,
+      endpoints: ['ws://relay-peer.test'],
+      card: relayCard,
+      ws: relayWs,
+      connected: true,
+      admissionState: 'authenticated',
+      admittedByPeer: false,
+      lastSeen: Date.now(),
+      agentCount: 0,
+      uptime: 0,
+      pendingPeerDids: [],
+      admissionError: null,
+    });
+
+    const admitted = await (manager as any).beginAdmission(relayDid);
+    const relay = (manager as any).federatedRelays.get(relayDid);
+
+    expect(admitted).toBe(true);
+    expect(relay.admissionState).toBe('admitted');
+    expect(relay.admissionError).toBeNull();
+    expect(relayWs.sent).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'FEDERATION_HEALTH_CHECK' }),
+      expect.objectContaining({ type: 'FETCH_CARD', did: relayDid }),
+      expect.objectContaining({ type: 'FEDERATION_ADMITTED', relayDid: 'did:agent:relay-local' }),
+    ]));
+
+    verifySpy.mockRestore();
+  });
+
+  it('waits for peer admission before broadcasting local federation updates', async () => {
+    const manager = createManager({ exportPolicy: 'full' });
+    const relayWs = createFakeWs();
+
+    (manager as any).federatedRelays.set('did:agent:relay-peer', {
+      did: 'did:agent:relay-peer',
+      endpoints: ['ws://relay-peer.test'],
+      card: createRelayCard('did:agent:relay-peer'),
+      ws: relayWs,
+      connected: true,
+      admissionState: 'admitted',
+      admittedByPeer: false,
+      lastSeen: Date.now(),
+      agentCount: 0,
+      uptime: 0,
+      pendingPeerDids: [],
+    });
+
+    manager.notifyAgentJoined('did:agent:before-active', createCard('did:agent:before-active'), 'public');
+    expect(relayWs.sent).toHaveLength(0);
+
+    await manager.handleIncomingMessage(relayWs as any, 'did:agent:relay-peer', {
+      type: 'FEDERATION_ADMITTED',
+      relayDid: 'did:agent:relay-peer',
+      protocolVersion: 1,
+      timestamp: Date.now(),
+    } as any);
+
+    manager.notifyAgentJoined('did:agent:after-active', createCard('did:agent:after-active'), 'public');
+
+    expect(relayWs.sent).toHaveLength(1);
+    expect(relayWs.sent[0]).toMatchObject({ type: 'AGENT_JOINED', agentDid: 'did:agent:after-active' });
   });
 });

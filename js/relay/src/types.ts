@@ -38,6 +38,7 @@ export type RelayMessageType =
   | 'UNPUBLISH_CARD'
   | 'FEDERATION_HELLO'
   | 'FEDERATION_WELCOME'
+  | 'FEDERATION_ADMITTED'
   | 'AGENT_JOINED'
   | 'AGENT_LEFT'
   | 'ROUTE_REQUEST'
@@ -266,6 +267,13 @@ export interface FederationWelcomeMessage {
   endpoints?: string[];
 }
 
+export interface FederationAdmittedMessage {
+  type: 'FEDERATION_ADMITTED';
+  relayDid: string;
+  protocolVersion: number;
+  timestamp: number;
+}
+
 export interface AgentJoinedMessage {
   type: 'AGENT_JOINED';
   agentDid: string;
@@ -336,6 +344,7 @@ export type RelayMessage =
   | UnpublishCardMessage
   | FederationHelloMessage
   | FederationWelcomeMessage
+  | FederationAdmittedMessage
   | AgentJoinedMessage
   | AgentLeftMessage
   | RouteRequestMessage

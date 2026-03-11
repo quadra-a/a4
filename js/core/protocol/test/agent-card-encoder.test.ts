@@ -74,7 +74,7 @@ describe('Agent Card Encoder', () => {
 
       expect(typeof encoded).toBe('string');
       expect(encoded).toContain('@context');
-      expect(encoded).toContain('did:clawiverse');
+      expect(encoded).toContain(sampleCard.did);
     });
 
     it('should decode JSON-LD back to Agent Card', () => {

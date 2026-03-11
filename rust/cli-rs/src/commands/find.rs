@@ -1,9 +1,9 @@
-use anyhow::Result;
 use crate::config::load_config;
 use crate::identity::KeyPair;
 use crate::protocol::AgentCard;
 use crate::relay::{connect_first_available, parse_discovered_agent_card, RelaySession};
 use crate::ui::LlmFormatter;
+use anyhow::Result;
 
 fn matches_capability(agent: &AgentCard, capability: &str) -> bool {
     let normalized = capability.trim().to_lowercase();
@@ -41,8 +41,14 @@ pub async fn run(opts: FindOptions) -> Result<()> {
         println!("Finding agents across configured relays...");
     }
 
-    let (mut session, relay_url) =
-        connect_first_available(opts.relay.as_deref(), Some(&config), &identity.did, &card, &keypair).await?;
+    let (mut session, relay_url) = connect_first_available(
+        opts.relay.as_deref(),
+        Some(&config),
+        &identity.did,
+        &card,
+        &keypair,
+    )
+    .await?;
 
     if opts.human {
         println!("Using relay {}", relay_url);
@@ -325,7 +331,8 @@ mod tests {
             }
         });
 
-        let parsed = parse_discovered_agent_card(value).expect("wrapped discovery result should parse");
+        let parsed =
+            parse_discovered_agent_card(value).expect("wrapped discovery result should parse");
         assert_eq!(parsed.did, "did:agent:test");
         assert_eq!(parsed.name, "Relay Agent");
         assert_eq!(parsed.capabilities.len(), 1);

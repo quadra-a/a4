@@ -12,11 +12,15 @@ import { WebSocket } from 'ws';
 import { encode as encodeCBOR, decode as decodeCBOR } from 'cbor-x';
 import type { RelayIdentity } from './relay-identity.js';
 import type { AgentRegistry, DirectoryAgentEntry } from './registry.js';
+import type { ConnectionContext } from './relay-agent-types.js';
 import type {
+  CardMessage,
   FederationHelloMessage,
+  FederationAdmittedMessage,
   FederationWelcomeMessage,
   AgentJoinedMessage,
   AgentLeftMessage,
+  FetchCardMessage,
   RouteRequestMessage,
   RouteResponseMessage,
   FederationHealthCheckMessage,
@@ -25,18 +29,83 @@ import type {
   AgentCard,
 } from './types.js';
 
+export type FederationAdmissionState = 'connecting' | 'authenticated' | 'probation' | 'admitted';
+
+interface PendingPeerProbe<T> {
+  resolve: (value: T) => void;
+  reject: (error: Error) => void;
+  timeout: NodeJS.Timeout;
+}
+
+interface RelayEligibilityResult {
+  ok: boolean;
+  endpoints: string[];
+  error?: string;
+}
+
+interface SlidingWindowCounter {
+  count: number;
+  windowStart: number;
+}
+
+interface FederationAdmissionGuardResult {
+  ok: boolean;
+  error?: string;
+  closeCode?: number;
+}
+
+const REQUIRED_RELAY_CAPABILITIES = [
+  'relay/message-routing',
+  'relay/discovery',
+  'relay/health-check',
+  'relay/federation',
+] as const;
+
+const PROBATIONARY_MESSAGE_TYPES = new Set<string>([
+  'FEDERATION_WELCOME',
+  'FEDERATION_ADMITTED',
+  'FEDERATION_HEALTH_CHECK',
+  'FEDERATION_HEALTH_RESPONSE',
+  'FETCH_CARD',
+  'CARD',
+]);
+
+function isWebSocketEndpoint(endpoint: string): boolean {
+  return endpoint.startsWith('ws://') || endpoint.startsWith('wss://');
+}
+
+function normalizeRelayEndpoints(endpoints: string[]): string[] {
+  return Array.from(new Set(endpoints
+    .map((endpoint) => endpoint.trim())
+    .filter(Boolean)
+    .filter(isWebSocketEndpoint)));
+}
+
 export interface FederatedRelay {
   did: string;
   endpoints: string[];
   card?: AgentCard;
   ws: WebSocket | null;
+  inbound?: boolean;
+  sourceIp?: string;
   lastSeen: number;
   connected: boolean;
+  admissionState?: FederationAdmissionState;
+  admittedByPeer?: boolean;
   connecting?: boolean;
   reconnectAttempts?: number;
   reconnectTimer?: NodeJS.Timeout | null;
+  probationTimer?: NodeJS.Timeout | null;
   agentCount: number;
   uptime: number;
+  pendingPeerDids?: string[];
+  admissionError?: string | null;
+  eligibilityCheckedAt?: number;
+  lastHealthCheckAt?: number;
+  lastHealthResponseAt?: number;
+  lastProbeStartedAt?: number;
+  lastProbeSucceededAt?: number;
+  violationCount?: number;
 }
 
 export interface FederatedAgentRoute {
@@ -60,6 +129,11 @@ export interface FederationConfig {
   reconnectDelay: number;
   maxReconnectDelay: number;
   maxReconnectAttempts: number;
+  handshakeRateLimitWindowMs: number;
+  handshakeRateLimitMaxAttempts: number;
+  failedHandshakeWindowMs: number;
+  failedHandshakeThreshold: number;
+  failedHandshakeQuarantineMs: number;
   exportPolicy: FederationExportPolicy;
   selectiveVisibilityValue: string;
   realmPolicies: Record<string, FederationRealmPolicyConfig>;
@@ -72,6 +146,11 @@ const DEFAULT_FEDERATION_CONFIG: FederationConfig = {
   reconnectDelay: 5000,
   maxReconnectDelay: 60000,
   maxReconnectAttempts: 5,
+  handshakeRateLimitWindowMs: 60000,
+  handshakeRateLimitMaxAttempts: 5,
+  failedHandshakeWindowMs: 300000,
+  failedHandshakeThreshold: 3,
+  failedHandshakeQuarantineMs: 300000,
   exportPolicy: 'full',
   selectiveVisibilityValue: 'public',
   realmPolicies: {},
@@ -90,6 +169,14 @@ export class FederationManager {
   private exportedLocalAgents = new Set<string>();
   private healthCheckTimer: NodeJS.Timeout | null = null;
   private discoveryTimer: NodeJS.Timeout | null = null;
+  private pendingHealthChecks = new Map<string, PendingPeerProbe<void>>();
+  private pendingCardFetches = new Map<string, PendingPeerProbe<CardMessage> & { did: string }>();
+  private inboundHandshakeAttemptsByIp = new Map<string, SlidingWindowCounter>();
+  private inboundHandshakeAttemptsByDid = new Map<string, SlidingWindowCounter>();
+  private inboundHandshakeFailuresByIp = new Map<string, SlidingWindowCounter>();
+  private inboundHandshakeFailuresByDid = new Map<string, SlidingWindowCounter>();
+  private quarantinedSourceIps = new Map<string, number>();
+  private quarantinedRelayDids = new Map<string, number>();
 
   constructor(
     relayIdentity: RelayIdentity,
@@ -140,15 +227,447 @@ export class FederationManager {
         relay.reconnectTimer = null;
       }
 
+      if (relay.probationTimer) {
+        clearTimeout(relay.probationTimer);
+        relay.probationTimer = null;
+      }
+
       if (relay.ws && relay.ws.readyState === WebSocket.OPEN) {
         relay.ws.close();
       }
     }
 
+    for (const pending of this.pendingHealthChecks.values()) {
+      clearTimeout(pending.timeout);
+      pending.reject(new Error('Federation manager stopped'));
+    }
+    this.pendingHealthChecks.clear();
+
+    for (const pending of this.pendingCardFetches.values()) {
+      clearTimeout(pending.timeout);
+      pending.reject(new Error('Federation manager stopped'));
+    }
+    this.pendingCardFetches.clear();
+    this.inboundHandshakeAttemptsByIp.clear();
+    this.inboundHandshakeAttemptsByDid.clear();
+    this.inboundHandshakeFailuresByIp.clear();
+    this.inboundHandshakeFailuresByDid.clear();
+    this.quarantinedSourceIps.clear();
+    this.quarantinedRelayDids.clear();
+
     this.federatedRelays.clear();
     this.remoteAgentRoutes.clear();
     this.exportedLocalAgents.clear();
     console.log('Federation manager stopped');
+  }
+
+  private isLocallyAdmitted(relay: FederatedRelay | null | undefined): boolean {
+    if (!relay?.connected) {
+      return false;
+    }
+
+    if (!relay.admissionState) {
+      return true;
+    }
+
+    return relay.admissionState === 'admitted';
+  }
+
+  private isDataPlaneActive(relay: FederatedRelay | null | undefined): boolean {
+    if (!relay?.connected) {
+      return false;
+    }
+
+    if (!relay.admissionState) {
+      return true;
+    }
+
+    return relay.admissionState === 'admitted' && relay.admittedByPeer === true;
+  }
+
+  private validateRelayEligibility(relayDid: string, relayCard: AgentCard, announcedEndpoints?: string[]): RelayEligibilityResult {
+    if (relayCard.did !== relayDid) {
+      return { ok: false, endpoints: [], error: 'Relay DID mismatch' };
+    }
+
+    const capabilityIds = new Set(relayCard.capabilities.map((capability) => capability.id));
+    const missingCapabilities = REQUIRED_RELAY_CAPABILITIES.filter((capability) => !capabilityIds.has(capability));
+    if (missingCapabilities.length > 0) {
+      return {
+        ok: false,
+        endpoints: [],
+        error: `Relay missing required capabilities: ${missingCapabilities.join(', ')}`,
+      };
+    }
+
+    const endpoints = normalizeRelayEndpoints([...(announcedEndpoints ?? []), ...relayCard.endpoints]);
+    if (endpoints.length === 0) {
+      return { ok: false, endpoints: [], error: 'Relay must advertise at least one WebSocket endpoint' };
+    }
+
+    return { ok: true, endpoints };
+  }
+
+  private normalizeSourceKey(value: string | undefined): string | null {
+    const normalized = value?.trim();
+    if (!normalized || normalized === 'unknown') {
+      return null;
+    }
+    return normalized;
+  }
+
+  private isQuarantined(quarantineMap: Map<string, number>, value: string | undefined): boolean {
+    const key = this.normalizeSourceKey(value);
+    if (!key) {
+      return false;
+    }
+
+    const expiresAt = quarantineMap.get(key);
+    if (!expiresAt) {
+      return false;
+    }
+
+    if (expiresAt <= Date.now()) {
+      quarantineMap.delete(key);
+      return false;
+    }
+
+    return true;
+  }
+
+  private incrementWindowCounter(counterMap: Map<string, SlidingWindowCounter>, value: string | undefined, windowMs: number): number {
+    const key = this.normalizeSourceKey(value);
+    if (!key) {
+      return 0;
+    }
+
+    const now = Date.now();
+    const current = counterMap.get(key);
+    if (!current || now - current.windowStart >= windowMs) {
+      counterMap.set(key, { count: 1, windowStart: now });
+      return 1;
+    }
+
+    current.count += 1;
+    return current.count;
+  }
+
+  private clearCounter(counterMap: Map<string, SlidingWindowCounter>, value: string | undefined): void {
+    const key = this.normalizeSourceKey(value);
+    if (key) {
+      counterMap.delete(key);
+    }
+  }
+
+  private clearQuarantine(quarantineMap: Map<string, number>, value: string | undefined): void {
+    const key = this.normalizeSourceKey(value);
+    if (key) {
+      quarantineMap.delete(key);
+    }
+  }
+
+  private guardIncomingFederationHandshake(context: ConnectionContext, relayDid: string): FederationAdmissionGuardResult {
+    if (this.isQuarantined(this.quarantinedSourceIps, context.remoteIp) || this.isQuarantined(this.quarantinedRelayDids, relayDid)) {
+      return {
+        ok: false,
+        error: 'Federation handshake temporarily quarantined',
+        closeCode: 1013,
+      };
+    }
+
+    const ipAttempts = this.incrementWindowCounter(
+      this.inboundHandshakeAttemptsByIp,
+      context.remoteIp,
+      this.config.handshakeRateLimitWindowMs,
+    );
+    const didAttempts = this.incrementWindowCounter(
+      this.inboundHandshakeAttemptsByDid,
+      relayDid,
+      this.config.handshakeRateLimitWindowMs,
+    );
+
+    if (ipAttempts > this.config.handshakeRateLimitMaxAttempts || didAttempts > this.config.handshakeRateLimitMaxAttempts) {
+      return {
+        ok: false,
+        error: 'Federation handshake rate limit exceeded',
+        closeCode: 1013,
+      };
+    }
+
+    return { ok: true };
+  }
+
+  private recordIncomingFederationFailure(relayDid: string, remoteIp: string | undefined, _reason: string): void {
+    const ipFailures = this.incrementWindowCounter(
+      this.inboundHandshakeFailuresByIp,
+      remoteIp,
+      this.config.failedHandshakeWindowMs,
+    );
+    const didFailures = this.incrementWindowCounter(
+      this.inboundHandshakeFailuresByDid,
+      relayDid,
+      this.config.failedHandshakeWindowMs,
+    );
+
+    const now = Date.now();
+    if (ipFailures >= this.config.failedHandshakeThreshold) {
+      const sourceIp = this.normalizeSourceKey(remoteIp);
+      if (sourceIp) {
+        this.quarantinedSourceIps.set(sourceIp, now + this.config.failedHandshakeQuarantineMs);
+      }
+      this.clearCounter(this.inboundHandshakeFailuresByIp, remoteIp);
+    }
+
+    if (didFailures >= this.config.failedHandshakeThreshold) {
+      const normalizedDid = this.normalizeSourceKey(relayDid);
+      if (normalizedDid) {
+        this.quarantinedRelayDids.set(normalizedDid, now + this.config.failedHandshakeQuarantineMs);
+      }
+      this.clearCounter(this.inboundHandshakeFailuresByDid, relayDid);
+    }
+  }
+
+  private recordSuccessfulIncomingFederationAdmission(relayDid: string, remoteIp: string | undefined): void {
+    this.clearCounter(this.inboundHandshakeFailuresByIp, remoteIp);
+    this.clearCounter(this.inboundHandshakeFailuresByDid, relayDid);
+    this.clearQuarantine(this.quarantinedSourceIps, remoteIp);
+    this.clearQuarantine(this.quarantinedRelayDids, relayDid);
+  }
+
+  private clearPendingProbe(relayDid: string, errorMessage?: string): void {
+    const healthProbe = this.pendingHealthChecks.get(relayDid);
+    if (healthProbe) {
+      clearTimeout(healthProbe.timeout);
+      this.pendingHealthChecks.delete(relayDid);
+      if (errorMessage) {
+        healthProbe.reject(new Error(errorMessage));
+      }
+    }
+
+    const cardProbe = this.pendingCardFetches.get(relayDid);
+    if (cardProbe) {
+      clearTimeout(cardProbe.timeout);
+      this.pendingCardFetches.delete(relayDid);
+      if (errorMessage) {
+        cardProbe.reject(new Error(errorMessage));
+      }
+    }
+  }
+
+  private clearProbationTimer(relay: FederatedRelay | undefined): void {
+    if (relay?.probationTimer) {
+      clearTimeout(relay.probationTimer);
+      relay.probationTimer = null;
+    }
+  }
+
+  private markAdmissionFailure(relayDid: string, error: string): void {
+    const relay = this.federatedRelays.get(relayDid);
+    if (!relay) {
+      return;
+    }
+
+    if (relay.inbound) {
+      this.recordIncomingFederationFailure(relayDid, relay.sourceIp, error);
+    }
+
+    relay.admissionError = error;
+    relay.connected = false;
+    relay.admissionState = 'probation';
+    this.clearProbationTimer(relay);
+    this.clearPendingProbe(relayDid, error);
+    this.removeRemoteAgentRoutesForRelay(relayDid);
+    if (relay.ws && relay.ws.readyState === WebSocket.OPEN) {
+      relay.ws.close(1008, 'Federation admission failed');
+    }
+  }
+
+  private async maybeActivateRelay(relayDid: string): Promise<void> {
+    const relay = this.federatedRelays.get(relayDid);
+    if (!relay || !this.isDataPlaneActive(relay) || !relay.ws || relay.ws.readyState !== WebSocket.OPEN) {
+      return;
+    }
+
+    this.advertiseCurrentAgentsToRelay(relay.ws);
+    await this.connectPendingPeers(relayDid);
+  }
+
+  private async connectPendingPeers(relayDid: string): Promise<void> {
+    const relay = this.federatedRelays.get(relayDid);
+    if (!relay || !relay.pendingPeerDids?.length) {
+      return;
+    }
+
+    const pendingPeers = [...relay.pendingPeerDids];
+    relay.pendingPeerDids = [];
+    const localRelayDid = this.relayIdentity.getIdentity().did;
+
+    for (const peerDid of pendingPeers) {
+      if (peerDid === localRelayDid || this.federatedRelays.has(peerDid)) {
+        continue;
+      }
+
+      const peerAgent = this.registry.get(peerDid);
+      if (peerAgent) {
+        await this.connectToRelay(peerDid, peerAgent.card);
+      }
+    }
+  }
+
+  private async sendFederationAdmitted(relayDid: string): Promise<void> {
+    const relay = this.federatedRelays.get(relayDid);
+    if (!relay?.ws || relay.ws.readyState !== WebSocket.OPEN) {
+      return;
+    }
+
+    const identity = this.relayIdentity.getIdentity();
+    const admitted: FederationAdmittedMessage = {
+      type: 'FEDERATION_ADMITTED',
+      relayDid: identity.did,
+      protocolVersion: 1,
+      timestamp: Date.now(),
+    };
+
+    relay.ws.send(encodeCBOR(admitted));
+  }
+
+  private async beginAdmission(relayDid: string): Promise<boolean> {
+    const relay = this.federatedRelays.get(relayDid);
+    if (!relay?.ws || relay.ws.readyState !== WebSocket.OPEN) {
+      return false;
+    }
+
+    relay.admissionState = 'probation';
+    relay.admissionError = null;
+    relay.lastProbeStartedAt = Date.now();
+    this.clearProbationTimer(relay);
+    relay.probationTimer = setTimeout(() => {
+      this.markAdmissionFailure(relayDid, 'Federation admission timed out');
+    }, this.config.connectionTimeout * 2);
+
+    try {
+      await this.runAdmissionProbe(relayDid);
+      const currentRelay = this.federatedRelays.get(relayDid);
+      if (!currentRelay) {
+        return false;
+      }
+
+      currentRelay.admissionState = 'admitted';
+      currentRelay.lastProbeSucceededAt = Date.now();
+      currentRelay.admissionError = null;
+      if (currentRelay.inbound) {
+        this.recordSuccessfulIncomingFederationAdmission(relayDid, currentRelay.sourceIp);
+      }
+      this.clearProbationTimer(currentRelay);
+      await this.sendFederationAdmitted(relayDid);
+      await this.maybeActivateRelay(relayDid);
+      return true;
+    } catch (err) {
+      const error = err instanceof Error ? err.message : 'Federation admission failed';
+      console.warn(`Federation admission failed for ${relayDid}: ${error}`);
+      this.markAdmissionFailure(relayDid, error);
+      return false;
+    }
+  }
+
+  private async runAdmissionProbe(relayDid: string): Promise<void> {
+    await this.runHealthProbe(relayDid);
+    const cardMessage = await this.runCardProbe(relayDid, relayDid);
+    if (!cardMessage.card) {
+      throw new Error('Relay admission probe returned no relay card');
+    }
+
+    if (cardMessage.did !== relayDid || cardMessage.card.did !== relayDid) {
+      throw new Error('Relay admission probe returned mismatched relay card');
+    }
+
+    const isValidCard = await this.verifyRelayCard(relayDid, cardMessage.card);
+    if (!isValidCard) {
+      throw new Error('Relay admission probe returned invalid relay card');
+    }
+
+    const eligibility = this.validateRelayEligibility(relayDid, cardMessage.card);
+    if (!eligibility.ok) {
+      throw new Error(eligibility.error);
+    }
+
+    const relay = this.federatedRelays.get(relayDid);
+    if (relay) {
+      relay.card = cardMessage.card;
+      relay.endpoints = eligibility.endpoints;
+    }
+  }
+
+  private async runHealthProbe(relayDid: string): Promise<void> {
+    const relay = this.federatedRelays.get(relayDid);
+    if (!relay?.ws || relay.ws.readyState !== WebSocket.OPEN) {
+      throw new Error('Relay connection unavailable for health probe');
+    }
+
+    this.clearPendingProbe(relayDid, 'Federated relay disconnected');
+    const healthCheck: FederationHealthCheckMessage = {
+      type: 'FEDERATION_HEALTH_CHECK',
+      timestamp: Date.now(),
+    };
+
+    relay.lastHealthCheckAt = healthCheck.timestamp;
+
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.pendingHealthChecks.delete(relayDid);
+        reject(new Error('Federation health probe timed out'));
+      }, this.config.connectionTimeout);
+
+      this.pendingHealthChecks.set(relayDid, {
+        resolve,
+        reject,
+        timeout,
+      });
+
+      relay.ws!.send(encodeCBOR(healthCheck));
+    });
+  }
+
+  private async runCardProbe(relayDid: string, cardDid: string): Promise<CardMessage> {
+    const relay = this.federatedRelays.get(relayDid);
+    if (!relay?.ws || relay.ws.readyState !== WebSocket.OPEN) {
+      throw new Error('Relay connection unavailable for card probe');
+    }
+
+    const fetchCard: FetchCardMessage = {
+      type: 'FETCH_CARD',
+      did: cardDid,
+    };
+
+    return await new Promise<CardMessage>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.pendingCardFetches.delete(relayDid);
+        reject(new Error('Federation card probe timed out'));
+      }, this.config.connectionTimeout);
+
+      this.pendingCardFetches.set(relayDid, {
+        did: cardDid,
+        resolve,
+        reject,
+        timeout,
+      });
+
+      relay.ws!.send(encodeCBOR(fetchCard));
+    });
+  }
+
+  private isMessageAllowedDuringProbation(msg: RelayMessage): boolean {
+    return PROBATIONARY_MESSAGE_TYPES.has(msg.type);
+  }
+
+  private recordProtocolViolation(relayDid: string, msg: RelayMessage): void {
+    const relay = this.federatedRelays.get(relayDid);
+    if (!relay) {
+      return;
+    }
+
+    relay.violationCount = (relay.violationCount ?? 0) + 1;
+    console.warn(`Ignoring ${msg.type} from non-admitted relay ${relayDid}`);
   }
 
   /**
@@ -162,6 +681,8 @@ export class FederationManager {
       for (const agent of agents) {
         if (agent.did === myDid) continue;
         if (this.federatedRelays.has(agent.did)) continue;
+        const eligibility = this.validateRelayEligibility(agent.did, agent.card);
+        if (!eligibility.ok) continue;
         await this.connectToRelay(agent.did, agent.card);
       }
     } catch (err) {
@@ -183,15 +704,16 @@ export class FederationManager {
         return false;
       }
 
-      const wsEndpoints = relayCard.endpoints.filter(ep => ep.startsWith('ws://') || ep.startsWith('wss://'));
-
-      if (wsEndpoints.length === 0) {
-        console.warn(`No WebSocket endpoints found for relay ${relayDid}`);
+      const eligibility = this.validateRelayEligibility(relayDid, relayCard);
+      if (!eligibility.ok) {
+        console.warn(`Skipping relay ${relayDid}: ${eligibility.error}`);
         return false;
       }
 
+      const wsEndpoints = eligibility.endpoints;
+
       const existing = this.federatedRelays.get(relayDid);
-      if (existing?.connected && existing.ws?.readyState === WebSocket.OPEN) {
+      if (this.isLocallyAdmitted(existing) && existing?.ws?.readyState === WebSocket.OPEN) {
         return true;
       }
 
@@ -207,11 +729,18 @@ export class FederationManager {
         ws: existing?.ws ?? null,
         lastSeen: existing?.lastSeen ?? Date.now(),
         connected: false,
+        admissionState: 'connecting',
+        admittedByPeer: false,
         connecting: true,
         reconnectAttempts: existing?.reconnectAttempts ?? 0,
         reconnectTimer: existing?.reconnectTimer ?? null,
+        probationTimer: null,
         agentCount: existing?.agentCount ?? 0,
         uptime: existing?.uptime ?? 0,
+        pendingPeerDids: existing?.pendingPeerDids ?? [],
+        admissionError: null,
+        eligibilityCheckedAt: Date.now(),
+        violationCount: existing?.violationCount ?? 0,
       });
 
       console.log(`Connecting to relay ${relayDid} at ${endpoint}`);
@@ -237,7 +766,14 @@ export class FederationManager {
     return await verifyAgentCard(relayCard as any, (sig, data) => verify(sig, data, relayPublicKey));
   }
 
-  private registerFederatedRelay(relayDid: string, relayCard: AgentCard, endpoints: string[], ws: WebSocket): void {
+  private registerFederatedRelay(
+    relayDid: string,
+    relayCard: AgentCard,
+    endpoints: string[],
+    ws: WebSocket,
+    admissionState: FederationAdmissionState,
+    source?: { inbound: boolean; remoteIp?: string },
+  ): void {
     const existing = this.federatedRelays.get(relayDid);
     if (existing?.ws && existing.ws !== ws && existing.ws.readyState === WebSocket.OPEN) {
       existing.ws.close(4001, 'Replaced by new federation connection');
@@ -247,18 +783,35 @@ export class FederationManager {
       clearTimeout(existing.reconnectTimer);
     }
 
+    if (existing?.probationTimer) {
+      clearTimeout(existing.probationTimer);
+    }
+
     this.federatedRelays.set(relayDid, {
       did: relayDid,
       endpoints,
       card: relayCard,
       ws,
+      inbound: source?.inbound ?? existing?.inbound ?? false,
+      sourceIp: source?.remoteIp ?? existing?.sourceIp,
       lastSeen: Date.now(),
       connected: true,
+      admissionState,
+      admittedByPeer: existing?.admittedByPeer ?? false,
       connecting: false,
       reconnectAttempts: 0,
       reconnectTimer: null,
+      probationTimer: null,
       agentCount: existing?.agentCount ?? 0,
       uptime: existing?.uptime ?? 0,
+      pendingPeerDids: existing?.pendingPeerDids ?? [],
+      admissionError: null,
+      eligibilityCheckedAt: Date.now(),
+      lastHealthCheckAt: existing?.lastHealthCheckAt,
+      lastHealthResponseAt: existing?.lastHealthResponseAt,
+      lastProbeStartedAt: existing?.lastProbeStartedAt,
+      lastProbeSucceededAt: existing?.lastProbeSucceededAt,
+      violationCount: existing?.violationCount ?? 0,
     });
   }
 
@@ -294,7 +847,7 @@ export class FederationManager {
 
   private getConnectedRelay(relayDid: string): FederatedRelay | null {
     const relay = this.federatedRelays.get(relayDid);
-    if (!relay || !relay.connected || !relay.ws || relay.ws.readyState !== WebSocket.OPEN) {
+    if (!this.isDataPlaneActive(relay) || !relay?.ws || relay.ws.readyState !== WebSocket.OPEN) {
       return null;
     }
     return relay;
@@ -414,6 +967,7 @@ export class FederationManager {
     return await new Promise((resolve) => {
       let settled = false;
       let connectedRelayDid = expectedRelayDid;
+      const handshakeBacklog: RelayMessage[] = [];
       const ws = new WebSocket(endpoint);
 
       const finish = (result: boolean): void => {
@@ -433,6 +987,7 @@ export class FederationManager {
         try {
           const msg: RelayMessage = decodeCBOR(data);
           if (msg.type !== 'FEDERATION_WELCOME') {
+            handshakeBacklog.push(msg);
             return;
           }
 
@@ -458,18 +1013,36 @@ export class FederationManager {
           const isValidCard = await this.verifyRelayCard(relayDid, relayCard);
           if (!isValidCard) {
             console.warn(`Invalid relay card from ${relayDid}`);
+            this.federatedRelays.delete(relayDid);
             ws.close(1008, 'Invalid relay card');
             finish(false);
             return;
           }
 
+          const eligibility = this.validateRelayEligibility(relayDid, relayCard, relayEndpoints);
+          if (!eligibility.ok) {
+            console.warn(`Relay ${relayDid} failed admission eligibility: ${eligibility.error}`);
+            this.federatedRelays.delete(relayDid);
+            ws.close(1008, 'Relay missing federation prerequisites');
+            finish(false);
+            return;
+          }
+
           connectedRelayDid = relayDid;
-          this.registerFederatedRelay(relayDid, relayCard, relayEndpoints, ws);
+          this.registerFederatedRelay(relayDid, relayCard, eligibility.endpoints, ws, 'authenticated');
           ws.off('message', initialMessageHandler);
           this.setupFederationHandlers(ws, relayDid);
           await this.handleFederationWelcome(relayDid, welcome);
-          this.advertiseCurrentAgentsToRelay(ws);
-          finish(true);
+
+          while (handshakeBacklog.length > 0) {
+            const queuedMessage = handshakeBacklog.shift();
+            if (!queuedMessage) {
+              continue;
+            }
+            await this.handleFederationMessage(ws, relayDid, queuedMessage);
+          }
+
+          finish(await this.beginAdmission(relayDid));
         } catch (err) {
           console.error(`Error handling federation handshake from ${expectedRelayDid ?? endpoint}:`, err);
           ws.close(1011, 'Federation handshake failed');
@@ -533,12 +1106,22 @@ export class FederationManager {
     ws.send(encodeCBOR(hello));
   }
 
-  async acceptIncomingRelay(ws: WebSocket, msg: FederationHelloMessage): Promise<{ ok: boolean; relayDid?: string; error?: string }> {
+  async acceptIncomingRelay(
+    ws: WebSocket,
+    msg: FederationHelloMessage,
+    context: ConnectionContext = { remoteIp: 'unknown', userAgent: 'unknown' },
+  ): Promise<{ ok: boolean; relayDid?: string; error?: string; closeCode?: number }> {
     try {
+      const guard = this.guardIncomingFederationHandshake(context, msg.relayDid);
+      if (!guard.ok) {
+        return { ok: false, error: guard.error, closeCode: guard.closeCode };
+      }
+
       const { verify, extractPublicKey } = await import('@quadra-a/protocol');
       const relayPublicKey = extractPublicKey(msg.relayDid);
       const isValidCard = await this.verifyRelayCard(msg.relayDid, msg.relayCard);
       if (!isValidCard) {
+        this.recordIncomingFederationFailure(msg.relayDid, context.remoteIp, 'Invalid federation relay card signature');
         return { ok: false, error: 'Invalid federation relay card signature' };
       }
 
@@ -551,10 +1134,24 @@ export class FederationManager {
       const signature = Array.isArray(msg.signature) ? new Uint8Array(msg.signature) : msg.signature;
       const isValidHello = await verify(signature, helloData, relayPublicKey);
       if (!isValidHello) {
+        this.recordIncomingFederationFailure(msg.relayDid, context.remoteIp, 'Invalid federation hello signature');
         return { ok: false, error: 'Invalid federation hello signature' };
       }
 
-      this.registerFederatedRelay(msg.relayDid, msg.relayCard, msg.endpoints, ws);
+      const eligibility = this.validateRelayEligibility(msg.relayDid, msg.relayCard, msg.endpoints);
+      if (!eligibility.ok) {
+        this.recordIncomingFederationFailure(msg.relayDid, context.remoteIp, eligibility.error ?? 'Relay missing federation prerequisites');
+        return { ok: false, error: eligibility.error };
+      }
+
+      this.registerFederatedRelay(
+        msg.relayDid,
+        msg.relayCard,
+        eligibility.endpoints,
+        ws,
+        'authenticated',
+        { inbound: true, remoteIp: context.remoteIp },
+      );
 
       const identity = this.relayIdentity.getIdentity();
       const welcome: FederationWelcomeMessage = {
@@ -566,7 +1163,12 @@ export class FederationManager {
         endpoints: identity.agentCard.endpoints,
       };
       ws.send(encodeCBOR(welcome));
-      this.advertiseCurrentAgentsToRelay(ws);
+
+      setTimeout(() => {
+        void this.beginAdmission(msg.relayDid).catch((err) => {
+          console.error(`Failed to complete federation admission for ${msg.relayDid}:`, err);
+        });
+      }, 0);
 
       return { ok: true, relayDid: msg.relayDid };
     } catch (err) {
@@ -586,6 +1188,9 @@ export class FederationManager {
     relay.connecting = false;
     relay.ws = null;
     relay.lastSeen = Date.now();
+    relay.admittedByPeer = false;
+    this.clearProbationTimer(relay);
+    this.clearPendingProbe(relayDid);
     this.removeRemoteAgentRoutesForRelay(relayDid);
   }
 
@@ -612,9 +1217,18 @@ export class FederationManager {
 
     relay.lastSeen = Date.now();
 
+    if (!this.isDataPlaneActive(relay) && !this.isMessageAllowedDuringProbation(msg)) {
+      this.recordProtocolViolation(relayDid, msg);
+      return;
+    }
+
     switch (msg.type) {
       case 'FEDERATION_WELCOME':
         await this.handleFederationWelcome(relayDid, msg as FederationWelcomeMessage);
+        break;
+
+      case 'FEDERATION_ADMITTED':
+        await this.handleFederationAdmitted(relayDid, msg as FederationAdmittedMessage);
         break;
 
       case 'AGENT_JOINED':
@@ -641,6 +1255,14 @@ export class FederationManager {
         await this.handleFederationHealthResponse(relayDid, msg as FederationHealthResponseMessage);
         break;
 
+      case 'FETCH_CARD':
+        await this.handleFederationFetchCard(ws, relayDid, msg as FetchCardMessage);
+        break;
+
+      case 'CARD':
+        await this.handleFederationCard(relayDid, msg as CardMessage);
+        break;
+
       default:
         console.warn(`Unknown federation message type: ${msg.type}`);
     }
@@ -655,22 +1277,27 @@ export class FederationManager {
     const relay = this.federatedRelays.get(relayDid);
     if (relay) {
       relay.connected = true;
+      relay.admissionState = relay.admissionState === 'admitted' ? relay.admissionState : 'authenticated';
       if (msg.relayCard) {
         relay.card = msg.relayCard;
       }
       if (msg.endpoints?.length) {
-        relay.endpoints = msg.endpoints;
+        relay.endpoints = normalizeRelayEndpoints(msg.endpoints);
       }
+      relay.pendingPeerDids = msg.peers.filter((peerDid) => peerDid !== this.relayIdentity.getIdentity().did);
+    }
+  }
+
+  private async handleFederationAdmitted(relayDid: string, _msg: FederationAdmittedMessage): Promise<void> {
+    console.log(`Received federation admitted from ${relayDid}`);
+
+    const relay = this.federatedRelays.get(relayDid);
+    if (!relay) {
+      return;
     }
 
-    for (const peerDid of msg.peers) {
-      if (peerDid !== this.relayIdentity.getIdentity().did && !this.federatedRelays.has(peerDid)) {
-        const peerAgent = this.registry.get(peerDid);
-        if (peerAgent) {
-          await this.connectToRelay(peerDid, peerAgent.card);
-        }
-      }
-    }
+    relay.admittedByPeer = true;
+    await this.maybeActivateRelay(relayDid);
   }
 
   /**
@@ -745,7 +1372,7 @@ export class FederationManager {
 
     let forwarded = false;
     for (const [relayDid, relay] of this.federatedRelays) {
-      if (relayDid !== fromRelayDid && relay.ws && relay.connected && relay.ws.readyState === WebSocket.OPEN) {
+      if (relayDid !== fromRelayDid && this.isDataPlaneActive(relay) && relay.ws && relay.ws.readyState === WebSocket.OPEN) {
         const forwardedRequest: RouteRequestMessage = {
           ...msg,
           hopCount: msg.hopCount + 1,
@@ -789,6 +1416,28 @@ export class FederationManager {
     ws.send(encodeCBOR(response));
   }
 
+  private async handleFederationFetchCard(ws: WebSocket, _relayDid: string, msg: FetchCardMessage): Promise<void> {
+    const identity = this.relayIdentity.getIdentity();
+    const response: CardMessage = {
+      type: 'CARD',
+      did: msg.did,
+      card: msg.did === identity.did ? identity.agentCard : null,
+    };
+
+    ws.send(encodeCBOR(response));
+  }
+
+  private async handleFederationCard(relayDid: string, msg: CardMessage): Promise<void> {
+    const pending = this.pendingCardFetches.get(relayDid);
+    if (!pending || pending.did !== msg.did) {
+      return;
+    }
+
+    clearTimeout(pending.timeout);
+    this.pendingCardFetches.delete(relayDid);
+    pending.resolve(msg);
+  }
+
   /**
    * Handle federation health response
    */
@@ -798,6 +1447,14 @@ export class FederationManager {
       relay.uptime = msg.uptime;
       relay.agentCount = msg.connectedAgents;
       relay.lastSeen = Date.now();
+      relay.lastHealthResponseAt = Date.now();
+    }
+
+    const pending = this.pendingHealthChecks.get(relayDid);
+    if (pending) {
+      clearTimeout(pending.timeout);
+      this.pendingHealthChecks.delete(relayDid);
+      pending.resolve();
     }
   }
 
@@ -813,6 +1470,9 @@ export class FederationManager {
       relay.connecting = false;
       relay.ws = null;
       relay.lastSeen = Date.now();
+      relay.admittedByPeer = false;
+      this.clearProbationTimer(relay);
+      this.clearPendingProbe(relayDid, 'Federated relay disconnected');
       this.removeRemoteAgentRoutesForRelay(relayDid);
       console.log(`Relay ${relayDid} disconnected`);
 
@@ -861,7 +1521,8 @@ export class FederationManager {
     };
 
     for (const relay of this.federatedRelays.values()) {
-      if (relay.ws && relay.connected && relay.ws.readyState === WebSocket.OPEN) {
+      if (this.isLocallyAdmitted(relay) && relay.ws && relay.ws.readyState === WebSocket.OPEN) {
+        relay.lastHealthCheckAt = healthCheck.timestamp;
         relay.ws.send(encodeCBOR(healthCheck));
       }
     }
@@ -884,7 +1545,8 @@ export class FederationManager {
    * Route a message to another relay if the target agent is not local
    */
   async routeToFederation(targetDid: string, envelope: Uint8Array, _fromDid: string): Promise<boolean> {
-    if (this.federatedRelays.size === 0) {
+    const activeRelays = Array.from(this.federatedRelays.values()).filter((relay) => this.isDataPlaneActive(relay));
+    if (activeRelays.length === 0) {
       return false;
     }
 
@@ -910,7 +1572,7 @@ export class FederationManager {
     }
 
     for (const [relayDid, relay] of this.federatedRelays) {
-      if (relay.ws && relay.connected && relay.ws.readyState === WebSocket.OPEN) {
+      if (this.isDataPlaneActive(relay) && relay.ws && relay.ws.readyState === WebSocket.OPEN) {
         relay.ws.send(encodeCBOR(routeRequest));
         console.log(`Routed message to federation via relay ${relayDid}`);
         return true;
@@ -969,7 +1631,7 @@ export class FederationManager {
     const encoded = encodeCBOR(message);
 
     for (const relay of this.federatedRelays.values()) {
-      if (relay.ws && relay.connected && relay.ws.readyState === WebSocket.OPEN) {
+      if (this.isDataPlaneActive(relay) && relay.ws && relay.ws.readyState === WebSocket.OPEN) {
         relay.ws.send(encoded);
       }
     }
@@ -978,18 +1640,31 @@ export class FederationManager {
   /**
    * Get federation status
    */
-  getFederationStatus(): { relayCount: number; connectedRelays: string[]; totalAgents: number } {
+  getFederationStatus(): {
+    relayCount: number;
+    connectedRelays: string[];
+    totalAgents: number;
+    knownRelayCount: number;
+    probationRelays: string[];
+  } {
     const connectedRelays = Array.from(this.federatedRelays.entries())
-      .filter(([_, relay]) => relay.connected)
+      .filter(([_, relay]) => this.isDataPlaneActive(relay))
+      .map(([did]) => did);
+
+    const probationRelays = Array.from(this.federatedRelays.entries())
+      .filter(([_, relay]) => relay.connected && !this.isDataPlaneActive(relay))
       .map(([did]) => did);
 
     const totalAgents = Array.from(this.federatedRelays.values())
+      .filter((relay) => this.isDataPlaneActive(relay))
       .reduce((sum, relay) => sum + relay.agentCount, 0);
 
     return {
-      relayCount: this.federatedRelays.size,
+      relayCount: connectedRelays.length,
       connectedRelays,
       totalAgents,
+      knownRelayCount: this.federatedRelays.size,
+      probationRelays,
     };
   }
 }

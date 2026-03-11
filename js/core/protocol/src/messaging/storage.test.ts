@@ -65,7 +65,13 @@ describe('MessageStorage - Thread Operations', () => {
     from: string,
     to: string,
     threadId?: string,
-    text?: string
+    text?: string,
+    options: {
+      envelopeTimestamp?: number;
+      receivedAt?: number;
+      sentAt?: number;
+      direction?: StoredMessage['direction'];
+    } = {}
   ): StoredMessage => {
     const envelope: MessageEnvelope = {
       id,
@@ -74,16 +80,20 @@ describe('MessageStorage - Thread Operations', () => {
       type: 'message',
       protocol: 'test/v1',
       payload: { text: text !== undefined ? text : 'Test message' },
-      timestamp: Date.now(),
+      timestamp: options.envelopeTimestamp ?? Date.now(),
       signature: 'test-signature',
       threadId,
     };
 
+    const direction = options.direction ?? 'inbound';
+
     return {
       envelope,
-      direction: 'inbound',
+      direction,
       status: 'delivered',
-      receivedAt: Date.now(),
+      ...(direction === 'outbound'
+        ? { sentAt: options.sentAt ?? Date.now() }
+        : { receivedAt: options.receivedAt ?? Date.now() }),
     };
   };
 
@@ -146,10 +156,14 @@ describe('MessageStorage - Thread Operations', () => {
     it('should update session metadata when adding more messages', async () => {
       const threadId = generateThreadId();
       const now = Date.now();
-      const msg1 = createTestMessage('msg1', 'did:agent:alice', 'did:agent:bob', threadId);
-      msg1.receivedAt = now;
-      const msg2 = createTestMessage('msg2', 'did:agent:alice', 'did:agent:bob', threadId);
-      msg2.receivedAt = now + 100;
+      const msg1 = createTestMessage('msg1', 'did:agent:alice', 'did:agent:bob', threadId, undefined, {
+        envelopeTimestamp: now,
+        receivedAt: now,
+      });
+      const msg2 = createTestMessage('msg2', 'did:agent:alice', 'did:agent:bob', threadId, undefined, {
+        envelopeTimestamp: now + 100,
+        receivedAt: now + 100,
+      });
 
       await storage.putMessage(msg1);
       await storage.putMessage(msg2);
@@ -256,6 +270,126 @@ describe('MessageStorage - Thread Operations', () => {
       const sessions = await storage.listSessions();
       expect(sessions.length).toBe(2);
       expect(sessions[0].lastMessageAt).toBeGreaterThanOrEqual(sessions[1].lastMessageAt);
+    });
+
+    it('should sort sessions by last message timestamp instead of thread key order', async () => {
+      await storage.putMessage(createTestMessage(
+        'msg-old',
+        'did:agent:alice',
+        'did:agent:bob',
+        'thread_z',
+        'older',
+        { envelopeTimestamp: 1_000, receivedAt: 1_100 },
+      ));
+      await storage.putMessage(createTestMessage(
+        'msg-new',
+        'did:agent:charlie',
+        'did:agent:bob',
+        'thread_a',
+        'newer',
+        { envelopeTimestamp: 2_000, receivedAt: 2_100 },
+      ));
+
+      const sessions = await storage.listSessions();
+      expect(sessions.map((session) => session.threadId)).toEqual(['thread_a', 'thread_z']);
+    });
+  });
+
+  describe('Timestamp-based ordering', () => {
+    it('should sort inbox messages by envelope timestamp when arrival order differs', async () => {
+      await storage.putMessage(createTestMessage(
+        'msg-older-late',
+        'did:agent:alice',
+        'did:agent:bob',
+        undefined,
+        'older',
+        { envelopeTimestamp: 1_000, receivedAt: 2_000 },
+      ));
+      await storage.putMessage(createTestMessage(
+        'msg-newer-early',
+        'did:agent:alice',
+        'did:agent:bob',
+        undefined,
+        'newer',
+        { envelopeTimestamp: 2_000, receivedAt: 1_000 },
+      ));
+
+      const page = await storage.queryMessages('inbound');
+      expect(page.messages.map((message) => message.envelope.id)).toEqual(['msg-newer-early', 'msg-older-late']);
+    });
+
+    it('should sort thread messages by envelope timestamp when arrival order differs', async () => {
+      const threadId = 'thread_timestamp_order';
+
+      await storage.putMessage(createTestMessage(
+        'msg-older-late',
+        'did:agent:alice',
+        'did:agent:bob',
+        threadId,
+        'older',
+        { envelopeTimestamp: 1_000, receivedAt: 2_000 },
+      ));
+      await storage.putMessage(createTestMessage(
+        'msg-newer-early',
+        'did:agent:bob',
+        'did:agent:alice',
+        threadId,
+        'newer',
+        { envelopeTimestamp: 2_000, receivedAt: 1_000 },
+      ));
+
+      const page = await storage.queryMessagesByThread(threadId);
+      expect(page.messages.map((message) => message.envelope.id)).toEqual(['msg-older-late', 'msg-newer-early']);
+    });
+
+    it('should keep session bounds aligned with message timestamps', async () => {
+      const threadId = 'thread_session_bounds';
+
+      await storage.putMessage(createTestMessage(
+        'msg-newer-early',
+        'did:agent:alice',
+        'did:agent:bob',
+        threadId,
+        'newer',
+        { envelopeTimestamp: 2_000, receivedAt: 1_000 },
+      ));
+      await storage.putMessage(createTestMessage(
+        'msg-older-late',
+        'did:agent:bob',
+        'did:agent:alice',
+        threadId,
+        'older',
+        { envelopeTimestamp: 1_000, receivedAt: 2_000 },
+      ));
+
+      const session = await storage.getSession(threadId);
+      expect(session?.startedAt).toBe(1_000);
+      expect(session?.lastMessageAt).toBe(2_000);
+    });
+
+    it('should reorder legacy-keyed messages using message timestamps at read time', async () => {
+      const legacyMessage = createTestMessage(
+        'msg-legacy-key',
+        'did:agent:alice',
+        'did:agent:bob',
+        undefined,
+        'legacy',
+        { envelopeTimestamp: 1_000, receivedAt: 3_000 },
+      );
+      const db = (storage as unknown as { db: { put: (key: string, value: StoredMessage) => Promise<void> } }).db;
+      await db.put('msg:inbound:0000000000003000:msg-legacy-key', legacyMessage);
+
+      await storage.putMessage(createTestMessage(
+        'msg-new-key',
+        'did:agent:alice',
+        'did:agent:bob',
+        undefined,
+        'new',
+        { envelopeTimestamp: 2_000, receivedAt: 1_500 },
+      ));
+
+      const page = await storage.queryMessages('inbound');
+      expect(page.messages.map((message) => message.envelope.id)).toEqual(['msg-new-key', 'msg-legacy-key']);
     });
   });
 

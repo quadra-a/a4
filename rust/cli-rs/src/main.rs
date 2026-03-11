@@ -36,7 +36,10 @@ fn show_deprecation_warning() {
 
     match binary_name.as_str() {
         "hw1" | "agent" | "agt" => {
-            eprintln!("Warning: '{}' is deprecated. Use 'a4' instead.", binary_name);
+            eprintln!(
+                "Warning: '{}' is deprecated. Use 'a4' instead.",
+                binary_name
+            );
             eprintln!("Example: a4 find translate/japanese");
         }
         _ => {}
@@ -155,12 +158,21 @@ enum Commands {
         /// Show endorsements created by this agent
         #[arg(long)]
         created_by: Option<String>,
+        /// Filter endorsements by capability domain
+        #[arg(long)]
+        domain: Option<String>,
         /// Maximum endorsements to show
         #[arg(long, default_value = "20")]
         limit: u32,
         /// Human-friendly output with colors
         #[arg(long)]
         human: bool,
+    },
+
+    /// Legacy-style trust command group
+    Trust {
+        #[command(subcommand)]
+        action: TrustAction,
     },
 
     /// Block an agent
@@ -500,6 +512,85 @@ enum SessionsAction {
     },
 }
 
+#[derive(Subcommand)]
+enum TrustAction {
+    /// Show trust score for an agent
+    Show {
+        target: String,
+        #[arg(long)]
+        detailed: bool,
+        #[arg(long)]
+        human: bool,
+    },
+    /// Create a general endorsement for an agent
+    Endorse {
+        target: String,
+        #[arg(long, default_value = "0.8")]
+        score: f64,
+        #[arg(long, default_value = "Good collaboration")]
+        reason: String,
+        #[arg(long)]
+        domain: Option<String>,
+        #[arg(long)]
+        human: bool,
+    },
+    /// Show endorsement history for an agent
+    History {
+        target: String,
+        #[arg(long, default_value = "10")]
+        limit: u32,
+        #[arg(long)]
+        human: bool,
+    },
+    /// Show local trust statistics
+    Stats {
+        #[arg(long)]
+        human: bool,
+    },
+    /// Query endorsements for an agent
+    Query {
+        target: String,
+        #[arg(long)]
+        domain: Option<String>,
+        #[arg(long, default_value = "20")]
+        limit: u32,
+        #[arg(long)]
+        human: bool,
+    },
+    /// Block an agent
+    Block {
+        target: String,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long)]
+        human: bool,
+    },
+    /// Unblock an agent
+    Unblock {
+        target: String,
+        #[arg(long)]
+        human: bool,
+    },
+    /// List blocked agents
+    ListBlocked {
+        #[arg(long)]
+        human: bool,
+    },
+    /// Add an agent to the local allowlist
+    Allow {
+        target: String,
+        #[arg(long)]
+        note: Option<String>,
+        #[arg(long)]
+        human: bool,
+    },
+    /// List allowlisted agents
+    ListAllowed {
+        #[arg(long)]
+        human: bool,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     show_deprecation_warning();
@@ -604,17 +695,110 @@ async fn main() -> Result<()> {
         Commands::Endorsements {
             target,
             created_by,
+            domain,
             limit,
             human,
         } => {
             commands::endorsements::run(commands::endorsements::EndorsementsOptions {
                 target,
                 created_by,
+                domain,
                 limit,
                 human,
             })
             .await?;
         }
+
+        Commands::Trust { action } => match action {
+            TrustAction::Show {
+                target,
+                detailed,
+                human,
+            } => {
+                commands::trust_cli::show(commands::trust_cli::TrustShowOptions {
+                    target,
+                    detailed,
+                    human,
+                })
+                .await?;
+            }
+            TrustAction::Endorse {
+                target,
+                score,
+                reason,
+                domain,
+                human,
+            } => {
+                commands::trust_cli::endorse(commands::trust_cli::TrustEndorseOptions {
+                    target,
+                    score,
+                    reason,
+                    domain,
+                    human,
+                })
+                .await?;
+            }
+            TrustAction::History {
+                target,
+                limit,
+                human,
+            } => {
+                commands::trust_cli::history(commands::trust_cli::TrustHistoryOptions {
+                    target,
+                    limit,
+                    human,
+                })
+                .await?;
+            }
+            TrustAction::Stats { human } => {
+                commands::trust_cli::stats(commands::trust_cli::TrustStatsOptions { human })
+                    .await?;
+            }
+            TrustAction::Query {
+                target,
+                domain,
+                limit,
+                human,
+            } => {
+                commands::trust_cli::query(commands::trust_cli::TrustQueryOptions {
+                    target,
+                    domain,
+                    limit,
+                    human,
+                })
+                .await?;
+            }
+            TrustAction::Block {
+                target,
+                reason,
+                human,
+            } => {
+                commands::trust_cli::block(target, reason, human).await?;
+            }
+            TrustAction::Unblock { target, human } => {
+                commands::trust_cli::unblock(target, human).await?;
+            }
+            TrustAction::ListBlocked { human } => {
+                commands::trust_cli::list_blocked(commands::trust_cli::TrustListOptions { human })
+                    .await?;
+            }
+            TrustAction::Allow {
+                target,
+                note,
+                human,
+            } => {
+                commands::trust_cli::allow(commands::trust_cli::TrustAllowOptions {
+                    target,
+                    note,
+                    human,
+                })
+                .await?;
+            }
+            TrustAction::ListAllowed { human } => {
+                commands::trust_cli::list_allowed(commands::trust_cli::TrustListOptions { human })
+                    .await?;
+            }
+        },
 
         Commands::Block {
             target,

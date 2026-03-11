@@ -46,6 +46,27 @@ describe('message envelope async correlation', () => {
     });
   });
 
+  it('preserves quick agent group metadata on envelopes', () => {
+    const envelope = createEnvelope(
+      'did:agent:zSender',
+      'did:agent:zTarget',
+      'message',
+      '/jobs/1.0.0',
+      { status: 'running', jobId: 'job-1' },
+      undefined,
+      undefined,
+      'grp_overlay',
+    );
+
+    const normalized = normalizeEnvelope({
+      ...envelope,
+      signature: 'deadbeef',
+    });
+
+    expect(envelope.groupId).toBe('grp_overlay');
+    expect(normalized?.groupId).toBe('grp_overlay');
+  });
+
   it('signs and verifies message envelopes with replyTo', async () => {
     const keyPair = await generateKeyPair();
     const did = deriveDID(keyPair.publicKey);

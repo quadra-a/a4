@@ -7,6 +7,7 @@ export * from './daemon-server.js';
 export * from './daemon-control.js';
 export * from './listener-bootstrap.js';
 export * from './agent-runtime.js';
+export * from './group-runtime.js';
 export * from './messaging.js';
 export * from './inbox.js';
 export * from './message-trace.js';

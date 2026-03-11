@@ -3,25 +3,36 @@
 /// Request:  {"id":"req_...","command":"send","params":{...}}\n
 /// Response: {"id":"req_...","success":true,"data":{...}}\n
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot, RwLock};
-use tokio::time::{sleep, timeout, Duration};
+use tokio::time::{timeout, Duration};
 use uuid::Uuid;
 
 use crate::config::{
-    resolve_reachability_policy, save_config, Config, EndorsementV2, IdentityConfig,
-    ReachabilityMode, ReachabilityPolicy, TrustConfig,
+    resolve_reachability_policy, resolve_relay_invite_token, save_config, Config, EndorsementV2,
+    TrustConfig,
 };
-use crate::identity::{derive_did, KeyPair};
-use crate::protocol::{cbor_x_encode_json, AgentCard, AgentCardUnsigned, Capability};
-use crate::relay::{extract_discovered_relay_endpoints, RelaySession, DEFAULT_RELAY};
+use crate::identity::KeyPair;
+use crate::protocol::{cbor_x_encode_json, AgentCard};
 use crate::trust::{ActivityLevel, NetworkPosition, TrustEngine};
+use quadra_a_runtime::card::build_agent_card_from_config;
+use quadra_a_runtime::inbox::{
+    effective_thread_id, parse_envelope_value, MessageDirection, MessageStore, StoredMessage,
+};
+use quadra_a_runtime::query::{
+    query_discovered_agents as runtime_query_discovered_agents,
+    query_network_endorsements as runtime_query_network_endorsements,
+};
+use quadra_a_runtime::relay_worker::{
+    run_relay_worker as runtime_run_relay_worker, RelayWorkerCommand, RelayWorkerEvent,
+    RelayWorkerOptions,
+};
+use quadra_a_runtime::session_manager::ManagedRelayState;
 
 pub const DEFAULT_DAEMON_SOCKET: &str = "/tmp/quadra-a-rs.sock";
 
@@ -73,6 +84,20 @@ fn non_empty_str(value: Option<&Value>) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
+pub struct DaemonState {
+    pub config: Config,
+    pub keypair: KeyPair,
+    pub relay_runtime: ManagedRelayState,
+    relay_sender: Option<mpsc::Sender<RelayWorkerCommand>>,
+    pub messages: MessageStore,
+    pub running: bool,
+}
+
+pub struct DaemonServer {
+    state: Arc<RwLock<DaemonState>>,
+    socket_path: String,
+}
+
 fn matches_capability(card: &AgentCard, capability: &str) -> bool {
     let normalized = capability.trim().to_lowercase();
     if normalized.is_empty() {
@@ -85,202 +110,16 @@ fn matches_capability(card: &AgentCard, capability: &str) -> bool {
     })
 }
 
-fn parse_envelope_value(envelope_bytes: &[u8]) -> Result<Value> {
-    if let Ok(value) = crate::protocol::cbor_decode_value(envelope_bytes) {
-        return Ok(value);
-    }
-
-    serde_json::from_slice::<Value>(envelope_bytes).context("Invalid envelope payload")
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum MessageDirection {
-    Inbound,
-    Outbound,
-}
-
-impl MessageDirection {
-    fn as_str(self) -> &'static str {
-        match self {
-            MessageDirection::Inbound => "inbound",
-            MessageDirection::Outbound => "outbound",
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct Message {
-    pub id: String,
-    pub from: String,
-    pub to: String,
-    pub envelope: Value,
-    pub timestamp: u64,
-    pub thread_id: Option<String>,
-    pub read: bool,
-    pub direction: MessageDirection,
-}
-
-pub struct DaemonState {
-    pub config: Config,
-    pub keypair: KeyPair,
-    pub relay_url: String,
-    relay_sender: Option<mpsc::Sender<RelayCommand>>,
-    pub messages: Vec<Message>,
-    pub running: bool,
-    pub connected: bool,
-    pub connected_at: u64,
-    pub reachability_policy: ReachabilityPolicy,
-    pub known_relays: Vec<String>,
-    pub last_discovery_at: Option<u64>,
-    pub relay_failures: HashMap<String, RelayFailureState>,
-}
-
-pub struct DaemonServer {
-    state: Arc<RwLock<DaemonState>>,
-    socket_path: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct DiscoveredAgentEnvelope {
-    did: Option<String>,
-    online: Option<bool>,
-    #[serde(default)]
-    trust: Option<Value>,
-    card: AgentCard,
-}
-
-struct SessionSummary {
-    thread_id: String,
-    peer_did: String,
-    started_at: u64,
-    last_message_at: u64,
-    message_count: usize,
-    title: String,
-}
-
-#[derive(Clone, Serialize)]
-pub struct RelayFailureState {
-    pub provider: String,
-    pub attempts: u32,
-    #[serde(rename = "lastFailureAt")]
-    pub last_failure_at: u64,
-    #[serde(rename = "lastError", skip_serializing_if = "Option::is_none")]
-    pub last_error: Option<String>,
-}
-
-enum RelayCommand {
-    SendEnvelope {
-        to: String,
-        envelope_bytes: Vec<u8>,
-        response: oneshot::Sender<Result<()>>,
-    },
-    Stop,
-}
-
-const RELAY_DISCOVERY_CAPABILITY: &str = "relay/message-routing";
-const RELAY_MAINTENANCE_INTERVAL_SECS: u64 = 60;
-const RELAY_RECONNECT_DELAY_SECS: u64 = 5;
-
-fn relay_candidates(state: &DaemonState) -> Vec<String> {
-    let mut seen = HashSet::new();
-    let mut relays = Vec::new();
-
-    for relay_url in std::iter::once(state.relay_url.as_str())
-        .chain(state.known_relays.iter().map(String::as_str))
-        .chain(
-            state
-                .reachability_policy
-                .bootstrap_providers
-                .iter()
-                .map(String::as_str),
-        )
-    {
-        let normalized = relay_url.trim();
-        if normalized.is_empty() {
-            continue;
-        }
-        if seen.insert(normalized.to_string()) {
-            relays.push(normalized.to_string());
-        }
-    }
-
-    if relays.is_empty() {
-        relays.push(DEFAULT_RELAY.to_string());
-    }
-
-    relays
-}
-
-fn insert_known_relays<I>(state: &mut DaemonState, relays: I) -> bool
-where
-    I: IntoIterator<Item = String>,
-{
-    let mut changed = false;
-    for relay_url in relays {
-        let normalized = relay_url.trim();
-        if normalized.is_empty() {
-            continue;
-        }
-        if state.known_relays.iter().any(|known| known == normalized) {
-            continue;
-        }
-        state.known_relays.push(normalized.to_string());
-        changed = true;
-    }
-    changed
-}
-
-fn relay_failure_snapshot(state: &DaemonState) -> Vec<RelayFailureState> {
-    let mut failures = state
-        .relay_failures
-        .values()
-        .cloned()
-        .collect::<Vec<_>>();
-    failures.sort_by(|left, right| left.provider.cmp(&right.provider));
-    failures
-}
-
-async fn record_relay_failure(state: &Arc<RwLock<DaemonState>>, relay_url: &str, error: String) {
-    let mut state_guard = state.write().await;
-    let entry = state_guard
-        .relay_failures
-        .entry(relay_url.to_string())
-        .or_insert(RelayFailureState {
-            provider: relay_url.to_string(),
-            attempts: 0,
-            last_failure_at: 0,
-            last_error: None,
-        });
-    entry.attempts = entry.attempts.saturating_add(1);
-    entry.last_failure_at = now_ms();
-    entry.last_error = Some(error);
-}
-
-async fn clear_relay_failure(state: &Arc<RwLock<DaemonState>>, relay_url: &str) {
-    state.write().await.relay_failures.remove(relay_url);
-}
-
 impl DaemonServer {
     pub fn new(config: Config, keypair: KeyPair, socket_path: &str) -> Self {
         let reachability_policy = resolve_reachability_policy(None, Some(&config));
-        let relay_url = reachability_policy
-            .bootstrap_providers
-            .first()
-            .cloned()
-            .unwrap_or_else(|| DEFAULT_RELAY.to_string());
         let state = DaemonState {
             config,
             keypair,
-            relay_url,
+            relay_runtime: ManagedRelayState::new(reachability_policy),
             relay_sender: None,
-            messages: Vec::new(),
+            messages: MessageStore::default(),
             running: true,
-            connected: false,
-            connected_at: 0,
-            reachability_policy: reachability_policy.clone(),
-            known_relays: reachability_policy.bootstrap_providers.clone(),
-            last_discovery_at: None,
-            relay_failures: HashMap::new(),
         };
 
         DaemonServer {
@@ -303,31 +142,33 @@ impl DaemonServer {
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("No identity found"))?;
             let should_publish = state.config.published.unwrap_or(false);
-            let reachability_policy = resolve_reachability_policy(explicit_relay, Some(&state.config));
-            let card = crate::commands::discover::build_card(&state.config, &identity)?;
+            let reachability_policy =
+                resolve_reachability_policy(explicit_relay, Some(&state.config));
+            let card = build_agent_card_from_config(&state.config, &identity)?;
+            let invite_token = resolve_relay_invite_token(None, Some(&state.config));
             let (relay_tx, relay_rx) = mpsc::channel(32);
+            let (event_tx, event_rx) = mpsc::channel(128);
 
-            state.reachability_policy = reachability_policy.clone();
-            state.known_relays = reachability_policy.bootstrap_providers.clone();
-            if state.known_relays.is_empty() {
-                state.known_relays.push(DEFAULT_RELAY.to_string());
-            }
-            state.relay_url = state
-                .known_relays
-                .first()
-                .cloned()
-                .unwrap_or_else(|| DEFAULT_RELAY.to_string());
-            state.connected = false;
-            state.connected_at = 0;
-            state.last_discovery_at = None;
-            state.relay_failures.clear();
+            state.relay_runtime.reset(reachability_policy.clone());
+            let relay_runtime = state.relay_runtime.clone();
             state.relay_sender = Some(relay_tx);
 
-            eprintln!("Daemon managing relays: {}", state.known_relays.join(", "));
+            eprintln!(
+                "Daemon managing relays: {}",
+                state.relay_runtime.known_relays.join(", ")
+            );
 
             let state_clone = Arc::clone(&self.state);
             tokio::spawn(async move {
-                Self::run_relay_worker(state_clone, relay_rx, identity, card, should_publish).await;
+                Self::process_relay_worker_events(state_clone, event_rx).await;
+            });
+
+            let worker_options = RelayWorkerOptions {
+                should_publish,
+                ..RelayWorkerOptions::new(identity, card, invite_token)
+            };
+            tokio::spawn(async move {
+                runtime_run_relay_worker(relay_runtime, relay_rx, event_tx, worker_options).await;
             });
         }
 
@@ -357,228 +198,98 @@ impl DaemonServer {
         Ok(())
     }
 
-    async fn connect_managed_session(
-        state: &Arc<RwLock<DaemonState>>,
-        identity: &IdentityConfig,
-        card: &AgentCard,
-        should_publish: bool,
-    ) -> Result<(RelaySession, String)> {
-        let keypair = KeyPair::from_hex(&identity.private_key)?;
-        let relay_urls = {
-            let state_guard = state.read().await;
-            relay_candidates(&state_guard)
-        };
-
-        let mut errors = Vec::new();
-        for relay_url in relay_urls {
-            match RelaySession::connect(&relay_url, &identity.did, card, &keypair).await {
-                Ok(mut session) => {
-                    clear_relay_failure(state, &relay_url).await;
-                    if should_publish {
-                        if let Err(error) = session.publish_card().await {
-                            record_relay_failure(
-                                state,
-                                &relay_url,
-                                format!("publish failed: {}", error),
-                            )
-                            .await;
-                            let _ = session.goodbye().await;
-                            errors.push(format!("{}: publish failed: {}", relay_url, error));
+    async fn process_relay_worker_events(
+        state: Arc<RwLock<DaemonState>>,
+        mut event_rx: mpsc::Receiver<RelayWorkerEvent>,
+    ) {
+        while let Some(event) = event_rx.recv().await {
+            match event {
+                RelayWorkerEvent::EnvelopeReceived {
+                    relay_url,
+                    message_id,
+                    from,
+                    envelope_bytes,
+                    received_at,
+                } => {
+                    let envelope = match parse_envelope_value(&envelope_bytes) {
+                        Ok(envelope) => envelope,
+                        Err(err) => {
+                            eprintln!(
+                                "Skipping relay message {} from {} on {}: {}",
+                                message_id, from, relay_url, err,
+                            );
                             continue;
                         }
-                        eprintln!("Daemon published agent card for discovery");
-                    }
+                    };
 
-                    {
-                        let mut state_guard = state.write().await;
-                        state_guard.relay_url = relay_url.clone();
-                        state_guard.connected = true;
-                        state_guard.connected_at = now_ms();
-                        insert_known_relays(&mut state_guard, std::iter::once(relay_url.clone()));
-                    }
+                    let message = StoredMessage {
+                        id: envelope
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(&message_id)
+                            .to_string(),
+                        from,
+                        to: envelope
+                            .get("to")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        timestamp: json_u64(envelope.get("timestamp")).unwrap_or(received_at),
+                        thread_id: envelope
+                            .get("threadId")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                        envelope,
+                        read: false,
+                        direction: MessageDirection::Inbound,
+                    };
 
-                    eprintln!("Daemon connected to relay {} as {}", relay_url, identity.did);
-                    return Ok((session, relay_url));
+                    let mut state_guard = state.write().await;
+                    state_guard.messages.store(message);
                 }
-                Err(error) => {
-                    record_relay_failure(state, &relay_url, error.to_string()).await;
-                    errors.push(format!("{}: {}", relay_url, error));
+                RelayWorkerEvent::DeliveryReported {
+                    relay_url,
+                    message_id,
+                    status,
+                    ..
+                } => {
+                    eprintln!(
+                        "Relay delivery report on {} for {}: {}",
+                        relay_url, message_id, status,
+                    );
                 }
-            }
-        }
+                other => {
+                    let mut state_guard = state.write().await;
+                    let known_relays_before = state_guard.relay_runtime.known_relays.len();
+                    state_guard.relay_runtime.apply_worker_event(&other);
 
-        state.write().await.connected = false;
-        anyhow::bail!(
-            "Failed to connect to any relay: {}",
-            if errors.is_empty() {
-                "no configured relays".to_string()
-            } else {
-                errors.join(" | ")
-            }
-        )
-    }
-
-    async fn maintain_relay_set(state: &Arc<RwLock<DaemonState>>, relay_url: &str) -> Result<()> {
-        let limit = {
-            let state_guard = state.read().await;
-            if !matches!(state_guard.reachability_policy.mode, ReachabilityMode::Adaptive)
-                || !state_guard.reachability_policy.auto_discover_providers
-            {
-                return Ok(());
-            }
-            ((state_guard.reachability_policy.target_provider_count as usize).max(1) * 4)
-                .max(10) as u32
-        };
-
-        let relay_endpoints = discover_relay_providers(relay_url, limit).await?;
-        let mut state_guard = state.write().await;
-        state_guard.last_discovery_at = Some(now_ms());
-        if insert_known_relays(&mut state_guard, relay_endpoints) {
-            eprintln!("Daemon supplemented relay pool: {}", state_guard.known_relays.join(", "));
-        }
-        Ok(())
-    }
-
-    async fn run_relay_worker(
-        state: Arc<RwLock<DaemonState>>,
-        mut relay_rx: mpsc::Receiver<RelayCommand>,
-        identity: IdentityConfig,
-        card: AgentCard,
-        should_publish: bool,
-    ) {
-        let mut maintenance_interval = tokio::time::interval(Duration::from_secs(
-            RELAY_MAINTENANCE_INTERVAL_SECS,
-        ));
-        maintenance_interval.tick().await;
-
-        'worker: loop {
-            if !state.read().await.running {
-                break;
-            }
-
-            let (mut session, relay_url) = match Self::connect_managed_session(
-                &state,
-                &identity,
-                &card,
-                should_publish,
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(error) => {
-                    eprintln!("Relay connect retry pending: {}", error);
-                    tokio::select! {
-                        maybe_command = relay_rx.recv() => {
-                            match maybe_command {
-                                Some(RelayCommand::Stop) | None => break 'worker,
-                                Some(RelayCommand::SendEnvelope { response, .. }) => {
-                                    let _ = response.send(Err(anyhow::anyhow!("Not connected to any relay")));
-                                }
-                            }
+                    match &other {
+                        RelayWorkerEvent::Connected { relay_url, .. } => {
+                            let did = state_guard
+                                .config
+                                .identity
+                                .as_ref()
+                                .map(|identity| identity.did.as_str())
+                                .unwrap_or("unknown");
+                            eprintln!("Daemon connected to relay {} as {}", relay_url, did);
                         }
-                        _ = sleep(Duration::from_secs(RELAY_RECONNECT_DELAY_SECS)) => {}
-                    }
-                    continue;
-                }
-            };
-
-            let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
-            ping_interval.tick().await;
-
-            loop {
-                if !state.read().await.running {
-                    break 'worker;
-                }
-
-                tokio::select! {
-                    maybe_command = relay_rx.recv() => {
-                        match maybe_command {
-                            Some(RelayCommand::SendEnvelope { to, envelope_bytes, response }) => {
-                                let result = session.send_envelope(&to, envelope_bytes).await;
-                                if let Err(error) = &result {
-                                    record_relay_failure(&state, &relay_url, error.to_string()).await;
-                                }
-                                let failed = result.is_err();
-                                let _ = response.send(result);
-                                if failed {
-                                    break;
-                                }
-                            }
-                            Some(RelayCommand::Stop) | None => break 'worker,
+                        RelayWorkerEvent::RelayPoolUpdated { .. }
+                            if state_guard.relay_runtime.known_relays.len()
+                                > known_relays_before =>
+                        {
+                            eprintln!(
+                                "Daemon supplemented relay pool: {}",
+                                state_guard.relay_runtime.known_relays.join(", ")
+                            );
                         }
-                    }
-                    result = session.next_deliver() => {
-                        match result {
-                            Ok((message_id, from, envelope_bytes)) => {
-                                if !from.starts_with("__delivery_report:") {
-                                    let envelope = match parse_envelope_value(&envelope_bytes) {
-                                        Ok(envelope) => envelope,
-                                        Err(err) => {
-                                            eprintln!(
-                                                "Skipping relay message {} from {}: {}",
-                                                message_id,
-                                                from,
-                                                err,
-                                            );
-                                            continue;
-                                        }
-                                    };
-
-                                    let message = Message {
-                                        id: envelope.get("id").and_then(|v| v.as_str()).unwrap_or(&message_id).to_string(),
-                                        from: from.clone(),
-                                        to: envelope.get("to").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                                        timestamp: json_u64(envelope.get("timestamp")).unwrap_or_else(now_ms),
-                                        thread_id: envelope.get("threadId").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                                        envelope,
-                                        read: false,
-                                        direction: MessageDirection::Inbound,
-                                    };
-
-                                    let mut state_guard = state.write().await;
-                                    store_message(&mut state_guard, message);
-                                }
-                            }
-                            Err(error) => {
-                                eprintln!("Relay error on {}: {}", relay_url, error);
-                                record_relay_failure(&state, &relay_url, error.to_string()).await;
-                                break;
-                            }
-                        }
-                    }
-                    _ = ping_interval.tick() => {
-                        if let Err(error) = session.ping().await {
-                            eprintln!("Ping failed on {}: {}", relay_url, error);
-                            record_relay_failure(&state, &relay_url, error.to_string()).await;
-                            break;
-                        }
-                    }
-                    _ = maintenance_interval.tick() => {
-                        if let Err(error) = Self::maintain_relay_set(&state, &relay_url).await {
-                            eprintln!("Relay maintenance skipped on {}: {}", relay_url, error);
-                        }
+                        _ => {}
                     }
                 }
-            }
-
-            let _ = session.goodbye().await;
-            state.write().await.connected = false;
-
-            tokio::select! {
-                maybe_command = relay_rx.recv() => {
-                    match maybe_command {
-                        Some(RelayCommand::Stop) | None => break 'worker,
-                        Some(RelayCommand::SendEnvelope { response, .. }) => {
-                            let _ = response.send(Err(anyhow::anyhow!("Not connected to any relay")));
-                        }
-                    }
-                }
-                _ = sleep(Duration::from_secs(RELAY_RECONNECT_DELAY_SECS)) => {}
             }
         }
 
         let mut state_guard = state.write().await;
-        state_guard.connected = false;
+        state_guard.relay_runtime.mark_disconnected();
         state_guard.relay_sender = None;
     }
 
@@ -660,11 +371,11 @@ impl DaemonServer {
                 let relay_sender = {
                     let mut state_guard = state.write().await;
                     state_guard.running = false;
-                    state_guard.connected = false;
+                    state_guard.relay_runtime.mark_disconnected();
                     state_guard.relay_sender.clone()
                 };
                 if let Some(relay_sender) = relay_sender {
-                    let _ = relay_sender.send(RelayCommand::Stop).await;
+                    let _ = relay_sender.send(RelayWorkerCommand::Stop).await;
                 }
                 Ok(json!({"stopping": true}))
             }
@@ -680,27 +391,27 @@ async fn handle_status(state: Arc<RwLock<DaemonState>>) -> Result<Value> {
         .identity
         .as_ref()
         .map(|identity| identity.did.clone());
-    let connected_relays = if state_guard.connected {
-        vec![state_guard.relay_url.clone()]
+    let connected_relays = if state_guard.relay_runtime.connected {
+        vec![state_guard.relay_runtime.relay_url.clone()]
     } else {
         Vec::<String>::new()
     };
-    let known_relays = state_guard.known_relays.clone();
-    let reachability_policy = state_guard.reachability_policy.clone();
-    let relay_failures = relay_failure_snapshot(&state_guard);
+    let known_relays = state_guard.relay_runtime.known_relays.clone();
+    let reachability_policy = state_guard.relay_runtime.reachability_policy.clone();
+    let relay_failures = state_guard.relay_runtime.failure_snapshot();
 
     Ok(json!({
         "running": state_guard.running,
-        "connected": state_guard.connected,
+        "connected": state_guard.relay_runtime.connected,
         "messages": state_guard.messages.len(),
-        "relay": state_guard.relay_url.clone(),
+        "relay": state_guard.relay_runtime.relay_url.clone(),
         "connectedRelays": connected_relays.clone(),
         "knownRelays": known_relays.clone(),
         "reachabilityPolicy": reachability_policy.clone(),
         "reachabilityStatus": {
             "connectedProviders": connected_relays,
             "knownProviders": known_relays,
-            "lastDiscoveryAt": state_guard.last_discovery_at,
+            "lastDiscoveryAt": state_guard.relay_runtime.last_discovery_at,
             "providerFailures": relay_failures,
             "targetProviderCount": reachability_policy.target_provider_count,
             "mode": reachability_policy.mode,
@@ -708,7 +419,7 @@ async fn handle_status(state: Arc<RwLock<DaemonState>>) -> Result<Value> {
             "operatorLock": reachability_policy.operator_lock,
             "bootstrapProviders": reachability_policy.bootstrap_providers,
         },
-        "connectedAt": state_guard.connected_at,
+        "connectedAt": state_guard.relay_runtime.connected_at,
         "did": did,
     }))
 }
@@ -732,35 +443,12 @@ async fn handle_inbox(params: Value, state: Arc<RwLock<DaemonState>>) -> Result<
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let mut matching: Vec<_> = state_guard
+    let (selected, total) = state_guard
         .messages
-        .iter_mut()
-        .filter(|msg| {
-            if unread && msg.read {
-                return false;
-            }
-
-            if let Some(thread_id) = &thread_id {
-                let effective = effective_thread_id(msg);
-                if msg.thread_id.as_deref() != Some(thread_id.as_str()) && effective != *thread_id {
-                    return false;
-                }
-            }
-
-            true
-        })
-        .collect();
-
-    matching.sort_by_key(|msg| msg.timestamp);
-    let total = matching.len();
-
-    let selected = matching.into_iter().rev().take(limit).collect::<Vec<_>>();
+        .inbox_page(limit, unread, thread_id.as_deref());
     let messages = selected
         .into_iter()
-        .map(|msg| {
-            msg.read = true;
-            message_to_inbox_json(msg)
-        })
+        .map(|message| message_to_inbox_json(&message))
         .collect::<Vec<_>>();
 
     Ok(json!({
@@ -776,7 +464,7 @@ async fn handle_send(params: Value, state: Arc<RwLock<DaemonState>>) -> Result<V
         .identity
         .clone()
         .ok_or_else(|| anyhow::anyhow!("No identity found"))?;
-    if !state_guard.connected {
+    if !state_guard.relay_runtime.connected {
         anyhow::bail!("Not connected to any relay");
     }
     let relay_sender = state_guard
@@ -844,7 +532,7 @@ async fn handle_send(params: Value, state: Arc<RwLock<DaemonState>>) -> Result<V
 
     let (response_tx, response_rx) = oneshot::channel();
     relay_sender
-        .send(RelayCommand::SendEnvelope {
+        .send(RelayWorkerCommand::SendEnvelope {
             to: to.clone(),
             envelope_bytes,
             response: response_tx,
@@ -855,7 +543,7 @@ async fn handle_send(params: Value, state: Arc<RwLock<DaemonState>>) -> Result<V
         .await
         .context("Relay worker dropped send response")??;
 
-    let message = Message {
+    let message = StoredMessage {
         id: message_id.clone(),
         from: identity.did,
         to,
@@ -865,7 +553,7 @@ async fn handle_send(params: Value, state: Arc<RwLock<DaemonState>>) -> Result<V
         read: true,
         direction: MessageDirection::Outbound,
     };
-    store_message(&mut state_guard, message);
+    state_guard.messages.store(message);
 
     Ok(json!({
         "sent": true,
@@ -876,9 +564,12 @@ async fn handle_send(params: Value, state: Arc<RwLock<DaemonState>>) -> Result<V
 }
 
 async fn handle_discover(params: Value, state: Arc<RwLock<DaemonState>>) -> Result<Value> {
-    let relay_urls = {
+    let (relay_urls, invite_token) = {
         let state_guard = state.read().await;
-        relay_candidates(&state_guard)
+        (
+            state_guard.relay_runtime.candidates(),
+            resolve_relay_invite_token(None, Some(&state_guard.config)),
+        )
     };
     let limit = json_u64(params.get("limit")).unwrap_or(20) as u32;
     let capability = non_empty_str(params.get("capability"));
@@ -889,10 +580,32 @@ async fn handle_discover(params: Value, state: Arc<RwLock<DaemonState>>) -> Resu
     );
     let query = non_empty_str(params.get("query"));
 
-    let mut discovered = if query.is_some() {
-        query_discovered_agents(&relay_urls, query, None, min_trust, limit).await?
+    let mut discovered: Vec<(AgentCard, bool)> = if query.is_some() {
+        runtime_query_discovered_agents(
+            &relay_urls,
+            invite_token.as_deref(),
+            query,
+            None,
+            min_trust,
+            limit,
+        )
+        .await?
+        .into_iter()
+        .map(|result| (result.card, result.online))
+        .collect()
     } else {
-        query_discovered_agents(&relay_urls, None, capability, min_trust, limit).await?
+        runtime_query_discovered_agents(
+            &relay_urls,
+            invite_token.as_deref(),
+            None,
+            capability,
+            min_trust,
+            limit,
+        )
+        .await?
+        .into_iter()
+        .map(|result| (result.card, result.online))
+        .collect()
     };
 
     if let (Some(_query), Some(capability)) = (query, capability) {
@@ -914,12 +627,13 @@ async fn handle_discover(params: Value, state: Arc<RwLock<DaemonState>>) -> Resu
 }
 
 async fn handle_peers(params: Value, state: Arc<RwLock<DaemonState>>) -> Result<Value> {
-    let (relay_urls, relay_url, connected_at) = {
+    let (relay_urls, relay_url, connected_at, invite_token) = {
         let state_guard = state.read().await;
         (
-            relay_candidates(&state_guard),
-            state_guard.relay_url.clone(),
-            state_guard.connected_at,
+            state_guard.relay_runtime.candidates(),
+            state_guard.relay_runtime.relay_url.clone(),
+            state_guard.relay_runtime.connected_at,
+            resolve_relay_invite_token(None, Some(&state_guard.config)),
         )
     };
     let limit = json_u64(params.get("limit")).unwrap_or(20) as u32;
@@ -927,10 +641,32 @@ async fn handle_peers(params: Value, state: Arc<RwLock<DaemonState>>) -> Result<
     let min_trust = json_f64(params.get("minTrust"));
     let query = non_empty_str(params.get("query"));
 
-    let mut discovered = if query.is_some() {
-        query_discovered_agents(&relay_urls, query, None, min_trust, limit).await?
+    let mut discovered: Vec<(AgentCard, bool)> = if query.is_some() {
+        runtime_query_discovered_agents(
+            &relay_urls,
+            invite_token.as_deref(),
+            query,
+            None,
+            min_trust,
+            limit,
+        )
+        .await?
+        .into_iter()
+        .map(|result| (result.card, result.online))
+        .collect()
     } else {
-        query_discovered_agents(&relay_urls, None, capability, min_trust, limit).await?
+        runtime_query_discovered_agents(
+            &relay_urls,
+            invite_token.as_deref(),
+            None,
+            capability,
+            min_trust,
+            limit,
+        )
+        .await?
+        .into_iter()
+        .map(|result| (result.card, result.online))
+        .collect()
     };
 
     if let (Some(_query), Some(capability)) = (query, capability) {
@@ -961,7 +697,7 @@ async fn handle_sessions(params: Value, state: Arc<RwLock<DaemonState>>) -> Resu
     let limit = json_u64(params.get("limit")).unwrap_or(50) as usize;
     let peer_filter = params.get("peerDid").and_then(|v| v.as_str());
 
-    let all_sessions = build_session_summaries(&state_guard.messages, peer_filter);
+    let all_sessions = state_guard.messages.session_summaries(peer_filter);
     let total = all_sessions.len();
     let sessions = all_sessions
         .into_iter()
@@ -992,19 +728,10 @@ async fn handle_session_messages(params: Value, state: Arc<RwLock<DaemonState>>)
     let limit = json_u64(params.get("limit")).unwrap_or(50) as usize;
 
     let state_guard = state.read().await;
-    let mut messages = state_guard
-        .messages
-        .iter()
-        .filter(|msg| effective_thread_id(msg) == thread_id)
-        .collect::<Vec<_>>();
-    messages.sort_by_key(|msg| msg.timestamp);
-
-    let total = messages.len();
-    let start = total.saturating_sub(limit);
+    let (messages, total) = state_guard.messages.session_messages(thread_id, limit);
     let page = messages
         .into_iter()
-        .skip(start)
-        .map(message_to_session_json)
+        .map(|message| message_to_session_json(&message))
         .collect::<Vec<_>>();
 
     Ok(json!({
@@ -1021,7 +748,7 @@ async fn handle_trust_score(params: Value, state: Arc<RwLock<DaemonState>>) -> R
         .ok_or_else(|| anyhow::anyhow!("Missing target DID"))?
         .to_string();
 
-    let (observer_did, relay_urls, local_trust_config) = {
+    let (observer_did, relay_urls, invite_token, local_trust_config) = {
         let state_guard = state.read().await;
         let observer_did = state_guard
             .config
@@ -1032,14 +759,22 @@ async fn handle_trust_score(params: Value, state: Arc<RwLock<DaemonState>>) -> R
             .clone();
         (
             observer_did,
-            relay_candidates(&state_guard),
+            state_guard.relay_runtime.candidates(),
+            resolve_relay_invite_token(None, Some(&state_guard.config)),
             state_guard.config.trust_config.clone().unwrap_or_default(),
         )
     };
 
     let mut endorsements: Vec<EndorsementV2> =
         local_trust_config.endorsements.values().cloned().collect();
-    if let Ok(network_endorsements) = query_network_endorsements(&relay_urls, &target_did, 100).await
+    if let Ok(network_endorsements) = runtime_query_network_endorsements(
+        &relay_urls,
+        invite_token.as_deref(),
+        &target_did,
+        None,
+        100,
+    )
+    .await
     {
         merge_endorsements(&mut endorsements, network_endorsements);
     }
@@ -1082,11 +817,13 @@ async fn handle_endorsements(params: Value, state: Arc<RwLock<DaemonState>>) -> 
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
     let limit = json_u64(params.get("limit")).unwrap_or(20) as usize;
+    let domain = non_empty_str(params.get("domain"));
 
-    let (relay_urls, mut endorsements) = {
+    let (relay_urls, invite_token, mut endorsements) = {
         let state_guard = state.read().await;
         (
-            relay_candidates(&state_guard),
+            state_guard.relay_runtime.candidates(),
+            resolve_relay_invite_token(None, Some(&state_guard.config)),
             state_guard
                 .config
                 .trust_config
@@ -1099,8 +836,14 @@ async fn handle_endorsements(params: Value, state: Arc<RwLock<DaemonState>>) -> 
     };
 
     if let Some(target_did) = &target_did {
-        if let Ok(network_endorsements) =
-            query_network_endorsements(&relay_urls, target_did, limit as u32 + 20).await
+        if let Ok(network_endorsements) = runtime_query_network_endorsements(
+            &relay_urls,
+            invite_token.as_deref(),
+            target_did,
+            domain,
+            limit as u32 + 20,
+        )
+        .await
         {
             merge_endorsements(&mut endorsements, network_endorsements);
         }
@@ -1115,7 +858,14 @@ async fn handle_endorsements(params: Value, state: Arc<RwLock<DaemonState>>) -> 
             .as_ref()
             .map(|creator| &endorsement.endorser == creator)
             .unwrap_or(true);
-        target_matches && creator_matches
+        let domain_matches = domain
+            .map(|requested| {
+                endorsement.domain.as_deref() == Some(requested)
+                    || endorsement.domain.as_deref() == Some("*")
+                    || endorsement.domain.is_none()
+            })
+            .unwrap_or(true);
+        target_matches && creator_matches && domain_matches
     });
     endorsements.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
 
@@ -1140,19 +890,28 @@ async fn handle_block_agent(params: Value, state: Arc<RwLock<DaemonState>>) -> R
         .ok_or_else(|| anyhow::anyhow!("Missing target DID"))?
         .to_string();
 
+    let action = params
+        .get("action")
+        .and_then(|value| value.as_str())
+        .unwrap_or("block");
+
     let mut state_guard = state.write().await;
     if state_guard.config.trust_config.is_none() {
         state_guard.config.trust_config = Some(TrustConfig::new());
     }
 
     if let Some(trust_config) = &mut state_guard.config.trust_config {
-        trust_config.block_agent(target_did.clone());
+        if action == "unblock" {
+            trust_config.unblock_agent(&target_did);
+        } else {
+            trust_config.block_agent(target_did.clone());
+        }
     }
 
     save_config(&state_guard.config)?;
 
     Ok(json!({
-        "blocked": true,
+        "blocked": action != "unblock",
         "targetDid": target_did,
     }))
 }
@@ -1187,88 +946,7 @@ fn merge_endorsements(existing: &mut Vec<EndorsementV2>, incoming: Vec<Endorseme
     existing.extend(dedup.into_values());
 }
 
-fn store_message(state: &mut DaemonState, message: Message) {
-    state.messages.push(message);
-    let msg_len = state.messages.len();
-    if msg_len > 1000 {
-        state.messages.drain(0..msg_len - 1000);
-    }
-}
-
-fn effective_thread_id(message: &Message) -> String {
-    message
-        .thread_id
-        .clone()
-        .unwrap_or_else(|| format!("direct:{}", peer_did(message)))
-}
-
-fn peer_did(message: &Message) -> String {
-    match message.direction {
-        MessageDirection::Inbound => message.from.clone(),
-        MessageDirection::Outbound => message.to.clone(),
-    }
-}
-
-fn payload_text(payload: Option<&Value>) -> Option<String> {
-    payload.and_then(|payload| {
-        payload
-            .get("text")
-            .or_else(|| payload.get("message"))
-            .and_then(|value| value.as_str())
-            .map(|text| text.to_string())
-    })
-}
-
-fn session_title(message: &Message) -> String {
-    payload_text(message.envelope.get("payload"))
-        .map(|text| {
-            if text.chars().count() > 60 {
-                text.chars().take(60).collect::<String>() + "..."
-            } else {
-                text
-            }
-        })
-        .unwrap_or_else(|| format!("Conversation with {}", peer_did(message)))
-}
-
-fn build_session_summaries(messages: &[Message], peer_filter: Option<&str>) -> Vec<SessionSummary> {
-    let mut sessions = HashMap::<String, SessionSummary>::new();
-
-    for message in messages {
-        let peer = peer_did(message);
-        if let Some(peer_filter) = peer_filter {
-            if peer != peer_filter {
-                continue;
-            }
-        }
-
-        let thread_id = effective_thread_id(message);
-        let entry = sessions
-            .entry(thread_id.clone())
-            .or_insert_with(|| SessionSummary {
-                thread_id: thread_id.clone(),
-                peer_did: peer.clone(),
-                started_at: message.timestamp,
-                last_message_at: message.timestamp,
-                message_count: 0,
-                title: session_title(message),
-            });
-
-        entry.peer_did = peer;
-        entry.started_at = entry.started_at.min(message.timestamp);
-        entry.last_message_at = entry.last_message_at.max(message.timestamp);
-        entry.message_count += 1;
-        if entry.title.starts_with("Conversation with") {
-            entry.title = session_title(message);
-        }
-    }
-
-    let mut sessions = sessions.into_values().collect::<Vec<_>>();
-    sessions.sort_by(|a, b| b.last_message_at.cmp(&a.last_message_at));
-    sessions
-}
-
-fn message_to_inbox_json(message: &Message) -> Value {
+fn message_to_inbox_json(message: &StoredMessage) -> Value {
     json!({
         "id": message.id,
         "from": message.from,
@@ -1283,7 +961,7 @@ fn message_to_inbox_json(message: &Message) -> Value {
     })
 }
 
-fn message_to_session_json(message: &Message) -> Value {
+fn message_to_session_json(message: &StoredMessage) -> Value {
     json!({
         "id": message.id,
         "direction": message.direction.as_str(),
@@ -1291,195 +969,6 @@ fn message_to_session_json(message: &Message) -> Value {
         "receivedAt": if message.direction == MessageDirection::Inbound { json!(message.timestamp) } else { Value::Null },
         "sentAt": if message.direction == MessageDirection::Outbound { json!(message.timestamp) } else { Value::Null },
     })
-}
-
-fn parse_discovered_agent(value: Value) -> Option<(AgentCard, bool)> {
-    if let Ok(card) = serde_json::from_value::<AgentCard>(value.clone()) {
-        return Some((card, true));
-    }
-
-    if let Ok(mut envelope) = serde_json::from_value::<DiscoveredAgentEnvelope>(value) {
-        if let Some(did) = envelope.did.take() {
-            envelope.card.did = did;
-        }
-        if envelope.card.trust.is_none() {
-            envelope.card.trust = envelope.trust.take();
-        }
-        return Some((envelope.card, envelope.online.unwrap_or(true)));
-    }
-
-    None
-}
-
-async fn query_discovered_agents(
-    relay_urls: &[String],
-    query: Option<&str>,
-    capability: Option<&str>,
-    min_trust: Option<f64>,
-    limit: u32,
-) -> Result<Vec<(AgentCard, bool)>> {
-    let candidates = if relay_urls.is_empty() {
-        vec![DEFAULT_RELAY.to_string()]
-    } else {
-        relay_urls.to_vec()
-    };
-
-    let mut merged = Vec::new();
-    let mut seen = HashSet::new();
-    let mut errors = Vec::new();
-    let mut had_success = false;
-
-    for relay_url in candidates {
-        match query_discovered_agents_from_relay(&relay_url, query, capability, min_trust, limit)
-            .await
-        {
-            Ok(results) => {
-                had_success = true;
-                for (card, online) in results {
-                    if seen.insert(card.did.clone()) {
-                        merged.push((card, online));
-                        if merged.len() >= limit as usize {
-                            return Ok(merged);
-                        }
-                    }
-                }
-            }
-            Err(error) => errors.push(format!("{}: {}", relay_url, error)),
-        }
-    }
-
-    if had_success {
-        return Ok(merged);
-    }
-
-    anyhow::bail!(
-        "Failed to query discovery across known relays: {}",
-        if errors.is_empty() {
-            "no relay candidates".to_string()
-        } else {
-            errors.join(" | ")
-        }
-    )
-}
-
-async fn query_discovered_agents_from_relay(
-    relay_url: &str,
-    query: Option<&str>,
-    capability: Option<&str>,
-    min_trust: Option<f64>,
-    limit: u32,
-) -> Result<Vec<(AgentCard, bool)>> {
-    let mut session = connect_query_session(relay_url).await?;
-    let result = session
-        .discover(query, capability, min_trust, Some(limit))
-        .await?;
-    let _ = session.goodbye().await;
-    Ok(result
-        .into_iter()
-        .filter_map(parse_discovered_agent)
-        .collect())
-}
-
-async fn discover_relay_providers(relay_url: &str, limit: u32) -> Result<Vec<String>> {
-    let mut session = connect_query_session(relay_url).await?;
-    let result = session
-        .discover(None, Some(RELAY_DISCOVERY_CAPABILITY), None, Some(limit))
-        .await?;
-    let _ = session.goodbye().await;
-    Ok(extract_discovered_relay_endpoints(&result))
-}
-
-async fn query_network_endorsements(
-    relay_urls: &[String],
-    target_did: &str,
-    limit: u32,
-) -> Result<Vec<EndorsementV2>> {
-    let candidates = if relay_urls.is_empty() {
-        vec![DEFAULT_RELAY.to_string()]
-    } else {
-        relay_urls.to_vec()
-    };
-
-    let mut endorsements = Vec::new();
-    let mut errors = Vec::new();
-    let mut had_success = false;
-
-    for relay_url in candidates {
-        match query_network_endorsements_from_relay(&relay_url, target_did, limit).await {
-            Ok(result) => {
-                had_success = true;
-                merge_endorsements(&mut endorsements, result);
-                if endorsements.len() >= limit as usize {
-                    endorsements.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-                    endorsements.truncate(limit as usize);
-                    return Ok(endorsements);
-                }
-            }
-            Err(error) => errors.push(format!("{}: {}", relay_url, error)),
-        }
-    }
-
-    if had_success {
-        endorsements.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-        endorsements.truncate(limit as usize);
-        return Ok(endorsements);
-    }
-
-    anyhow::bail!(
-        "Failed to query endorsements across known relays: {}",
-        if errors.is_empty() {
-            "no relay candidates".to_string()
-        } else {
-            errors.join(" | ")
-        }
-    )
-}
-
-async fn query_network_endorsements_from_relay(
-    relay_url: &str,
-    target_did: &str,
-    limit: u32,
-) -> Result<Vec<EndorsementV2>> {
-    let mut session = connect_query_session(relay_url).await?;
-    let result = session
-        .query_endorsements(target_did, None, Some(limit), None)
-        .await?;
-    let _ = session.goodbye().await;
-    Ok(result.endorsements)
-}
-
-async fn connect_query_session(relay_url: &str) -> Result<RelaySession> {
-    let keypair = KeyPair::generate();
-    let did = derive_did(keypair.verifying_key.as_bytes());
-    let timestamp = now_ms();
-    let unsigned = AgentCardUnsigned {
-        did: did.clone(),
-        name: "Rust Daemon Query".to_string(),
-        description: "Internal query session".to_string(),
-        version: "1.0.0".to_string(),
-        capabilities: Vec::<Capability>::new(),
-        endpoints: vec![],
-        peer_id: None,
-        trust: None,
-        metadata: Some(json!({"internal": true})),
-        timestamp,
-    };
-    let signature = AgentCard::sign(&unsigned, &keypair);
-    let card = AgentCard {
-        did: unsigned.did,
-        name: unsigned.name,
-        description: unsigned.description,
-        version: unsigned.version,
-        capabilities: unsigned.capabilities,
-        endpoints: unsigned.endpoints,
-        peer_id: unsigned.peer_id,
-        trust: unsigned.trust,
-        metadata: unsigned.metadata,
-        timestamp: unsigned.timestamp,
-        signature,
-    };
-
-    RelaySession::connect(relay_url, &did, &card, &keypair).await
 }
 
 pub struct DaemonClient {
@@ -1557,11 +1046,7 @@ impl DaemonClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        build_session_summaries, effective_thread_id, parse_envelope_value,
-        resolve_daemon_socket_path, Message, MessageDirection, DEFAULT_DAEMON_SOCKET,
-    };
-    use serde_json::json;
+    use super::{resolve_daemon_socket_path, DEFAULT_DAEMON_SOCKET};
 
     #[test]
     fn prefers_rust_specific_socket_path() {
@@ -1582,56 +1067,5 @@ mod tests {
     fn uses_rust_default_when_no_env_is_set() {
         let actual = resolve_daemon_socket_path(None, None);
         assert_eq!(actual, DEFAULT_DAEMON_SOCKET);
-    }
-
-    #[test]
-    fn groups_direct_messages_into_synthetic_sessions() {
-        let messages = vec![
-            Message {
-                id: "msg-1".to_string(),
-                from: "did:agent:alice".to_string(),
-                to: "did:agent:me".to_string(),
-                envelope: json!({"payload": {"text": "hello"}}),
-                timestamp: 10,
-                thread_id: None,
-                read: false,
-                direction: MessageDirection::Inbound,
-            },
-            Message {
-                id: "msg-2".to_string(),
-                from: "did:agent:me".to_string(),
-                to: "did:agent:alice".to_string(),
-                envelope: json!({"payload": {"text": "hi back"}}),
-                timestamp: 20,
-                thread_id: None,
-                read: true,
-                direction: MessageDirection::Outbound,
-            },
-        ];
-
-        assert_eq!(effective_thread_id(&messages[0]), "direct:did:agent:alice");
-        let sessions = build_session_summaries(&messages, None);
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].thread_id, "direct:did:agent:alice");
-        assert_eq!(sessions[0].message_count, 2);
-        assert_eq!(sessions[0].peer_did, "did:agent:alice");
-    }
-
-    #[test]
-    fn parses_json_envelope_payloads() {
-        let envelope = parse_envelope_value(br#"{"id":"msg-1","protocol":"highway1/chat/1.0"}"#)
-            .expect("json envelope should parse");
-
-        assert_eq!(envelope.get("id").and_then(|v| v.as_str()), Some("msg-1"));
-        assert_eq!(
-            envelope.get("protocol").and_then(|v| v.as_str()),
-            Some("highway1/chat/1.0")
-        );
-    }
-
-    #[test]
-    fn rejects_invalid_envelope_payloads() {
-        let err = parse_envelope_value(&[0xff, 0x00]).expect_err("invalid payload should fail");
-        assert!(err.to_string().contains("Invalid envelope payload"));
     }
 }

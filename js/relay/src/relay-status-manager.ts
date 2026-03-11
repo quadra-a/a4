@@ -148,7 +148,7 @@ export class RelayStatusManager {
       federation: {
         enabled: !!this.federationManager,
         connectedRelays: federationStatus?.relayCount || 0,
-        totalRelaysKnown: federationStatus?.relayCount || 0,
+        totalRelaysKnown: federationStatus?.knownRelayCount || federationStatus?.relayCount || 0,
         crossRelayMessages: this.crossRelayMessages,
         federationUptime: Date.now() - this.startTime, // Simplified
         peerRelays: [], // TODO: Get from federation manager

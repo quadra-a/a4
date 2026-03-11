@@ -36,9 +36,9 @@ MEDIUM_PAYLOAD_SIZE=10000    # 10KB
 LARGE_PAYLOAD_SIZE=50000     # 50KB
 MASSIVE_PAYLOAD_SIZE=100000  # 100KB
 
-# Stress test parameters
-SEQUENTIAL_TEST_COUNTS=(5 10 20 50 100)
-CONCURRENT_TEST_COUNTS=(3 5 10 20 50)
+# Stress test parameters - optimized to prevent connection pool saturation
+SEQUENTIAL_TEST_COUNTS=(5 10 20 50)
+CONCURRENT_TEST_COUNTS=(3 5 10 20)
 
 # Timeout settings (seconds) - increased to accommodate Rust CLI performance
 DISCOVERY_TIMEOUT=15

@@ -22,9 +22,14 @@ export interface MessageRouter {
   stop: () => Promise<void>;
 }
 
+export interface MessageRouterOptions {
+  acceptEnvelope?: (envelope: MessageEnvelope) => boolean | Promise<boolean>;
+}
+
 export function createMessageRouter(
   relayClient: RelayClient,
   verifyFn: (signature: Uint8Array, data: Uint8Array) => Promise<boolean>,
+  options: MessageRouterOptions = {},
 ): MessageRouter {
   const handlers = new Map<string, MessageHandler>();
   let catchAllHandler: MessageHandler | undefined;
@@ -103,6 +108,25 @@ export function createMessageRouter(
             }
           } catch (error) {
             logger.warn('Custom verification hook failed', {
+              id: envelope.id,
+              from: envelope.from,
+              error: (error as Error).message,
+            });
+            return;
+          }
+
+          try {
+            if (options.acceptEnvelope && !(await options.acceptEnvelope(envelope))) {
+              logger.info('Envelope rejected by acceptance hook', {
+                id: envelope.id,
+                from: envelope.from,
+                protocol: envelope.protocol,
+                groupId: envelope.groupId,
+              });
+              return;
+            }
+          } catch (error) {
+            logger.warn('Envelope acceptance hook failed', {
               id: envelope.id,
               from: envelope.from,
               error: (error as Error).message,

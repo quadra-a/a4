@@ -1,0 +1,71 @@
+quadra-a Relay Performance Benchmark Report
+============================================
+Date: 2026年 3月11日 星期三 15时31分45秒 CST
+Relay URL: ws://relay-sg-1.quadra-a.com:8080
+A4 Binary: /Users/hqzhou/Code/workbench/repos/a4/rust/target/release/a4
+Benchmark Session Mode: daemon
+Benchmark Session Note: started temporary background listener
+Timeout Backend: python3
+Test DID: did:a4:z5m2k4p3QiDQbGc9oi4oKvK2gaDCvcxti8E9aRG7mAFJe
+System: Darwin JacobMacBook-Pro.local 25.2.0 Darwin Kernel Version 25.2.0: Tue Nov 18 21:09:40 PST 2025; root:xnu-12377.61.12~1/RELEASE_ARM64_T6000 arm64
+============================================
+
+Notes:
+- Discovery and messaging numbers measure end-to-end CLI wall-clock time.
+- Direct mode includes process startup and relay session setup on each command.
+- Daemon mode reuses a persistent background listener for lower latency.
+
+
+Discovery Performance:
+=====================
+Basic Discovery: 370ms
+WebSocket Query Discovery: 352ms
+Multi-word Query Discovery: 386ms
+Non-existent Query Discovery: 356ms
+Limited Discovery: 363ms
+
+Message Sending Performance:
+===========================
+Basic Message Send: 357ms
+Message with Wait Flag: FAILED
+Custom Protocol Message: 75ms
+JSON Payload Message: 49ms
+
+Payload Size Performance:
+========================
+100B Payload: 31ms
+1000B Payload: 32ms
+5000B Payload: 31ms
+10000B Payload: 34ms
+25000B Payload: 40ms
+50000B Payload: 33ms
+
+Sequential Throughput:
+=====================
+5 messages: 62ms (80.65 msg/s)
+10 messages: 82ms (121.95 msg/s)
+20 messages: 135ms (148.15 msg/s)
+50 messages: 3146ms (15.89 msg/s)
+
+Concurrent Throughput:
+=====================
+5 concurrent messages: 30392ms (0.16 msg/s)
+10 concurrent messages: 30412ms (0.33 msg/s)
+20 concurrent messages: 30640ms (0.65 msg/s)
+
+Daemon Operations:
+=================
+Daemon Status Check: 30066ms
+Inbox Check: FAILED
+A4 Status Check: 30051ms
+
+Performance Summary:
+===================
+Key Metrics:
+- Discovery Latency: 370ms
+- Message Latency: 357ms
+- Large Payload (50KB): 33ms
+
+Overall Performance Rating: EXCELLENT
+
+Benchmark completed at: 2026年 3月11日 星期三 15时34分57秒 CST

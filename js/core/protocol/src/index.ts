@@ -27,8 +27,12 @@ export * from './messaging/router.js';
 export * from './messaging/types.js';
 export * from './messaging/storage.js';
 export * from './messaging/queue.js';
+export * from './messaging/timestamp.js';
 export * from './messaging/defense.js';
 export * from './messaging/rate-limiter.js';
+
+// Quick Agent Groups
+export * from './groups/index.js';
 
 // Trust (Phase 2)
 export * from './trust/index.js';

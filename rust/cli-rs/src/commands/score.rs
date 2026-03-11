@@ -1,12 +1,10 @@
 use crate::config::load_config;
 use crate::daemon::DaemonClient;
 use crate::identity::KeyPair;
-use crate::protocol::AgentCard;
 use crate::relay::connect_first_available;
 use crate::trust::{ActivityLevel, NetworkPosition, TrustEngine};
 use crate::ui::LlmFormatter;
 use anyhow::Result;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct ScoreOptions {
     pub target: String,
@@ -257,56 +255,7 @@ async fn compute_trust_score_via_relay(
         .ok_or_else(|| anyhow::anyhow!("No identity found"))?;
     let keypair = KeyPair::from_hex(&identity.private_key)?;
 
-    // Build agent card for relay connection
-    let card_config = config
-        .agent_card
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("No agent card found"))?;
-
-    let capabilities = card_config
-        .capabilities
-        .iter()
-        .map(|cap| crate::protocol::Capability {
-            id: cap.clone(),
-            name: cap.clone(),
-            description: format!("Capability: {}", cap),
-            parameters: None,
-            metadata: None,
-        })
-        .collect();
-
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-
-    let card_unsigned = crate::protocol::AgentCardUnsigned {
-        did: identity.did.clone(),
-        name: card_config.name.clone(),
-        description: card_config.description.clone(),
-        version: "1.0.0".to_string(),
-        capabilities,
-        endpoints: vec![],
-        peer_id: None,
-        trust: None,
-        metadata: None,
-        timestamp,
-    };
-
-    let signature = AgentCard::sign(&card_unsigned, &keypair);
-    let card = AgentCard {
-        did: card_unsigned.did,
-        name: card_unsigned.name,
-        description: card_unsigned.description,
-        version: card_unsigned.version,
-        capabilities: card_unsigned.capabilities,
-        endpoints: card_unsigned.endpoints,
-        peer_id: card_unsigned.peer_id,
-        trust: card_unsigned.trust,
-        metadata: card_unsigned.metadata,
-        timestamp: card_unsigned.timestamp,
-        signature,
-    };
+    let card = crate::commands::discover::build_card(config, identity)?;
 
     // Query endorsements from relay
     let (mut session, _relay_url) =

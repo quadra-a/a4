@@ -166,8 +166,14 @@ pub async fn run(opts: TellOptions) -> Result<()> {
         eprintln!("Connecting to configured relays...");
     }
 
-    let (mut session, relay_url) =
-        connect_first_available(resolution_relay, Some(&config), &identity.did, &card, &keypair).await?;
+    let (mut session, relay_url) = connect_first_available(
+        resolution_relay,
+        Some(&config),
+        &identity.did,
+        &card,
+        &keypair,
+    )
+    .await?;
 
     if opts.human {
         eprintln!("Connected to relay {}", relay_url);

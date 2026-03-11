@@ -10,13 +10,14 @@ import type { HelloMessage, WelcomeMessage, RelayMessage } from '../types.js';
 
 describe('RelayServer', () => {
   let server: RelayServer;
-  const TEST_PORT = 8888;
   let testCounter = 0;
+  let relayPort = 0;
 
   beforeEach(async () => {
     testCounter++;
     const storagePath = `./test-relay-data-${testCounter}-${Date.now()}`;
-    server = new RelayServer({ port: TEST_PORT, storagePath });
+    relayPort = 10000 + Math.floor(Math.random() * 20000);
+    server = new RelayServer({ port: relayPort, storagePath });
     await server.start();
   });
 
@@ -27,7 +28,7 @@ describe('RelayServer', () => {
   });
 
   it('should start and accept connections', async () => {
-    const ws = new WebSocket(`ws://localhost:${TEST_PORT}`);
+    const ws = new WebSocket(`ws://localhost:${relayPort}`);
 
     await new Promise<void>((resolve, reject) => {
       ws.on('open', () => {
@@ -40,7 +41,7 @@ describe('RelayServer', () => {
   });
 
   it('should reject unauthenticated messages', async () => {
-    const ws = new WebSocket(`ws://localhost:${TEST_PORT}`);
+    const ws = new WebSocket(`ws://localhost:${relayPort}`);
 
     await new Promise<void>((resolve, reject) => {
       ws.on('open', () => {
@@ -61,7 +62,7 @@ describe('RelayServer', () => {
   });
 
   it('should handle HELLO with invalid timestamp', async () => {
-    const ws = new WebSocket(`ws://localhost:${TEST_PORT}`);
+    const ws = new WebSocket(`ws://localhost:${relayPort}`);
 
     await new Promise<void>((resolve, reject) => {
       ws.on('open', async () => {
@@ -97,7 +98,7 @@ describe('RelayServer', () => {
   });
 
   it('should accept valid HELLO and send WELCOME', async () => {
-    const ws = new WebSocket(`ws://localhost:${TEST_PORT}`);
+    const ws = new WebSocket(`ws://localhost:${relayPort}`);
 
     await new Promise<void>((resolve, reject) => {
       ws.on('open', async () => {
@@ -142,7 +143,7 @@ describe('RelayServer', () => {
   });
 
   it('should handle PING/PONG', async () => {
-    const ws = new WebSocket(`ws://localhost:${TEST_PORT}`);
+    const ws = new WebSocket(`ws://localhost:${relayPort}`);
 
     await new Promise<void>((resolve, reject) => {
       let authenticated = false;

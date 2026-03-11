@@ -1,4 +1,5 @@
-use crate::config::load_config;
+use crate::config::{load_config, save_config, TrustConfig};
+use crate::daemon::DaemonClient;
 use crate::ui::LlmFormatter;
 use anyhow::Result;
 
@@ -8,7 +9,7 @@ pub struct UnblockOptions {
 }
 
 pub async fn run(opts: UnblockOptions) -> Result<()> {
-    let config = load_config()?;
+    let mut config = load_config()?;
     let _identity = config
         .identity
         .as_ref()
@@ -23,6 +24,18 @@ pub async fn run(opts: UnblockOptions) -> Result<()> {
             )
         })?;
 
+    if config.trust_config.is_none() {
+        config.trust_config = Some(TrustConfig::new());
+    }
+
+    if let Some(trust_config) = &mut config.trust_config {
+        trust_config.unblock_agent(&target_did);
+    }
+
+    save_config(&config)?;
+
+    if let Err(_) = inform_daemon_of_unblock(&target_did).await {}
+
     if opts.human {
         println!("Unblocking agent: {}", target_did);
         println!();
@@ -36,8 +49,21 @@ pub async fn run(opts: UnblockOptions) -> Result<()> {
         println!();
     }
 
-    // TODO: Implement actual unblocking logic - remove from local config and inform daemon
-    // For now, just show the action was taken
+    Ok(())
+}
 
+async fn inform_daemon_of_unblock(target_did: &str) -> Result<()> {
+    let client = DaemonClient::new(&crate::daemon::daemon_socket_path());
+
+    if !client.is_running().await {
+        anyhow::bail!("Daemon not running");
+    }
+
+    let request = serde_json::json!({
+        "targetDid": target_did,
+        "action": "unblock",
+    });
+
+    client.send_command("block_agent", request).await?;
     Ok(())
 }

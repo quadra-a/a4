@@ -1,3 +1,4 @@
+import { compareMessagesBySortTimestamp, getMessageSortTimestamp } from '@quadra-a/protocol';
 import type { MessagePage, QueueStats, StoredMessage } from '@quadra-a/protocol';
 import { DaemonClient } from './daemon-client.js';
 import {
@@ -55,7 +56,7 @@ function timestampOf(message: StoredMessage | null): number | null {
     return null;
   }
 
-  return message.receivedAt ?? message.sentAt ?? message.envelope.timestamp ?? null;
+  return getMessageSortTimestamp(message);
 }
 
 function isoTimestamp(value: number | null | undefined): string | null {
@@ -67,7 +68,7 @@ function isoTimestamp(value: number | null | undefined): string | null {
 }
 
 function sortMessagesByTimestamp(messages: StoredMessage[]): StoredMessage[] {
-  return [...messages].sort((left, right) => (timestampOf(left) ?? 0) - (timestampOf(right) ?? 0));
+  return [...messages].sort(compareMessagesBySortTimestamp);
 }
 
 function uniqueMessages(messages: StoredMessage[]): StoredMessage[] {

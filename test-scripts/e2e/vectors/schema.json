@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://quadra-a.dev/schemas/e2e-vector-manifest.schema.json",
+  "title": "quadra-a E2E Vector Manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["suite", "version", "encoding", "cases"],
+  "properties": {
+    "suite": {
+      "type": "string",
+      "enum": [
+        "x3dh",
+        "double-ratchet",
+        "prekey-message",
+        "session-message",
+        "agent-card-devices"
+      ]
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "encoding": {
+      "type": "string",
+      "enum": ["hex", "base58btc", "utf8", "json"]
+    },
+    "notes": {
+      "type": "string"
+    },
+    "cases": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/case"
+      }
+    }
+  },
+  "$defs": {
+    "valueObject": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "negativeVariant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "mutation", "expectedError"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[A-Z0-9-]+$"
+        },
+        "mutation": {
+          "$ref": "#/$defs/valueObject"
+        },
+        "expectedError": {
+          "type": "string"
+        }
+      }
+    },
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "description", "inputs", "expected"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[A-Z0-9-]+$"
+        },
+        "description": {
+          "type": "string"
+        },
+        "inputs": {
+          "$ref": "#/$defs/valueObject"
+        },
+        "expected": {
+          "$ref": "#/$defs/valueObject"
+        },
+        "negativeVariants": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/negativeVariant"
+          }
+        }
+      }
+    }
+  }
+}

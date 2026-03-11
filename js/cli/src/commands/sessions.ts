@@ -7,7 +7,7 @@
 
 import { Command } from 'commander';
 import { DaemonClient } from '../daemon/client.js';
-import { createLogger } from '@quadra-a/protocol';
+import { createLogger, getMessageSortTimestamp } from '@quadra-a/protocol';
 import { llmSection, llmKeyValue, llmTable } from '../ui.js';
 import { getAliases } from '../config.js';
 import { reverseAlias } from '@quadra-a/protocol';
@@ -183,7 +183,7 @@ export function createSessionsCommand(): Command {
           console.log();
 
           for (const msg of result.messages) {
-            const timestamp = new Date(msg.receivedAt ?? msg.sentAt ?? msg.envelope.timestamp).toLocaleString();
+            const timestamp = new Date(getMessageSortTimestamp(msg)).toLocaleString();
             const from = msg.direction === 'outbound' ? 'you' : reverseAlias(msg.envelope.from, aliases) || msg.envelope.from.slice(10, 24) + '…';
             const text = typeof msg.envelope.payload === 'object' && msg.envelope.payload !== null
               ? (msg.envelope.payload as Record<string, unknown>).text ?? (msg.envelope.payload as Record<string, unknown>).message ?? JSON.stringify(msg.envelope.payload)
@@ -209,7 +209,7 @@ export function createSessionsCommand(): Command {
 
           llmSection('MESSAGES');
           for (const msg of result.messages) {
-            const timestamp = new Date(msg.receivedAt ?? msg.sentAt ?? msg.envelope.timestamp).toISOString();
+            const timestamp = new Date(getMessageSortTimestamp(msg)).toISOString();
             const from = msg.direction === 'outbound' ? 'you' : reverseAlias(msg.envelope.from, aliases) || msg.envelope.from;
             const text = typeof msg.envelope.payload === 'object' && msg.envelope.payload !== null
               ? (msg.envelope.payload as Record<string, unknown>).text ?? (msg.envelope.payload as Record<string, unknown>).message ?? JSON.stringify(msg.envelope.payload)

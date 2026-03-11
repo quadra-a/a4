@@ -1,3 +1,4 @@
+import { getMessageSortTimestamp } from '@quadra-a/protocol';
 import type { MessageFilter, MessagePage, StoredMessage } from '@quadra-a/protocol';
 import { Command } from 'commander';
 import { createLogger } from '@quadra-a/protocol';
@@ -74,7 +75,7 @@ function renderMessageList(page: MessagePage, options: {
     for (const message of page.messages) {
       const unread = !message.readAt ? '●' : ' ';
       const from = shortDid(message.envelope.from);
-      const age = formatAge(message.receivedAt ?? message.envelope.timestamp);
+      const age = formatAge(getMessageSortTimestamp(message));
       const id = message.envelope.id.slice(-8);
       const protocol = message.envelope.protocol ?? '';
       const replyTag = message.envelope.replyTo ? `  ↩ ${message.envelope.replyTo.slice(-8)}` : '';
@@ -108,7 +109,7 @@ function renderMessageList(page: MessagePage, options: {
     message.envelope.from,
     message.envelope.protocol ?? '',
     message.envelope.replyTo ?? '',
-    formatAge(message.receivedAt ?? message.envelope.timestamp),
+    formatAge(getMessageSortTimestamp(message)),
     payloadPreview(message.envelope.payload, 50),
   ]);
 
@@ -137,7 +138,13 @@ function renderMessageDetail(message: StoredMessage): void {
   if (message.envelope.threadId) {
     console.log(`Thread:    ${message.envelope.threadId}`);
   }
-  console.log(`Received:  ${new Date(message.receivedAt ?? message.envelope.timestamp).toLocaleString()}`);
+  console.log(`Message Time: ${new Date(message.envelope.timestamp).toLocaleString()}`);
+  if (message.receivedAt != null) {
+    console.log(`Received:  ${new Date(message.receivedAt).toLocaleString()}`);
+  }
+  if (message.sentAt != null) {
+    console.log(`Sent:      ${new Date(message.sentAt).toLocaleString()}`);
+  }
   if (message.trustScore != null) {
     console.log(`Trust:     ${(message.trustScore * 100).toFixed(0)}%`);
   }

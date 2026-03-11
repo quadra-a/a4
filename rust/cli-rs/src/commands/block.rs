@@ -32,7 +32,7 @@ pub async fn run(opts: BlockOptions) -> Result<()> {
 
     // Block the agent
     if let Some(ref mut trust_config) = config.trust_config {
-        trust_config.block_agent(target_did.clone());
+        trust_config.block_agent_with_reason(target_did.clone(), opts.reason.clone());
     }
 
     // Save the updated config

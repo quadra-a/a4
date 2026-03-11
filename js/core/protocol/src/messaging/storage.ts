@@ -24,12 +24,24 @@ import type {
   MessagePage,
 } from './types.js';
 import { normalizeEnvelope } from './envelope.js';
+import { compareMessagesBySortTimestamp, getMessageSortTimestamp } from './timestamp.js';
 
 const logger = createLogger('message-storage');
 
 export class MessageStorage {
   private db: Level<string, unknown>;
   private ready = false;
+
+  private static compareSessionsByLastMessageAt(
+    left: { threadId: string; lastMessageAt: number },
+    right: { threadId: string; lastMessageAt: number },
+  ): number {
+    if (left.lastMessageAt !== right.lastMessageAt) {
+      return right.lastMessageAt - left.lastMessageAt;
+    }
+
+    return left.threadId.localeCompare(right.threadId);
+  }
 
   constructor(dbPath: string) {
     this.db = new Level<string, unknown>(dbPath, { valueEncoding: 'json' });
@@ -53,7 +65,7 @@ export class MessageStorage {
 
   async putMessage(msg: StoredMessage): Promise<void> {
     const normalized = this.requireStoredMessage(msg);
-    const ts = String(normalized.receivedAt ?? normalized.sentAt ?? Date.now()).padStart(16, '0');
+    const ts = String(getMessageSortTimestamp(normalized)).padStart(16, '0');
     const key = `msg:${normalized.direction}:${ts}:${normalized.envelope.id}`;
     await this.db.put(key, normalized);
 
@@ -72,40 +84,34 @@ export class MessageStorage {
   }
 
   async getMessage(id: string): Promise<StoredMessage | null> {
-    // Scan both directions since we don't know the timestamp
-    for (const direction of ['inbound', 'outbound'] as const) {
-      const prefix = `msg:${direction}:`;
-      for await (const [, value] of this.db.iterator<string, StoredMessage>({
-        gte: prefix,
-        lte: prefix + '\xff',
-        valueEncoding: 'json',
-      })) {
-        if (value.envelope.id !== id) continue;
-        const normalized = this.normalizeStoredMessage(value);
-        if (normalized) return normalized;
-      }
-    }
-    return null;
+    const match = await this.findStoredMessageRecord(id);
+    return match?.message ?? null;
   }
 
   async updateMessage(id: string, updates: Partial<StoredMessage>): Promise<void> {
-    const msg = await this.getMessage(id);
-    if (!msg) return;
-    const ts = String(msg.receivedAt ?? msg.sentAt ?? Date.now()).padStart(16, '0');
-    const key = `msg:${msg.direction}:${ts}:${id}`;
-    await this.db.put(key, { ...msg, ...updates });
+    const match = await this.findStoredMessageRecord(id);
+    if (!match) return;
+    await this.db.put(match.key, { ...match.message, ...updates });
   }
 
   async deleteMessage(id: string): Promise<void> {
-    const msg = await this.getMessage(id);
-    if (!msg) return;
-    const ts = String(msg.receivedAt ?? msg.sentAt ?? Date.now()).padStart(16, '0');
-    const key = `msg:${msg.direction}:${ts}:${id}`;
-    const idxKey = `idx:from:${msg.envelope.from}:${ts}:${id}`;
-    await this.db.batch([
-      { type: 'del', key },
-      { type: 'del', key: idxKey },
-    ]);
+    const match = await this.findStoredMessageRecord(id);
+    if (!match) return;
+
+    const timestampSegment = this.getTimestampSegmentFromStorageKey(match.key);
+    const operations: Array<{ type: 'del'; key: string }> = [
+      { type: 'del', key: match.key },
+      { type: 'del', key: `idx:from:${match.message.envelope.from}:${timestampSegment}:${id}` },
+    ];
+
+    if (match.message.envelope.threadId) {
+      operations.push({
+        type: 'del',
+        key: `idx:thread:${match.message.envelope.threadId}:${timestampSegment}:${id}`,
+      });
+    }
+
+    await this.db.batch(operations);
   }
 
   async queryMessages(
@@ -115,22 +121,21 @@ export class MessageStorage {
   ): Promise<MessagePage> {
     const { limit = 50, offset = 0 } = pagination;
     const prefix = `msg:${direction}:`;
-    const results: StoredMessage[] = [];
-    let total = 0;
-    let skipped = 0;
+    const matches: StoredMessage[] = [];
 
     for await (const [, value] of this.db.iterator<string, StoredMessage>({
       gte: prefix,
       lte: prefix + '\xff',
-      reverse: true, // newest first
       valueEncoding: 'json',
     })) {
       const normalized = this.normalizeStoredMessage(value);
       if (!normalized || !this.matchesFilter(normalized, filter)) continue;
-      total++;
-      if (skipped < offset) { skipped++; continue; }
-      if (results.length < limit) results.push(normalized);
+      matches.push(normalized);
     }
+
+    matches.sort((left, right) => compareMessagesBySortTimestamp(right, left));
+    const results = matches.slice(offset, offset + limit);
+    const total = matches.length;
 
     return {
       messages: results,
@@ -163,7 +168,7 @@ export class MessageStorage {
       if (!statuses.includes(msg.status)) return false;
     }
     if (filter.maxAge) {
-      const age = Date.now() - (msg.receivedAt ?? msg.sentAt ?? 0);
+      const age = Date.now() - getMessageSortTimestamp(msg);
       if (age > filter.maxAge) return false;
     }
     if (filter.minTrustScore != null && (msg.trustScore ?? 0) < filter.minTrustScore) return false;
@@ -206,6 +211,30 @@ export class MessageStorage {
     }
 
     return normalized;
+  }
+
+  private async findStoredMessageRecord(id: string): Promise<{ key: string; message: StoredMessage } | null> {
+    for (const direction of ['inbound', 'outbound'] as const) {
+      const prefix = `msg:${direction}:`;
+      for await (const [key, value] of this.db.iterator<string, StoredMessage>({
+        gte: prefix,
+        lte: prefix + '\xff',
+        valueEncoding: 'json',
+      })) {
+        if (value.envelope.id !== id) continue;
+        const normalized = this.normalizeStoredMessage(value);
+        if (normalized) {
+          return { key, message: normalized };
+        }
+      }
+    }
+
+    return null;
+  }
+
+  private getTimestampSegmentFromStorageKey(key: string): string {
+    const parts = key.split(':');
+    return parts[2] ?? '0000000000000000';
   }
 
   // ─── Blocklist ────────────────────────────────────────────────────────────
@@ -327,6 +356,8 @@ export class MessageStorage {
   private async updateSessionMeta(msg: StoredMessage): Promise<void> {
     if (!msg.envelope.threadId) return;
 
+    const sortTimestamp = getMessageSortTimestamp(msg);
+
     const sessionKey = `session:${msg.envelope.threadId}`;
     let session: { peerDid: string; threadId: string; messageCount: number; lastMessageAt: number; startedAt?: number; title?: string; archived?: boolean; archivedAt?: number };
 
@@ -343,8 +374,8 @@ export class MessageStorage {
       session = {
         threadId: msg.envelope.threadId,
         peerDid,
-        startedAt: msg.receivedAt ?? msg.sentAt ?? Date.now(),
-        lastMessageAt: msg.receivedAt ?? msg.sentAt ?? Date.now(),
+        startedAt: sortTimestamp,
+        lastMessageAt: sortTimestamp,
         messageCount: 1,
         title,
       };
@@ -353,7 +384,8 @@ export class MessageStorage {
     }
 
     // Update existing session
-    session.lastMessageAt = msg.receivedAt ?? msg.sentAt ?? Date.now();
+    session.startedAt = Math.min(session.startedAt ?? sortTimestamp, sortTimestamp);
+    session.lastMessageAt = Math.max(session.lastMessageAt ?? sortTimestamp, sortTimestamp);
     session.messageCount = (session.messageCount ?? 0) + 1;
     await this.db.put(sessionKey, session);
   }
@@ -371,15 +403,16 @@ export class MessageStorage {
     for await (const [, value] of this.db.iterator<string, { peerDid: string; threadId: string; messageCount: number; lastMessageAt: number; startedAt?: number; title?: string; archived?: boolean; archivedAt?: number }>({
       gte: 'session:',
       lte: 'session:\xff',
-      reverse: true, // newest first
       valueEncoding: 'json',
     })) {
       if (peerDid && value.peerDid !== peerDid) continue;
       if (!includeArchived && value.archived) continue; // Skip archived sessions by default
       results.push(value);
-      if (results.length >= limit) break;
     }
-    return results;
+
+    return results
+      .sort(MessageStorage.compareSessionsByLastMessageAt)
+      .slice(0, limit);
   }
 
   async archiveSession(threadId: string): Promise<void> {
@@ -409,15 +442,16 @@ export class MessageStorage {
     for await (const [, value] of this.db.iterator<string, { peerDid: string; threadId: string; messageCount: number; lastMessageAt: number; startedAt?: number; title?: string; archived?: boolean; archivedAt?: number }>({
       gte: 'session:',
       lte: 'session:\xff',
-      reverse: true, // newest first
       valueEncoding: 'json',
     })) {
       if (!value.archived) continue; // Only archived sessions
       if (peerDid && value.peerDid !== peerDid) continue;
       results.push(value);
-      if (results.length >= limit) break;
     }
-    return results;
+
+    return results
+      .sort(MessageStorage.compareSessionsByLastMessageAt)
+      .slice(0, limit);
   }
 
   async searchSessions(query: string, limit = 50): Promise<Array<{ peerDid: string; threadId: string; messageCount: number; lastMessageAt: number; startedAt?: number; title?: string; archived?: boolean; archivedAt?: number }>> {
@@ -427,7 +461,6 @@ export class MessageStorage {
     for await (const [, value] of this.db.iterator<string, { peerDid: string; threadId: string; messageCount: number; lastMessageAt: number; startedAt?: number; title?: string; archived?: boolean; archivedAt?: number }>({
       gte: 'session:',
       lte: 'session:\xff',
-      reverse: true, // newest first
       valueEncoding: 'json',
     })) {
       // Search in title
@@ -456,10 +489,11 @@ export class MessageStorage {
         }
       }
 
-      if (results.length >= limit) break;
     }
 
-    return results;
+    return results
+      .sort(MessageStorage.compareSessionsByLastMessageAt)
+      .slice(0, limit);
   }
 
   async queryMessagesByThread(
@@ -468,16 +502,13 @@ export class MessageStorage {
   ): Promise<MessagePage> {
     const { limit = 50, offset = 0 } = pagination;
     const prefix = `idx:thread:${threadId}:`;
-    const results: StoredMessage[] = [];
-    let total = 0;
-    let skipped = 0;
+    const matches: StoredMessage[] = [];
 
     // Get message IDs from thread index
     const messageIds: string[] = [];
     for await (const [key] of this.db.iterator<string, string>({
       gte: prefix,
       lte: prefix + '\xff',
-      reverse: false, // chronological order
     })) {
       const parts = key.split(':');
       const msgId = parts[parts.length - 1];
@@ -488,10 +519,12 @@ export class MessageStorage {
     for (const msgId of messageIds) {
       const msg = await this.getMessage(msgId);
       if (!msg) continue;
-      total++;
-      if (skipped < offset) { skipped++; continue; }
-      if (results.length < limit) results.push(msg);
+      matches.push(msg);
     }
+
+    matches.sort(compareMessagesBySortTimestamp);
+    const results = matches.slice(offset, offset + limit);
+    const total = matches.length;
 
     return {
       messages: results,

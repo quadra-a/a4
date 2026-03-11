@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::{load_config, save_config, EndorsementV2, TrustConfig};
 use crate::identity::KeyPair;
-use crate::protocol::{relay_unsigned_endorsement_value, AgentCard};
+use crate::protocol::relay_unsigned_endorsement_value;
 use crate::relay::connect_first_available;
 use crate::ui::LlmFormatter;
 
@@ -131,56 +131,7 @@ async fn publish_to_relay(
 ) -> Result<()> {
     let keypair = KeyPair::from_hex(&identity.private_key)?;
 
-    // Build agent card for relay connection
-    let card_config = config
-        .agent_card
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("No agent card found"))?;
-
-    let capabilities = card_config
-        .capabilities
-        .iter()
-        .map(|cap| crate::protocol::Capability {
-            id: cap.clone(),
-            name: cap.clone(),
-            description: format!("Capability: {}", cap),
-            parameters: None,
-            metadata: None,
-        })
-        .collect();
-
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-
-    let card_unsigned = crate::protocol::AgentCardUnsigned {
-        did: identity.did.clone(),
-        name: card_config.name.clone(),
-        description: card_config.description.clone(),
-        version: "1.0.0".to_string(),
-        capabilities,
-        endpoints: vec![],
-        peer_id: None,
-        trust: None,
-        metadata: None,
-        timestamp,
-    };
-
-    let signature = AgentCard::sign(&card_unsigned, &keypair);
-    let card = AgentCard {
-        did: card_unsigned.did,
-        name: card_unsigned.name,
-        description: card_unsigned.description,
-        version: card_unsigned.version,
-        capabilities: card_unsigned.capabilities,
-        endpoints: card_unsigned.endpoints,
-        peer_id: card_unsigned.peer_id,
-        trust: card_unsigned.trust,
-        metadata: card_unsigned.metadata,
-        timestamp: card_unsigned.timestamp,
-        signature,
-    };
+    let card = crate::commands::discover::build_card(config, identity)?;
 
     let (mut session, _relay_url) =
         connect_first_available(None, Some(config), &identity.did, &card, &keypair).await?;

@@ -44,3 +44,4 @@ Sequential Throughput:
 =====================
 5 messages: 51ms (98.04 msg/s)
 10 messages: 85ms (117.65 msg/s)
+20 messages: 394574ms (0.05 msg/s)

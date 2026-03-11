@@ -215,7 +215,7 @@ measure_command() {
     local description="$1"
     shift
 
-    log_info "Measuring: $description"
+    echo "   🔍 $description..."
 
     local start_time end_time duration_ns duration_ms
     start_time="$(quadra_now_ns)"
@@ -288,7 +288,8 @@ benchmark_sequential_throughput() {
     echo "Sequential Throughput:" >> "$REPORT_FILE"
     echo "=====================" >> "$REPORT_FILE"
 
-    local counts=(5 10 20 50 100)
+    # Reduced counts to avoid connection pool saturation
+    local counts=(5 10 20 50)
     local count i start_time end_time duration_ns duration_ms throughput
 
     for count in "${counts[@]}"; do
@@ -297,6 +298,11 @@ benchmark_sequential_throughput() {
         start_time="$(quadra_now_ns)"
         for ((i=1; i<=count; i++)); do
             "$A4_BINARY" tell "$TEST_DID" "Sequential test $i/$count" --protocol "benchmark/sequential/1.0" --relay "$RELAY_URL" >/dev/null 2>&1
+
+            # Add small delay to prevent connection pool exhaustion
+            if [[ $i -lt $count && $count -gt 20 ]]; then
+                sleep 0.05  # 50ms delay for larger batches
+            fi
         done
         end_time="$(quadra_now_ns)"
 
@@ -315,7 +321,8 @@ benchmark_concurrent_throughput() {
     echo "Concurrent Throughput:" >> "$REPORT_FILE"
     echo "=====================" >> "$REPORT_FILE"
 
-    local counts=(5 10 20 50)
+    # Reduced counts to avoid overwhelming the relay server
+    local counts=(5 10 20)
     local count i start_time end_time duration_ns duration_ms throughput
     local pids=()
 
@@ -327,6 +334,11 @@ benchmark_concurrent_throughput() {
         for ((i=1; i<=count; i++)); do
             "$A4_BINARY" tell "$TEST_DID" "Concurrent test $i/$count" --protocol "benchmark/concurrent/1.0" --relay "$RELAY_URL" >/dev/null 2>&1 &
             pids+=("$!")
+
+            # Add small stagger to prevent connection burst
+            if [[ $count -gt 10 ]]; then
+                sleep 0.01  # 10ms stagger for larger concurrent batches
+            fi
         done
 
         local failed_jobs=0

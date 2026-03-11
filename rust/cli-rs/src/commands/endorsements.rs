@@ -1,15 +1,14 @@
 use crate::config::load_config;
 use crate::daemon::DaemonClient;
 use crate::identity::KeyPair;
-use crate::protocol::AgentCard;
 use crate::relay::connect_first_available;
 use crate::ui::LlmFormatter;
 use anyhow::Result;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct EndorsementsOptions {
     pub target: Option<String>,
     pub created_by: Option<String>,
+    pub domain: Option<String>,
     pub limit: u32,
     pub human: bool,
 }
@@ -64,6 +63,7 @@ pub async fn run(opts: EndorsementsOptions) -> Result<()> {
     let endorsements = match query_endorsements_with_fallback(
         &target_did,
         &created_by_did,
+        opts.domain.as_deref(),
         opts.limit,
         &config,
     )
@@ -112,6 +112,19 @@ pub async fn run(opts: EndorsementsOptions) -> Result<()> {
         }
     };
 
+    let endorsements = if let Some(domain) = opts.domain.as_deref() {
+        endorsements
+            .into_iter()
+            .filter(|endorsement| {
+                endorsement["domain"].is_null()
+                    || endorsement["domain"].as_str() == Some(domain)
+                    || endorsement["domain"].as_str() == Some("*")
+            })
+            .collect::<Vec<_>>()
+    } else {
+        endorsements
+    };
+
     if opts.human {
         println!("Found {} endorsement(s):", endorsements.len());
         println!();
@@ -150,6 +163,9 @@ pub async fn run(opts: EndorsementsOptions) -> Result<()> {
         }
         if let Some(creator) = &created_by_did {
             LlmFormatter::key_value("Created By", creator);
+        }
+        if let Some(domain) = &opts.domain {
+            LlmFormatter::key_value("Domain", domain);
         }
         LlmFormatter::key_value("Limit", &opts.limit.to_string());
         LlmFormatter::key_value("Count", &endorsements.len().to_string());
@@ -196,15 +212,17 @@ pub async fn run(opts: EndorsementsOptions) -> Result<()> {
 async fn query_endorsements_with_fallback(
     target_did: &Option<String>,
     created_by_did: &Option<String>,
+    domain: Option<&str>,
     limit: u32,
     config: &crate::config::Config,
 ) -> Result<Vec<serde_json::Value>> {
     // Try daemon first, fall back to direct relay if daemon unavailable
-    match try_daemon_endorsements(target_did, created_by_did, limit).await {
+    match try_daemon_endorsements(target_did, created_by_did, domain, limit).await {
         Ok(endorsements) => Ok(endorsements),
         Err(_) => {
             // Daemon unavailable, try direct relay connection
-            let result = query_from_relay(target_did, created_by_did, limit, config).await?;
+            let result =
+                query_from_relay(target_did, created_by_did, domain, limit, config).await?;
             Ok(result
                 .endorsements
                 .into_iter()
@@ -217,6 +235,7 @@ async fn query_endorsements_with_fallback(
 async fn try_daemon_endorsements(
     target_did: &Option<String>,
     created_by_did: &Option<String>,
+    domain: Option<&str>,
     limit: u32,
 ) -> Result<Vec<serde_json::Value>> {
     let client = DaemonClient::new(&crate::daemon::daemon_socket_path());
@@ -228,6 +247,7 @@ async fn try_daemon_endorsements(
     let request = serde_json::json!({
         "targetDid": target_did,
         "createdBy": created_by_did,
+        "domain": domain,
         "limit": limit,
     });
 
@@ -243,6 +263,7 @@ async fn try_daemon_endorsements(
 async fn query_from_relay(
     target_did: &Option<String>,
     _created_by_did: &Option<String>,
+    domain: Option<&str>,
     limit: u32,
     config: &crate::config::Config,
 ) -> Result<crate::protocol::TrustResultMessage> {
@@ -252,68 +273,19 @@ async fn query_from_relay(
         .ok_or_else(|| anyhow::anyhow!("No identity found"))?;
     let keypair = KeyPair::from_hex(&identity.private_key)?;
 
-    // Build agent card for relay connection
-    let card_config = config
-        .agent_card
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("No agent card found"))?;
-
-    let capabilities = card_config
-        .capabilities
-        .iter()
-        .map(|cap| crate::protocol::Capability {
-            id: cap.clone(),
-            name: cap.clone(),
-            description: format!("Capability: {}", cap),
-            parameters: None,
-            metadata: None,
-        })
-        .collect();
-
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-
-    let card_unsigned = crate::protocol::AgentCardUnsigned {
-        did: identity.did.clone(),
-        name: card_config.name.clone(),
-        description: card_config.description.clone(),
-        version: "1.0.0".to_string(),
-        capabilities,
-        endpoints: vec![],
-        peer_id: None,
-        trust: None,
-        metadata: None,
-        timestamp,
-    };
-
-    let signature = AgentCard::sign(&card_unsigned, &keypair);
-    let card = AgentCard {
-        did: card_unsigned.did,
-        name: card_unsigned.name,
-        description: card_unsigned.description,
-        version: card_unsigned.version,
-        capabilities: card_unsigned.capabilities,
-        endpoints: card_unsigned.endpoints,
-        peer_id: card_unsigned.peer_id,
-        trust: card_unsigned.trust,
-        metadata: card_unsigned.metadata,
-        timestamp: card_unsigned.timestamp,
-        signature,
-    };
+    let card = crate::commands::discover::build_card(config, identity)?;
 
     let (mut session, _relay_url) =
         connect_first_available(None, Some(config), &identity.did, &card, &keypair).await?;
 
     let result = if let Some(target) = target_did {
         session
-            .query_endorsements(target, None, Some(limit), None)
+            .query_endorsements(target, domain, Some(limit), None)
             .await?
     } else {
         // Query general endorsements - for now, use a placeholder target
         session
-            .query_endorsements("*", None, Some(limit), None)
+            .query_endorsements("*", domain, Some(limit), None)
             .await?
     };
 

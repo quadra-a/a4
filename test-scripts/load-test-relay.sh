@@ -16,8 +16,20 @@ source "$SCRIPT_DIR/lib/compat.sh"
 
 # Configuration
 RELAY_URL="${1:-$DEFAULT_RELAY_URL}"
-A4_BINARY="${2:-$DEFAULT_A4_BINARY}"
-DURATION="${3:-60}"  # Default 60 seconds
+CLI_MODE="${2:-rust}"
+CUSTOM_BINARY="${3:-}"
+DURATION="${4:-60}"  # Default 60 seconds (moved to 4th parameter)
+
+# Resolve A4_BINARY based on CLI_MODE and CUSTOM_BINARY
+if [[ -n "$CUSTOM_BINARY" ]]; then
+    A4_BINARY="$CUSTOM_BINARY"
+elif [[ "$CLI_MODE" == "rust" ]]; then
+    A4_BINARY="$DEFAULT_A4_BINARY"
+elif [[ "$CLI_MODE" == "node" ]]; then
+    A4_BINARY="$NODE_CLI_DIRECT"
+else
+    A4_BINARY="$DEFAULT_A4_BINARY"
+fi
 TEST_DID="did:agent:z5m2k4p3QiDQbGc9oi4oKvK2gaDCvcxti8E9aRG7mAFJe"
 LOAD_TEST_DIR="$TEST_OUTPUT_ROOT/load-results"
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")

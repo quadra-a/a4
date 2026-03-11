@@ -13,6 +13,11 @@ export interface RelayAgentConfig {
   federationPolicy?: FederationExportPolicy | 'auto';
   federationExportVisibility?: string;
   federationRealmPolicies?: Record<string, FederationRealmPolicyConfig>;
+  federationHandshakeRateLimitWindowMs?: number;
+  federationHandshakeMaxAttempts?: number;
+  federationFailedHandshakeWindowMs?: number;
+  federationFailedHandshakeThreshold?: number;
+  federationFailedHandshakeQuarantineMs?: number;
   genesisMode?: boolean;
   seedRelays?: string[];
   networkId?: string;
@@ -36,6 +41,11 @@ export const DEFAULT_RELAY_AGENT_CONFIG: Required<RelayAgentConfig> = {
   federationPolicy: 'auto',
   federationExportVisibility: 'public',
   federationRealmPolicies: {},
+  federationHandshakeRateLimitWindowMs: 60000,
+  federationHandshakeMaxAttempts: 5,
+  federationFailedHandshakeWindowMs: 300000,
+  federationFailedHandshakeThreshold: 3,
+  federationFailedHandshakeQuarantineMs: 300000,
   genesisMode: false,
   seedRelays: [],
   networkId: 'highway1-mainnet',

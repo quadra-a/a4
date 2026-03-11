@@ -1,0 +1,20 @@
+[package]
+name = "quadra-a-runtime"
+version = "0.0.1"
+edition = "2021"
+license = "GPL-3.0"
+
+[lib]
+name = "quadra_a_runtime"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.21", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+hex = "0.4"
+ciborium = "0.2"
+quadra-a-core = { path = "../core" }

@@ -104,6 +104,11 @@ export class RelayAgent {
         exportPolicy: this.resolveFederationExportPolicy(),
         selectiveVisibilityValue: this.config.federationExportVisibility,
         realmPolicies: this.config.federationRealmPolicies,
+        handshakeRateLimitWindowMs: this.config.federationHandshakeRateLimitWindowMs,
+        handshakeRateLimitMaxAttempts: this.config.federationHandshakeMaxAttempts,
+        failedHandshakeWindowMs: this.config.federationFailedHandshakeWindowMs,
+        failedHandshakeThreshold: this.config.federationFailedHandshakeThreshold,
+        failedHandshakeQuarantineMs: this.config.federationFailedHandshakeQuarantineMs,
       });
       await this.federationManager.start();
     }

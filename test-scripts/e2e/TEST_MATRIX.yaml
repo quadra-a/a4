@@ -1,0 +1,163 @@
+version: 1
+status: planned
+description: Planned E2E encryption test inventory shared by JS, Rust, relay, and real-machine harnesses.
+
+cases:
+  - id: E2E-X3DH-001
+    layer: protocol-unit
+    priority: P0
+    implementations: [js, rust]
+    topology: fixture-only
+    description: Shared X3DH secret derivation matches the vector corpus.
+  - id: E2E-X3DH-003
+    layer: protocol-unit
+    priority: P0
+    implementations: [js, rust]
+    topology: fixture-only
+    description: Initiator builds a first-contact message from a bundle with an OTK.
+  - id: E2E-RATCHET-003
+    layer: protocol-unit
+    priority: P0
+    implementations: [js, rust]
+    topology: fixture-only
+    description: Out-of-order receive succeeds within the skipped-key window.
+  - id: E2E-CARD-001
+    layer: protocol-unit
+    priority: P0
+    implementations: [js, rust]
+    topology: fixture-only
+    description: Signed Agent Card devices directory validates and is signature-covered.
+  - id: E2E-VECTOR-002
+    layer: shared-vectors
+    priority: P0
+    implementations: [js, rust]
+    topology: fixture-only
+    description: PREKEY_MESSAGE header serialization is byte-identical across runtimes.
+  - id: E2E-JS-RUNTIME-001
+    layer: runtime-integration
+    priority: P0
+    implementations: [js]
+    topology: local-single-relay
+    description: JS send path fetches bundles and emits encrypted application messages only.
+  - id: E2E-RUST-RUNTIME-001
+    layer: runtime-integration
+    priority: P0
+    implementations: [rust]
+    topology: local-single-relay
+    description: Rust send path fetches bundles and emits encrypted application messages only.
+  - id: E2E-CROSS-001
+    layer: cross-language
+    priority: P0
+    implementations: [js, rust]
+    topology: local-single-relay
+    description: JS initiator sends the first message to Rust responder.
+  - id: E2E-CROSS-002
+    layer: cross-language
+    priority: P0
+    implementations: [rust, js]
+    topology: local-single-relay
+    description: Rust initiator sends the first message to JS responder.
+  - id: E2E-CROSS-005
+    layer: cross-language
+    priority: P0
+    implementations: [js, rust]
+    topology: local-offline-queue
+    description: JS and Rust interoperate for offline first-message delivery.
+  - id: E2E-RELAY-001
+    layer: relay-integration
+    priority: P0
+    implementations: [relay]
+    topology: local-single-relay
+    description: Relay queue stores opaque ciphertext bytes for application messages.
+  - id: E2E-FED-001
+    layer: federation-integration
+    priority: P0
+    implementations: [relay]
+    topology: local-dual-relay
+    description: Federated relays route application ciphertext without decoding business plaintext.
+  - id: E2E-PREKEY-002
+    layer: relay-integration
+    priority: P0
+    implementations: [relay]
+    topology: local-single-relay
+    description: One-time pre-key claim is atomic under concurrent requests.
+  - id: E2E-MULTI-001
+    layer: runtime-integration
+    priority: P0
+    implementations: [js, rust]
+    topology: local-single-relay
+    description: First contact fans out to all active recipient devices.
+  - id: E2E-MULTI-002
+    layer: runtime-integration
+    priority: P0
+    implementations: [js, rust]
+    topology: local-single-relay
+    description: One business message does not surface as multiple user-visible messages.
+  - id: E2E-NEG-003
+    layer: security-negative
+    priority: P0
+    implementations: [js, rust, relay]
+    topology: local-single-relay
+    description: Replay of a consumed pre-key message does not create a second valid session.
+  - id: E2E-NEG-007
+    layer: security-negative
+    priority: P0
+    implementations: [js, rust]
+    topology: local-single-relay
+    description: Legacy plaintext application messages are rejected by the new receive path.
+  - id: E2E-RM-001
+    layer: real-machine
+    priority: P0
+    implementations: [js]
+    topology: hostA-hostB-via-hostC
+    requires_real_machine: true
+    description: JS sender to JS receiver through a live relay host.
+  - id: E2E-RM-002
+    layer: real-machine
+    priority: P0
+    implementations: [rust]
+    topology: hostA-hostB-via-hostC
+    requires_real_machine: true
+    description: Rust sender to Rust receiver through a live relay host.
+  - id: E2E-RM-003
+    layer: real-machine
+    priority: P0
+    implementations: [js, rust]
+    topology: hostA-hostB-offline-via-hostC
+    requires_real_machine: true
+    description: JS sender to offline Rust receiver through a live relay host.
+  - id: E2E-RM-004
+    layer: real-machine
+    priority: P0
+    implementations: [rust, js]
+    topology: hostA-hostB-offline-via-hostC
+    requires_real_machine: true
+    description: Rust sender to offline JS receiver through a live relay host.
+  - id: E2E-RM-005
+    layer: real-machine
+    priority: P0
+    implementations: [js, rust, relay]
+    topology: federated-relay-pair
+    requires_real_machine: true
+    description: JS sender behind relay A to Rust receiver behind relay B.
+  - id: E2E-RM-006
+    layer: real-machine
+    priority: P0
+    implementations: [relay]
+    topology: relay-inspection
+    requires_real_machine: true
+    description: Relay logs and queue inspection show no business protocol or payload plaintext.
+  - id: E2E-RM-007
+    layer: real-machine
+    priority: P0
+    implementations: [js, rust]
+    topology: multi-device-recipient
+    requires_real_machine: true
+    description: Multi-device fan-out and business-message dedupe on a live relay.
+  - id: E2E-RM-008
+    layer: real-machine
+    priority: P1
+    implementations: [js, rust, relay]
+    topology: low-otk-replenishment
+    requires_real_machine: true
+    description: Low OTK inventory and replenishment are visible without breaking existing sessions.

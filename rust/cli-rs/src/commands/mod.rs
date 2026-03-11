@@ -21,6 +21,7 @@ pub mod score;
 pub mod target_resolution;
 pub mod tell;
 pub mod trace;
+pub mod trust_cli;
 pub mod unblock;
 pub mod unpublish;
 pub mod vouch;

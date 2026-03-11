@@ -15,6 +15,7 @@ export interface MessageEnvelope {
   signature: string;
   replyTo?: string;
   threadId?: string;
+  groupId?: string;
 }
 
 export function normalizeEnvelopeType(type: string): MessageEnvelopeType | undefined {
@@ -67,6 +68,7 @@ export function normalizeEnvelope(msg: unknown): MessageEnvelope | undefined {
     signature: envelope.signature,
     replyTo: typeof envelope.replyTo === 'string' ? envelope.replyTo : undefined,
     threadId: typeof envelope.threadId === 'string' ? envelope.threadId : undefined,
+    groupId: typeof envelope.groupId === 'string' ? envelope.groupId : undefined,
   };
 }
 
@@ -78,6 +80,7 @@ export function createEnvelope(
   payload: unknown,
   replyTo?: string,
   threadId?: string,
+  groupId?: string,
 ): Omit<MessageEnvelope, 'signature'> {
   const normalizedType = normalizeEnvelopeType(type);
 
@@ -99,6 +102,7 @@ export function createEnvelope(
     timestamp: Date.now(),
     ...(replyTo ? { replyTo } : {}),
     ...(threadId ? { threadId } : {}),
+    ...(groupId ? { groupId } : {}),
   };
 }
 
