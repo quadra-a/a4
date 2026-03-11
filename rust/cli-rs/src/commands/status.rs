@@ -71,7 +71,7 @@ pub async fn run(opts: StatusOptions) -> Result<()> {
             println!("  {}: {}", "Name".dimmed(), card.name);
             println!("  {}: {}", "Description".dimmed(), card.description);
             if card.capabilities.is_empty() {
-                println!("  {}: {}", "Capabilities".dimmed(), "(none)");
+                println!("  {}: (none)", "Capabilities".dimmed());
             } else {
                 println!(
                     "  {}: {}",

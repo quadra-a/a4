@@ -60,13 +60,13 @@ impl MessageOutcomeTracker {
         let same_sender = self
             .correlated_from_did
             .as_deref()
-            .map_or(true, |value| source_did(message) == Some(value));
+            .is_none_or(|value| source_did(message) == Some(value));
         let same_protocol = self
             .correlated_protocol
             .as_deref()
-            .map_or(true, |value| protocol(message) == Some(value));
+            .is_none_or(|value| protocol(message) == Some(value));
 
-        if !direct_match && !(same_job && same_sender && same_protocol) {
+        if !(direct_match || same_job && same_sender && same_protocol) {
             return None;
         }
 

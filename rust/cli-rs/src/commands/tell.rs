@@ -27,6 +27,21 @@ pub struct TellOptions {
     pub human: bool,
 }
 
+struct EnvelopeThreading {
+    reply_to: Option<String>,
+    thread_id: Option<String>,
+}
+
+struct WaitOutcomeDisplay<'a> {
+    message_id: &'a str,
+    recipient_did: &'a str,
+    protocol: &'a str,
+    payload: &'a Value,
+    thread_id: Option<&'a str>,
+    timeout_secs: u64,
+    timeout_hint: Option<&'a str>,
+}
+
 pub async fn run(opts: TellOptions) -> Result<()> {
     let config = load_config()?;
     let identity = config
@@ -112,16 +127,19 @@ pub async fn run(opts: TellOptions) -> Result<()> {
                     let outcome =
                         wait_for_message_outcome_via_daemon(&daemon, message_id, timeout_secs)
                             .await?;
+                    let trace_hint = format!("agent trace {}", message_id);
                     render_wait_outcome(
                         opts.human,
-                        message_id,
-                        &recipient_did,
-                        &opts.protocol,
-                        &payload,
-                        thread_id.as_deref(),
-                        timeout_secs,
                         outcome.as_ref(),
-                        Some(&format!("agent trace {}", message_id)),
+                        WaitOutcomeDisplay {
+                            message_id,
+                            recipient_did: &recipient_did,
+                            protocol: &opts.protocol,
+                            payload: &payload,
+                            thread_id: thread_id.as_deref(),
+                            timeout_secs,
+                            timeout_hint: Some(trace_hint.as_str()),
+                        },
                     );
 
                     if outcome.is_none() {
@@ -184,8 +202,10 @@ pub async fn run(opts: TellOptions) -> Result<()> {
         "message",
         &opts.protocol,
         payload.clone(),
-        opts.reply_to.clone(),
-        thread_id.clone(),
+        EnvelopeThreading {
+            reply_to: opts.reply_to.clone(),
+            thread_id: thread_id.clone(),
+        },
         &keypair,
     )?;
     let envelope_json = serde_json::to_value(&envelope)?;
@@ -210,14 +230,18 @@ pub async fn run(opts: TellOptions) -> Result<()> {
 
         render_wait_outcome(
             opts.human,
-            &envelope.id,
-            &recipient_did,
-            &opts.protocol,
-            &payload,
-            thread_id.as_deref(),
-            timeout_secs,
             outcome.as_ref(),
-            Some("This send used direct relay mode, so daemon-backed trace data is unavailable."),
+            WaitOutcomeDisplay {
+                message_id: &envelope.id,
+                recipient_did: &recipient_did,
+                protocol: &opts.protocol,
+                payload: &payload,
+                thread_id: thread_id.as_deref(),
+                timeout_secs,
+                timeout_hint: Some(
+                    "This send used direct relay mode, so daemon-backed trace data is unavailable.",
+                ),
+            },
         );
 
         if outcome.is_none() {
@@ -284,14 +308,13 @@ fn generate_thread_id() -> String {
     format!("thread_{}_{}", timestamp, random)
 }
 
-pub fn build_envelope(
+fn build_envelope(
     from: &str,
     to: &str,
     msg_type: &str,
     protocol: &str,
     payload: Value,
-    reply_to: Option<String>,
-    thread_id: Option<String>,
+    threading: EnvelopeThreading,
     keypair: &KeyPair,
 ) -> Result<Envelope> {
     let timestamp = SystemTime::now()
@@ -313,8 +336,8 @@ pub fn build_envelope(
         protocol: protocol.to_string(),
         payload,
         timestamp,
-        reply_to,
-        thread_id,
+        reply_to: threading.reply_to,
+        thread_id: threading.thread_id,
     };
 
     Ok(unsigned.sign(keypair))
@@ -425,30 +448,24 @@ fn now_ms() -> u64 {
 
 fn render_wait_outcome(
     human: bool,
-    message_id: &str,
-    recipient_did: &str,
-    protocol: &str,
-    payload: &Value,
-    thread_id: Option<&str>,
-    timeout_secs: u64,
     outcome: Option<&MessageOutcome>,
-    timeout_hint: Option<&str>,
+    display: WaitOutcomeDisplay<'_>,
 ) {
     if human {
-        render_human_wait_outcome(timeout_secs, outcome, timeout_hint);
+        render_human_wait_outcome(display.timeout_secs, outcome, display.timeout_hint);
         return;
     }
 
     LlmFormatter::section("Message Sent");
-    LlmFormatter::key_value("Message ID", message_id);
-    LlmFormatter::key_value("To", recipient_did);
-    LlmFormatter::key_value("Protocol", protocol);
+    LlmFormatter::key_value("Message ID", display.message_id);
+    LlmFormatter::key_value("To", display.recipient_did);
+    LlmFormatter::key_value("Protocol", display.protocol);
     LlmFormatter::key_value("Type", "message");
-    LlmFormatter::key_value("Payload", &payload.to_string());
-    if let Some(thread_id) = thread_id {
+    LlmFormatter::key_value("Payload", &display.payload.to_string());
+    if let Some(thread_id) = display.thread_id {
         LlmFormatter::key_value("Thread ID", thread_id);
     }
-    LlmFormatter::key_value("Wait Timeout", &format!("{}s", timeout_secs));
+    LlmFormatter::key_value("Wait Timeout", &format!("{}s", display.timeout_secs));
 
     if let Some(outcome) = outcome {
         let payload = outcome_payload(outcome)
@@ -482,7 +499,7 @@ fn render_wait_outcome(
         LlmFormatter::key_value("Reply Received", "false");
         LlmFormatter::key_value("Result Received", "false");
         LlmFormatter::key_value("Timed Out", "true");
-        if let Some(timeout_hint) = timeout_hint {
+        if let Some(timeout_hint) = display.timeout_hint {
             LlmFormatter::key_value("Trace Hint", timeout_hint);
         }
     }

@@ -22,6 +22,20 @@ pub struct SendOptions {
     pub new_thread: bool,
 }
 
+pub(crate) struct EnvelopeThreading {
+    reply_to: Option<String>,
+    thread_id: Option<String>,
+}
+
+impl EnvelopeThreading {
+    pub(crate) fn new(reply_to: Option<String>, thread_id: Option<String>) -> Self {
+        Self {
+            reply_to,
+            thread_id,
+        }
+    }
+}
+
 pub async fn run(opts: SendOptions) -> Result<()> {
     let config = load_config()?;
     let identity = config
@@ -141,8 +155,7 @@ pub async fn run(opts: SendOptions) -> Result<()> {
         &opts.msg_type,
         &opts.protocol,
         payload.clone(),
-        None,
-        thread_id.clone(),
+        EnvelopeThreading::new(None, thread_id.clone()),
         &keypair,
     )?;
     let envelope_json = serde_json::to_value(&envelope)?;
@@ -212,14 +225,13 @@ fn generate_thread_id() -> String {
     format!("thread_{}_{}", timestamp, random)
 }
 
-pub fn build_envelope(
+pub(crate) fn build_envelope(
     from: &str,
     to: &str,
     msg_type: &str,
     protocol: &str,
     payload: Value,
-    reply_to: Option<String>,
-    thread_id: Option<String>,
+    threading: EnvelopeThreading,
     keypair: &KeyPair,
 ) -> Result<Envelope> {
     let timestamp = SystemTime::now()
@@ -241,8 +253,8 @@ pub fn build_envelope(
         protocol: protocol.to_string(),
         payload,
         timestamp,
-        reply_to,
-        thread_id,
+        reply_to: threading.reply_to,
+        thread_id: threading.thread_id,
     };
 
     Ok(unsigned.sign(keypair))

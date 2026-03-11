@@ -39,9 +39,7 @@ pub async fn run(opts: BlockOptions) -> Result<()> {
     save_config(&config)?;
 
     // Inform daemon if it's running (optional, don't fail if daemon unavailable)
-    if let Err(_) = inform_daemon_of_block(&target_did).await {
-        // Silently ignore daemon communication failures
-    }
+    let _ = inform_daemon_of_block(&target_did).await;
 
     if opts.human {
         println!("Blocking agent: {}", target_did);

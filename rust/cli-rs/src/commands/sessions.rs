@@ -43,8 +43,7 @@ fn short_thread_id(thread_id: &str) -> String {
 }
 
 fn short_did(did: &str) -> String {
-    if did.starts_with("did:agent:") {
-        let rest = &did[10..];
+    if let Some(rest) = did.strip_prefix("did:agent:") {
         if rest.len() > 14 {
             format!("{}…", &rest[..14])
         } else {

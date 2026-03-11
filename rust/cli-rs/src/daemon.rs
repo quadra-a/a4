@@ -516,8 +516,7 @@ async fn handle_send(params: Value, state: Arc<RwLock<DaemonState>>) -> Result<V
                 msg_type,
                 protocol,
                 payload,
-                reply_to,
-                thread_id.clone(),
+                crate::commands::send::EnvelopeThreading::new(reply_to, thread_id.clone()),
                 &state_guard.keypair,
             )?;
             let envelope_json = serde_json::to_value(&envelope)?;

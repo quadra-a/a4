@@ -74,15 +74,13 @@ pub async fn run(opts: FindOptions) -> Result<()> {
                     LlmFormatter::key_value("Aliased As", alias_name);
                 }
             }
+        } else if opts.human {
+            println!("Agent not found: {}", target_did);
         } else {
-            if opts.human {
-                println!("Agent not found: {}", target_did);
-            } else {
-                LlmFormatter::section("Find Result");
-                LlmFormatter::key_value("Status", "not_found");
-                LlmFormatter::key_value("DID", target_did);
-                println!();
-            }
+            LlmFormatter::section("Find Result");
+            LlmFormatter::key_value("Status", "not_found");
+            LlmFormatter::key_value("DID", target_did);
+            println!();
         }
         return Ok(());
     }

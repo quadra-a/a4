@@ -14,11 +14,13 @@ pub struct InitOptions {
 pub fn run(opts: InitOptions) -> Result<()> {
     let mut config = crate::config::load_config()?;
 
-    if config.identity.is_some() && !opts.force {
-        bail!(
-            "Identity already exists. Use --force to overwrite.\nDID: {}",
-            config.identity.as_ref().unwrap().did
-        );
+    if let Some(identity) = config.identity.as_ref() {
+        if !opts.force {
+            bail!(
+                "Identity already exists. Use --force to overwrite.\nDID: {}",
+                identity.did
+            );
+        }
     }
 
     // Generate keypair

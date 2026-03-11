@@ -102,30 +102,26 @@ pub async fn run(opts: PeersOptions) -> Result<()> {
                         }
                         println!();
                     }
+                } else if opts.human {
+                    println!("No peers connected");
                 } else {
-                    if opts.human {
-                        println!("No peers connected");
-                    } else {
-                        LlmFormatter::section("Connected Peers");
-                        LlmFormatter::key_value("Count", "0");
-                        println!();
-                    }
+                    LlmFormatter::section("Connected Peers");
+                    LlmFormatter::key_value("Count", "0");
+                    println!();
                 }
             }
             Err(e) => {
                 anyhow::bail!("Failed to get peer information from daemon: {}", e);
             }
         }
+    } else if opts.human {
+        println!("Daemon is not running. Start it with: agent listen");
     } else {
-        if opts.human {
-            println!("Daemon is not running. Start it with: agent listen");
-        } else {
-            LlmFormatter::section("Connected Peers");
-            LlmFormatter::key_value("Status", "daemon_not_running");
-            LlmFormatter::key_value("Count", "0");
-            LlmFormatter::key_value("Note", "Start daemon with 'agent listen'");
-            println!();
-        }
+        LlmFormatter::section("Connected Peers");
+        LlmFormatter::key_value("Status", "daemon_not_running");
+        LlmFormatter::key_value("Count", "0");
+        LlmFormatter::key_value("Note", "Start daemon with 'agent listen'");
+        println!();
     }
 
     Ok(())
