@@ -81,7 +81,7 @@ pub fn generate_anonymous_identity() -> AnonymousIdentity {
     // Extract last 8 characters from DID (after the 'z' multibase prefix)
     let did_suffix = did
         .split(':')
-        .next_back()
+        .last()
         .unwrap()
         .chars()
         .skip(1)

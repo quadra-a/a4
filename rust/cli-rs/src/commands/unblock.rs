@@ -34,7 +34,7 @@ pub async fn run(opts: UnblockOptions) -> Result<()> {
 
     save_config(&config)?;
 
-    let _ = inform_daemon_of_unblock(&target_did).await;
+    if let Err(_) = inform_daemon_of_unblock(&target_did).await {}
 
     if opts.human {
         println!("Unblocking agent: {}", target_did);

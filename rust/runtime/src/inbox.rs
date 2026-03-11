@@ -118,10 +118,6 @@ impl MessageStore {
         self.messages.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.messages.is_empty()
-    }
-
     pub fn store(&mut self, message: StoredMessage) {
         self.messages.push(message);
         let msg_len = self.messages.len();

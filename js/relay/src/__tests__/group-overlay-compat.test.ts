@@ -113,12 +113,8 @@ describe('Quick agent group overlay compatibility', () => {
     });
 
     const relayIndexA = createRelayIndexOperations(clientA);
-    await expect
-      .poll(
-        async () => (await discoverQuickAgentGroupMembers(relayIndexA, managerA, invite.groupId)).map((card) => card.did).sort(),
-        { timeout: 5_000, interval: 50 },
-      )
-      .toEqual([agentA.did, agentB.did].sort());
+    const visibleToA = await discoverQuickAgentGroupMembers(relayIndexA, managerA, invite.groupId);
+    expect(visibleToA.map((card) => card.did).sort()).toEqual([agentA.did, agentB.did].sort());
 
     await expect(discoverQuickAgentGroupMembers(createRelayIndexOperations(clientC), managerC, invite.groupId)).rejects.toThrow('Not a member');
 
