@@ -130,7 +130,7 @@ describe('RelayAgent federated directory', () => {
     });
   });
 
-  it('routes relay-directed envelopes through relay protocol handlers', async () => {
+  it('does not tunnel relay-control messages through SEND application envelopes', async () => {
     const relay = new RelayAgent({ federationEnabled: false });
     const senderWs = createCaptureWs();
 
@@ -148,11 +148,6 @@ describe('RelayAgent federated directory', () => {
         agentCard: createCard('did:agent:relay-local', 'relay/message-routing'),
       }),
     };
-    (relay as any).federationManager = {
-      getRemoteAgentCard: (did: string, realm: string) => did === 'did:agent:gpu-remote' && realm === 'public'
-        ? createCard('did:agent:gpu-remote')
-        : null,
-    };
 
     await (relay as any).routeMessage('did:agent:requester', {
       type: 'SEND',
@@ -164,11 +159,9 @@ describe('RelayAgent federated directory', () => {
     });
 
     expect(senderWs.sent).toHaveLength(1);
-    expect(senderWs.sent[0]).toMatchObject({ type: 'DELIVER' });
-    expect(decodeCBOR(senderWs.sent[0].envelope)).toMatchObject({
-      type: 'CARD',
-      did: 'did:agent:gpu-remote',
-      card: expect.objectContaining({ did: 'did:agent:gpu-remote' }),
+    expect(senderWs.sent[0]).toMatchObject({
+      type: 'DELIVERY_REPORT',
+      status: 'unknown_recipient',
     });
   });
 });
