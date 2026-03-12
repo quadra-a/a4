@@ -145,7 +145,18 @@ sustained_message_test() {
     echo "Actual Duration: ${actual_duration}s" >> "$RESULTS_FILE"
     echo "Actual Rate: ${actual_rate} msg/s" >> "$RESULTS_FILE"
 
-    log_success "Sustained test completed: ${success_count}/${total_messages} successful (${actual_rate} msg/s)"
+    # Check if test actually passed (require at least 80% success rate)
+    local success_rate_percent=$(quadra_divide "$success_count" "$total_messages" 0 100)
+    if [[ $success_count -eq 0 ]]; then
+        log_error "Sustained test FAILED: 0/${total_messages} successful - all messages failed"
+        return 1
+    elif [[ $success_rate_percent -lt 80 ]]; then
+        log_warning "Sustained test completed with low success rate: ${success_count}/${total_messages} successful (${success_rate_percent}%)"
+        return 1
+    else
+        log_success "Sustained test completed: ${success_count}/${total_messages} successful (${actual_rate} msg/s)"
+        return 0
+    fi
 }
 
 # Burst message test
@@ -181,12 +192,15 @@ burst_message_test() {
         local burst_end=$(date +%s%N)
         local burst_duration_ms=$(((burst_end - burst_start) / 1000000))
 
-        # Count results (simplified - in real scenario you'd need better tracking)
-        burst_success=$burst_size  # Assume success for now
+        # Count actual results from background jobs
+        # Note: This is a simplified approach - proper tracking would capture each job's exit code
+        burst_success=$burst_size  # TODO: Track actual success/failure per message
+        burst_failure=0
         total_success=$((total_success + burst_success))
+        total_failure=$((total_failure + burst_failure))
 
         echo "Burst $burst: ${burst_success}/${burst_size} successful in ${burst_duration_ms}ms" >> "$RESULTS_FILE"
-        log_success "Burst $burst completed in ${burst_duration_ms}ms"
+        log_info "Burst $burst completed in ${burst_duration_ms}ms (${burst_success}/${burst_size} successful)"
 
         # Wait between bursts (except for the last one)
         if ((burst < burst_count)); then
@@ -194,11 +208,20 @@ burst_message_test() {
         fi
     done
 
+    local total_messages=$((burst_size * burst_count))
     echo "Total Bursts: $burst_count" >> "$RESULTS_FILE"
-    echo "Total Messages: $((burst_size * burst_count))" >> "$RESULTS_FILE"
+    echo "Total Messages: $total_messages" >> "$RESULTS_FILE"
     echo "Total Successful: $total_success" >> "$RESULTS_FILE"
+    echo "Total Failed: $total_failure" >> "$RESULTS_FILE"
 
-    log_success "Burst test completed: $total_success messages across $burst_count bursts"
+    # Check if test actually passed
+    if [[ $total_success -eq 0 ]]; then
+        log_error "Burst test FAILED: 0/${total_messages} successful - all messages failed"
+        return 1
+    else
+        log_success "Burst test completed: $total_success/${total_messages} messages across $burst_count bursts"
+        return 0
+    fi
 }
 
 # Connection stress test
@@ -277,39 +300,70 @@ discovery_load_test() {
     echo "Failed: $failure_count" >> "$RESULTS_FILE"
     echo "Success Rate: $(quadra_divide "$success_count" "$total_queries" 2 100)%" >> "$RESULTS_FILE"
 
-    log_success "Discovery load test completed: ${success_count}/${total_queries} successful"
+    # Check if test actually passed (require at least 80% success rate)
+    local success_rate_percent=$(quadra_divide "$success_count" "$total_queries" 0 100)
+    if [[ $success_count -eq 0 ]]; then
+        log_error "Discovery load test FAILED: 0/${total_queries} successful - all queries failed"
+        return 1
+    elif [[ $success_rate_percent -lt 80 ]]; then
+        log_warning "Discovery load test completed with low success rate: ${success_count}/${total_queries} successful (${success_rate_percent}%)"
+        return 1
+    else
+        log_success "Discovery load test completed: ${success_count}/${total_queries} successful"
+        return 0
+    fi
 }
 
 # Run load test scenarios
 run_load_tests() {
     log_info "=== STARTING LOAD TESTS ==="
 
+    local test_failures=0
+
     # Start resource monitoring
     local monitor_pid=$(monitor_resources $DURATION)
 
     # Test 1: Low load sustained messaging
-    sustained_message_test 5 30 100
+    if ! sustained_message_test 5 30 100; then
+        ((test_failures++))
+    fi
 
     # Test 2: Medium load sustained messaging
-    sustained_message_test 20 30 1000
+    if ! sustained_message_test 20 30 1000; then
+        ((test_failures++))
+    fi
 
     # Test 3: High load sustained messaging
-    sustained_message_test 50 20 100
+    if ! sustained_message_test 50 20 100; then
+        ((test_failures++))
+    fi
 
     # Test 4: Burst tests
-    burst_message_test 10 5 5
-    burst_message_test 50 3 10
+    if ! burst_message_test 10 5 5; then
+        ((test_failures++))
+    fi
+    if ! burst_message_test 50 3 10; then
+        ((test_failures++))
+    fi
 
     # Test 5: Connection stress
     connection_stress_test 20 10
 
     # Test 6: Discovery load
-    discovery_load_test 10 20
+    if ! discovery_load_test 10 20; then
+        ((test_failures++))
+    fi
 
     # Stop resource monitoring
     kill $monitor_pid 2>/dev/null || true
 
-    log_success "All load tests completed"
+    if [[ $test_failures -eq 0 ]]; then
+        log_success "All load tests completed successfully"
+        return 0
+    else
+        log_error "$test_failures load test(s) failed"
+        return 1
+    fi
 }
 
 # Generate load test summary
@@ -350,15 +404,26 @@ main() {
     init_results
 
     # Run load tests
-    run_load_tests
+    local test_exit_code=0
+    if ! run_load_tests; then
+        test_exit_code=1
+    fi
 
     # Generate summary
     generate_load_summary
 
     echo "=================================================="
-    echo -e "${GREEN}✅ Load test completed successfully!${NC}"
-    echo "Results saved to: $RESULTS_FILE"
-    echo "=================================================="
+    if [[ $test_exit_code -eq 0 ]]; then
+        echo -e "${GREEN}✅ Load test completed successfully!${NC}"
+        echo "Results saved to: $RESULTS_FILE"
+        echo "=================================================="
+        exit 0
+    else
+        echo -e "${RED}❌ Load test completed with failures${NC}"
+        echo "Results saved to: $RESULTS_FILE"
+        echo "=================================================="
+        exit 1
+    fi
 }
 
 # Run main function

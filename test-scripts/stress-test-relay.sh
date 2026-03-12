@@ -194,13 +194,26 @@ connection_stress_test() {
     local success_rate
     success_rate="$(quadra_divide "$successful_connections" "$MAX_CONNECTIONS" 2 100)"
 
-    log_success "Connection test completed"
-    log_info "Successful: $successful_connections/$MAX_CONNECTIONS (${success_rate}%)"
-    log_info "Total time: ${total_time}ms"
-
-    # Add to results
-    local result_data="{\"successful\": $successful_connections, \"failed\": $failed_connections, \"total_time_ms\": $total_time, \"success_rate\": $success_rate}"
-    add_result "connection_tests" "$result_data"
+    # Check if test passed (require at least 80% success rate)
+    if [[ $successful_connections -eq 0 ]]; then
+        log_error "Connection test FAILED: 0/$MAX_CONNECTIONS successful"
+        local result_data="{\"successful\": $successful_connections, \"failed\": $failed_connections, \"total_time_ms\": $total_time, \"success_rate\": $success_rate}"
+        add_result "connection_tests" "$result_data"
+        return 1
+    elif [[ $(echo "$success_rate < 80" | bc -l) -eq 1 ]]; then
+        log_warning "Connection test completed with low success rate: $successful_connections/$MAX_CONNECTIONS (${success_rate}%)"
+        log_info "Total time: ${total_time}ms"
+        local result_data="{\"successful\": $successful_connections, \"failed\": $failed_connections, \"total_time_ms\": $total_time, \"success_rate\": $success_rate}"
+        add_result "connection_tests" "$result_data"
+        return 1
+    else
+        log_success "Connection test completed"
+        log_info "Successful: $successful_connections/$MAX_CONNECTIONS (${success_rate}%)"
+        log_info "Total time: ${total_time}ms"
+        local result_data="{\"successful\": $successful_connections, \"failed\": $failed_connections, \"total_time_ms\": $total_time, \"success_rate\": $success_rate}"
+        add_result "connection_tests" "$result_data"
+        return 0
+    fi
 }
 
 # Message throughput stress test
@@ -256,15 +269,31 @@ message_throughput_test() {
     actual_rate="$(quadra_divide "$successful_messages" "$actual_duration" 2)"
     success_rate="$(quadra_divide "$successful_messages" "$((successful_messages + failed_messages))" 2 100)"
 
-    log_success "Throughput test completed"
-    log_info "Messages sent: $((successful_messages + failed_messages))"
-    log_info "Successful: $successful_messages (${success_rate}%)"
-    log_info "Actual rate: ${actual_rate}/s"
-    log_info "Duration: ${actual_duration}s"
-
-    # Add to results
-    local result_data="{\"total_sent\": $((successful_messages + failed_messages)), \"successful\": $successful_messages, \"failed\": $failed_messages, \"actual_rate\": $actual_rate, \"duration\": $actual_duration, \"success_rate\": $success_rate}"
-    add_result "message_tests" "$result_data"
+    # Check if test passed (require at least 80% success rate)
+    if [[ $successful_messages -eq 0 ]]; then
+        log_error "Throughput test FAILED: 0/$((successful_messages + failed_messages)) successful - all messages failed"
+        local result_data="{\"total_sent\": $((successful_messages + failed_messages)), \"successful\": $successful_messages, \"failed\": $failed_messages, \"actual_rate\": $actual_rate, \"duration\": $actual_duration, \"success_rate\": $success_rate}"
+        add_result "message_tests" "$result_data"
+        return 1
+    elif [[ $(echo "$success_rate < 80" | bc -l) -eq 1 ]]; then
+        log_warning "Throughput test completed with low success rate"
+        log_info "Messages sent: $((successful_messages + failed_messages))"
+        log_info "Successful: $successful_messages (${success_rate}%)"
+        log_info "Actual rate: ${actual_rate}/s"
+        log_info "Duration: ${actual_duration}s"
+        local result_data="{\"total_sent\": $((successful_messages + failed_messages)), \"successful\": $successful_messages, \"failed\": $failed_messages, \"actual_rate\": $actual_rate, \"duration\": $actual_duration, \"success_rate\": $success_rate}"
+        add_result "message_tests" "$result_data"
+        return 1
+    else
+        log_success "Throughput test completed"
+        log_info "Messages sent: $((successful_messages + failed_messages))"
+        log_info "Successful: $successful_messages (${success_rate}%)"
+        log_info "Actual rate: ${actual_rate}/s"
+        log_info "Duration: ${actual_duration}s"
+        local result_data="{\"total_sent\": $((successful_messages + failed_messages)), \"successful\": $successful_messages, \"failed\": $failed_messages, \"actual_rate\": $actual_rate, \"duration\": $actual_duration, \"success_rate\": $success_rate}"
+        add_result "message_tests" "$result_data"
+        return 0
+    fi
 }
 
 # Discovery stress test
@@ -323,14 +352,29 @@ discovery_stress_test() {
         avg_query_time=$((total_time / successful_queries))
     fi
 
-    log_success "Discovery stress test completed"
-    log_info "Queries: $((successful_queries + failed_queries))"
-    log_info "Successful: $successful_queries (${success_rate}%)"
-    log_info "Average query time: ${avg_query_time}ms"
-
-    # Add to results
-    local result_data="{\"total_queries\": $((successful_queries + failed_queries)), \"successful\": $successful_queries, \"failed\": $failed_queries, \"avg_time_ms\": $avg_query_time, \"success_rate\": $success_rate}"
-    add_result "discovery_tests" "$result_data"
+    # Check if test passed (require at least 80% success rate)
+    if [[ $successful_queries -eq 0 ]]; then
+        log_error "Discovery stress test FAILED: 0/$((successful_queries + failed_queries)) successful - all queries failed"
+        local result_data="{\"total_queries\": $((successful_queries + failed_queries)), \"successful\": $successful_queries, \"failed\": $failed_queries, \"avg_time_ms\": $avg_query_time, \"success_rate\": $success_rate}"
+        add_result "discovery_tests" "$result_data"
+        return 1
+    elif [[ $(echo "$success_rate < 80" | bc -l) -eq 1 ]]; then
+        log_warning "Discovery stress test completed with low success rate"
+        log_info "Queries: $((successful_queries + failed_queries))"
+        log_info "Successful: $successful_queries (${success_rate}%)"
+        log_info "Average query time: ${avg_query_time}ms"
+        local result_data="{\"total_queries\": $((successful_queries + failed_queries)), \"successful\": $successful_queries, \"failed\": $failed_queries, \"avg_time_ms\": $avg_query_time, \"success_rate\": $success_rate}"
+        add_result "discovery_tests" "$result_data"
+        return 1
+    else
+        log_success "Discovery stress test completed"
+        log_info "Queries: $((successful_queries + failed_queries))"
+        log_info "Successful: $successful_queries (${success_rate}%)"
+        log_info "Average query time: ${avg_query_time}ms"
+        local result_data="{\"total_queries\": $((successful_queries + failed_queries)), \"successful\": $successful_queries, \"failed\": $failed_queries, \"avg_time_ms\": $avg_query_time, \"success_rate\": $success_rate}"
+        add_result "discovery_tests" "$result_data"
+        return 0
+    fi
 }
 
 # System resource monitoring
@@ -445,9 +489,16 @@ main() {
     local monitor_pid=$(monitor_resources)
 
     # Run stress tests
-    connection_stress_test
-    message_throughput_test
-    discovery_stress_test
+    local test_failures=0
+    if ! connection_stress_test; then
+        ((test_failures++))
+    fi
+    if ! message_throughput_test; then
+        ((test_failures++))
+    fi
+    if ! discovery_stress_test; then
+        ((test_failures++))
+    fi
 
     # Stop resource monitoring
     kill $monitor_pid 2>/dev/null || true
@@ -456,11 +507,21 @@ main() {
     local report_file=$(generate_stress_report)
 
     echo "=================================================="
-    echo -e "${GREEN}✅ Stress test completed!${NC}"
-    echo "Scenario: $SCENARIO"
-    echo "Report: $report_file"
-    echo "Results: $RESULTS_FILE"
-    echo "=================================================="
+    if [[ $test_failures -eq 0 ]]; then
+        echo -e "${GREEN}✅ Stress test completed successfully!${NC}"
+        echo "Scenario: $SCENARIO"
+        echo "Report: $report_file"
+        echo "Results: $RESULTS_FILE"
+        echo "=================================================="
+        exit 0
+    else
+        echo -e "${RED}❌ Stress test completed with $test_failures failure(s)${NC}"
+        echo "Scenario: $SCENARIO"
+        echo "Report: $report_file"
+        echo "Results: $RESULTS_FILE"
+        echo "=================================================="
+        exit 1
+    fi
 }
 
 # Show available scenarios

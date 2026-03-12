@@ -226,9 +226,11 @@ measure_command() {
 
         echo "$description: ${duration_ms}ms" >> "$REPORT_FILE"
         log_success "$description: ${duration_ms}ms"
+        return 0
     else
         echo "$description: FAILED" >> "$REPORT_FILE"
         log_error "$description: FAILED"
+        return 1
     fi
 }
 
@@ -238,11 +240,14 @@ benchmark_discovery() {
     echo "Discovery Performance:" >> "$REPORT_FILE"
     echo "=====================" >> "$REPORT_FILE"
 
-    measure_command "Basic Discovery" "$A4_BINARY" find --relay "$RELAY_URL"
-    measure_command "WebSocket Query Discovery" "$A4_BINARY" find --query "WebSocket" --relay "$RELAY_URL"
-    measure_command "Multi-word Query Discovery" "$A4_BINARY" find --query "routes messages" --relay "$RELAY_URL"
-    measure_command "Non-existent Query Discovery" "$A4_BINARY" find --query "nonexistent" --relay "$RELAY_URL"
-    measure_command "Limited Discovery" "$A4_BINARY" find --limit 5 --relay "$RELAY_URL"
+    local failures=0
+    measure_command "Basic Discovery" "$A4_BINARY" find --relay "$RELAY_URL" || ((failures++))
+    measure_command "WebSocket Query Discovery" "$A4_BINARY" find --query "WebSocket" --relay "$RELAY_URL" || ((failures++))
+    measure_command "Multi-word Query Discovery" "$A4_BINARY" find --query "routes messages" --relay "$RELAY_URL" || ((failures++))
+    measure_command "Non-existent Query Discovery" "$A4_BINARY" find --query "nonexistent" --relay "$RELAY_URL" || ((failures++))
+    measure_command "Limited Discovery" "$A4_BINARY" find --limit 5 --relay "$RELAY_URL" || ((failures++))
+
+    return $failures
 }
 
 benchmark_messaging() {
@@ -254,10 +259,13 @@ benchmark_messaging() {
     local json_payload
     json_payload=$(printf '{"test":"benchmark","timestamp":"%s"}' "$(quadra_iso_timestamp)")
 
-    measure_command "Basic Message Send" "$A4_BINARY" tell "$TEST_DID" "Benchmark test" --relay "$RELAY_URL"
-    measure_command "Message with Wait Flag" "$A4_BINARY" tell "$TEST_DID" "Request test" --wait --relay "$RELAY_URL"
-    measure_command "Custom Protocol Message" "$A4_BINARY" tell "$TEST_DID" "Custom protocol test" --protocol "benchmark/test/1.0" --relay "$RELAY_URL"
-    measure_command "JSON Payload Message" "$A4_BINARY" tell "$TEST_DID" --payload "$json_payload" --relay "$RELAY_URL"
+    local failures=0
+    measure_command "Basic Message Send" "$A4_BINARY" tell "$TEST_DID" "Benchmark test" --relay "$RELAY_URL" || ((failures++))
+    measure_command "Message with Wait Flag" "$A4_BINARY" tell "$TEST_DID" "Request test" --wait --relay "$RELAY_URL" || ((failures++))
+    measure_command "Custom Protocol Message" "$A4_BINARY" tell "$TEST_DID" "Custom protocol test" --protocol "benchmark/test/1.0" --relay "$RELAY_URL" || ((failures++))
+    measure_command "JSON Payload Message" "$A4_BINARY" tell "$TEST_DID" --payload "$json_payload" --relay "$RELAY_URL" || ((failures++))
+
+    return $failures
 }
 
 benchmark_payload_sizes() {
@@ -267,7 +275,7 @@ benchmark_payload_sizes() {
     echo "========================" >> "$REPORT_FILE"
 
     local sizes=(100 1000 5000 10000 25000 50000)
-    local size payload
+    local size payload failures=0
 
     for size in "${sizes[@]}"; do
         payload=$(python3 - "$size" <<'PY'
@@ -278,8 +286,10 @@ size = int(sys.argv[1])
 print(json.dumps({"test": f"payload_size_{size}", "data": "A" * size}, separators=(",", ":")))
 PY
 )
-        measure_command "${size}B Payload" "$A4_BINARY" tell "$TEST_DID" --payload "$payload" --protocol "benchmark/size-$size/1.0" --relay "$RELAY_URL"
+        measure_command "${size}B Payload" "$A4_BINARY" tell "$TEST_DID" --payload "$payload" --protocol "benchmark/size-$size/1.0" --relay "$RELAY_URL" || ((failures++))
     done
+
+    return $failures
 }
 
 benchmark_sequential_throughput() {
@@ -439,9 +449,10 @@ main() {
     setup_benchmark_session
     init_report
 
-    benchmark_discovery
-    benchmark_messaging
-    benchmark_payload_sizes
+    local total_failures=0
+    benchmark_discovery || total_failures=$((total_failures + $?))
+    benchmark_messaging || total_failures=$((total_failures + $?))
+    benchmark_payload_sizes || total_failures=$((total_failures + $?))
     benchmark_sequential_throughput
     benchmark_concurrent_throughput
     benchmark_daemon
@@ -451,12 +462,19 @@ main() {
     echo "Benchmark completed at: $(date)" >> "$REPORT_FILE"
 
     echo "=================================================="
-    echo -e "${GREEN}✅ Benchmark completed successfully!${NC}"
+    if [[ $total_failures -eq 0 ]]; then
+        echo -e "${GREEN}✅ Benchmark completed successfully!${NC}"
+    else
+        echo -e "${YELLOW}⚠️  Benchmark completed with $total_failures failure(s)${NC}"
+    fi
     echo "Report saved to: $REPORT_FILE"
     echo "=================================================="
     echo ""
     echo "Performance Summary:"
     tail -n 10 "$REPORT_FILE"
+
+    # Exit with success even if some tests failed (benchmark is informational)
+    exit 0
 }
 
 main "$@"
