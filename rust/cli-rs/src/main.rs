@@ -1,6 +1,7 @@
 mod commands;
 mod config;
 mod daemon;
+mod e2e_state;
 mod identity;
 mod protocol;
 mod relay;

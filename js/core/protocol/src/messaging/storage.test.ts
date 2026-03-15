@@ -181,6 +181,43 @@ describe('MessageStorage - Thread Operations', () => {
       expect(stored?.e2e?.deliveries).toEqual(merged?.e2e?.deliveries);
     });
 
+    it('should merge outbound E2E retry metadata onto one stored message', async () => {
+      const threadId = generateThreadId();
+      const message = createTestMessage(
+        'msg-retry',
+        'did:agent:me',
+        'did:agent:peer',
+        threadId,
+        'Retry me',
+        { direction: 'outbound', envelopeTimestamp: 1000, sentAt: 1000 },
+      );
+      message.e2e = {
+        deliveries: [],
+        retry: {
+          replayCount: 0,
+          lastRequestedAt: 100,
+        },
+      };
+
+      await storage.putMessage(message);
+      const merged = await storage.upsertE2ERetry('msg-retry', {
+        replayCount: 1,
+        lastRequestedAt: 200,
+        lastReplayedAt: 250,
+        lastReason: 'decrypt-failed',
+      });
+
+      expect(merged?.e2e?.retry).toEqual({
+        replayCount: 1,
+        lastRequestedAt: 200,
+        lastReplayedAt: 250,
+        lastReason: 'decrypt-failed',
+      });
+
+      const stored = await storage.getMessage('msg-retry', 'outbound');
+      expect(stored?.e2e?.retry).toEqual(merged?.e2e?.retry);
+    });
+
     it('should upsert duplicate message ids without duplicating inbox rows or session counts', async () => {
       const threadId = generateThreadId();
       const message = createTestMessage('msg1', 'did:agent:alice', 'did:agent:bob', threadId, 'Hello once', {

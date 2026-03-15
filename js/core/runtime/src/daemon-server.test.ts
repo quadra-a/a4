@@ -20,15 +20,42 @@ const mocks = vi.hoisted(() => {
     };
     e2e?: Awaited<ReturnType<typeof createInitialLocalE2EConfig>>;
   } = {};
+  const setE2EConfigMock = vi.fn((value) => {
+    configState.e2e = value;
+  });
 
   return {
     configState,
-    setE2EConfigMock: vi.fn((value) => {
-      configState.e2e = value;
+    setE2EConfigMock,
+    withLocalE2EStateTransactionMock: vi.fn(async (_identity, callback) => {
+      if (!configState.e2e) {
+        throw new Error('Missing test E2E config');
+      }
+
+      let nextE2E = configState.e2e;
+      const result = await callback({
+        config: {
+          identity: configState.identity,
+          e2e: configState.e2e,
+          deviceIdentity: configState.e2e
+            ? { seed: 'test-seed', deviceId: configState.e2e.currentDeviceId }
+            : undefined,
+        },
+        e2eConfig: configState.e2e,
+        deviceIdentity: { seed: 'test-seed', deviceId: configState.e2e.currentDeviceId },
+        created: false,
+        setE2EConfig(value: typeof nextE2E) {
+          nextE2E = value;
+        },
+      });
+      configState.e2e = nextE2E;
+      setE2EConfigMock(nextE2E);
+      return result;
     }),
     resolveE2EConfigMock: vi.fn(async () => configState.e2e),
     resolvePublishedDevicesMock: vi.fn(async () => []),
     resolvePublishedPreKeyBundlesMock: vi.fn(async () => []),
+    prepareEncryptedSendsMock: vi.fn(),
     prepareEncryptedReceiveMock: vi.fn(),
   };
 });
@@ -61,14 +88,24 @@ vi.mock('./e2e-receive.js', () => ({
   prepareEncryptedReceive: mocks.prepareEncryptedReceiveMock,
 }));
 
+vi.mock('./e2e-send.js', () => ({
+  prepareEncryptedSends: mocks.prepareEncryptedSendsMock,
+}));
+
+vi.mock('./e2e-state.js', () => ({
+  withLocalE2EStateTransaction: mocks.withLocalE2EStateTransactionMock,
+}));
+
 import { ClawDaemon } from './daemon-server.js';
 
 describe('ClawDaemon E2E recovery', () => {
   beforeEach(async () => {
     mocks.setE2EConfigMock.mockClear();
+    mocks.withLocalE2EStateTransactionMock.mockClear();
     mocks.resolveE2EConfigMock.mockClear();
     mocks.resolvePublishedDevicesMock.mockClear();
     mocks.resolvePublishedPreKeyBundlesMock.mockClear();
+    mocks.prepareEncryptedSendsMock.mockReset();
     mocks.prepareEncryptedReceiveMock.mockReset();
 
     const selfKeys = await generateKeyPair();
@@ -121,7 +158,7 @@ describe('ClawDaemon E2E recovery', () => {
     expect((daemon as any).queue.enqueueInbound).not.toHaveBeenCalled();
   });
 
-  it('sends a signed reset envelope and writes a diagnostic message after decrypt failure', async () => {
+  it('sends a signed retry envelope and writes a diagnostic message after decrypt failure', async () => {
     const peerKeys = await generateKeyPair();
     const peerDid = deriveDID(peerKeys.publicKey);
     const currentDeviceId = mocks.configState.e2e!.currentDeviceId;
@@ -177,14 +214,18 @@ describe('ClawDaemon E2E recovery', () => {
     }));
 
     expect(router.sendMessage).toHaveBeenCalledOnce();
-    const resetEnvelope = router.sendMessage.mock.calls[0]?.[0];
-    expect(resetEnvelope).toEqual(expect.objectContaining({
-      protocol: 'e2e/session-reset',
+    const retryEnvelope = router.sendMessage.mock.calls[0]?.[0];
+    expect(retryEnvelope).toEqual(expect.objectContaining({
+      protocol: 'e2e/session-retry',
       from: mocks.configState.identity!.did,
       to: peerDid,
+      payload: expect.objectContaining({
+        messageId: transportEnvelope.id,
+        failedTransport: 'session',
+      }),
     }));
     expect(await verifyEnvelope(
-      resetEnvelope,
+      retryEnvelope,
       (signature, data) => verify(
         signature,
         data,
@@ -255,6 +296,82 @@ describe('ClawDaemon E2E recovery', () => {
       state: 'received',
       usedSkippedMessageKey: false,
     }));
+  });
+
+  it('replays one outbound message once on signed session-retry messages', async () => {
+    const peerKeys = await generateKeyPair();
+    const peerDid = deriveDID(peerKeys.publicKey);
+    const applicationEnvelope = await signEnvelope(
+      createEnvelope(
+        mocks.configState.identity!.did,
+        peerDid,
+        'message',
+        '/agent/msg/1.0.0',
+        { text: 'hello again' },
+      ),
+      (data) => sign(data, Buffer.from(mocks.configState.identity!.privateKey, 'hex')),
+    );
+
+    mocks.prepareEncryptedSendsMock.mockResolvedValueOnce({
+      applicationEnvelope,
+      e2eConfig: mocks.configState.e2e!,
+      targets: [{
+        outerEnvelope: applicationEnvelope,
+        outerEnvelopeBytes: new Uint8Array([1, 2, 3]),
+        transport: 'prekey',
+        senderDeviceId: mocks.configState.e2e!.currentDeviceId,
+        recipientDeviceId: 'device-peer',
+        sessionId: 'session-replayed',
+      }],
+    });
+
+    const daemon = new ClawDaemon('/tmp/quadra-a-daemon-retry-test.sock');
+    const queue = {
+      getOutboundMessage: vi.fn(async () => ({
+        envelope: applicationEnvelope,
+        e2e: { deliveries: [], retry: { replayCount: 0 } },
+      })),
+      appendE2ERetry: vi.fn(async () => ({ e2e: { retry: { replayCount: 1 } } })),
+      appendE2EDelivery: vi.fn(async () => ({ e2e: { deliveries: [] } })),
+    };
+    const relayClient = {
+      sendEnvelope: vi.fn(async () => undefined),
+    };
+    (daemon as any).queue = queue;
+    (daemon as any).relayClient = relayClient;
+    (daemon as any).defense = { checkMessage: vi.fn(async () => ({ allowed: true })) };
+    (daemon as any).trustSystem = { recordInteraction: vi.fn(async () => undefined) };
+
+    const retryEnvelope = await signEnvelope(
+      createEnvelope(
+        peerDid,
+        mocks.configState.identity!.did,
+        'message',
+        'e2e/session-retry',
+        {
+          messageId: applicationEnvelope.id,
+          reason: 'decrypt-failed',
+          failedTransport: 'session',
+          timestamp: 123,
+        },
+      ),
+      (data) => sign(data, peerKeys.privateKey),
+    );
+
+    await (daemon as any).handleIncomingMessage(retryEnvelope);
+
+    expect(queue.getOutboundMessage).toHaveBeenCalledWith(applicationEnvelope.id);
+    expect(queue.appendE2ERetry).toHaveBeenCalledTimes(2);
+    expect(queue.appendE2EDelivery).toHaveBeenCalledWith(
+      applicationEnvelope.id,
+      expect.objectContaining({
+        transport: 'prekey',
+        receiverDeviceId: 'device-peer',
+        sessionId: 'session-replayed',
+        state: 'sent',
+      }),
+    );
+    expect(relayClient.sendEnvelope).toHaveBeenCalledWith(peerDid, new Uint8Array([1, 2, 3]));
   });
 
   it('merges duplicate inbound E2E deliveries onto the existing visible message', async () => {

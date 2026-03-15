@@ -6,13 +6,14 @@ use uuid::Uuid;
 use crate::commands::message_lifecycle::{
     envelope_payload, MessageOutcome, MessageOutcomeKind, MessageOutcomeTracker,
 };
-use crate::config::{load_config, save_config};
+use crate::config::load_config;
 use crate::daemon::{daemon_socket_path, DaemonClient};
+use crate::e2e_state::with_local_e2e_state_transaction;
 use crate::identity::KeyPair;
 use crate::protocol::{cbor_decode_value, Envelope, EnvelopeUnsigned};
 use crate::relay::{connect_first_available, RelaySession};
 use crate::ui::LlmFormatter;
-use quadra_a_core::e2e::{ensure_local_e2e_config, E2E_APPLICATION_ENVELOPE_PROTOCOL};
+use quadra_a_core::e2e::E2E_APPLICATION_ENVELOPE_PROTOCOL;
 use quadra_a_runtime::e2e_receive::prepare_encrypted_receive;
 use quadra_a_runtime::e2e_send::prepare_encrypted_sends_with_session;
 
@@ -54,7 +55,6 @@ struct WaitOutcomeDisplay<'a> {
 
 pub async fn run(opts: TellOptions) -> Result<()> {
     let mut config = load_config()?;
-    ensure_local_e2e_config(&mut config)?;
 
     let identity = config
         .identity
@@ -288,10 +288,27 @@ pub async fn run(opts: TellOptions) -> Result<()> {
         },
         &keypair,
     )?;
-    let prepared =
-        prepare_encrypted_sends_with_session(&mut session, &config, &keypair, envelope).await?;
-    config = prepared.config.clone();
-    save_config(&config)?;
+    let identity_for_send = identity.clone();
+    let envelope_for_send = envelope.clone();
+    let (prepared, next_config) = with_local_e2e_state_transaction(|config| {
+        let session = &mut session;
+        let identity_for_send = identity_for_send.clone();
+        let envelope_for_send = envelope_for_send.clone();
+        async move {
+            let keypair = KeyPair::from_hex(&identity_for_send.private_key)?;
+            let prepared = prepare_encrypted_sends_with_session(
+                session,
+                &config,
+                &keypair,
+                envelope_for_send,
+            )
+            .await?;
+            let next_config = prepared.config.clone();
+            Ok((prepared, next_config))
+        }
+    })
+    .await?;
+    config = next_config;
 
     for target in &prepared.targets {
         session
@@ -585,12 +602,17 @@ async fn wait_for_message_outcome_via_relay(
                     continue;
                 }
             };
-            match prepare_encrypted_receive(config, &transport_envelope) {
-                Ok(decrypted) => {
-                    *config = decrypted.config;
-                    if let Err(err) = save_config(config) {
-                        eprintln!("Failed to persist E2E state after decryption: {}", err);
-                    }
+            let transport_envelope_for_receive = transport_envelope.clone();
+            match with_local_e2e_state_transaction(|config_snapshot| async move {
+                let decrypted =
+                    prepare_encrypted_receive(&config_snapshot, &transport_envelope_for_receive)?;
+                let next_config = decrypted.config.clone();
+                Ok((decrypted, next_config))
+            })
+            .await
+            {
+                Ok((decrypted, next_config)) => {
+                    *config = next_config;
                     envelope = match serde_json::to_value(&decrypted.application_envelope) {
                         Ok(v) => v,
                         Err(err) => {

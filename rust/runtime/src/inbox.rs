@@ -40,8 +40,22 @@ pub struct E2EDeliveryMetadata {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct E2ERetryMetadata {
+    #[serde(rename = "replayCount")]
+    pub replay_count: u32,
+    #[serde(default, rename = "lastRequestedAt", skip_serializing_if = "Option::is_none")]
+    pub last_requested_at: Option<u64>,
+    #[serde(default, rename = "lastReplayedAt", skip_serializing_if = "Option::is_none")]
+    pub last_replayed_at: Option<u64>,
+    #[serde(default, rename = "lastReason", skip_serializing_if = "Option::is_none")]
+    pub last_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredMessageE2EMetadata {
     pub deliveries: Vec<E2EDeliveryMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<E2ERetryMetadata>,
 }
 
 impl MessageDirection {
@@ -180,7 +194,27 @@ fn merge_message_e2e(existing: &mut StoredMessage, incoming: Option<&StoredMessa
             .unwrap_or(&[]),
         &incoming.deliveries,
     );
-    existing.e2e = Some(StoredMessageE2EMetadata { deliveries: merged });
+    existing.e2e = Some(StoredMessageE2EMetadata {
+        deliveries: merged,
+        retry: merge_e2e_retry(existing.e2e.as_ref().and_then(|metadata| metadata.retry.clone()), incoming.retry.clone()),
+    });
+}
+
+fn merge_e2e_retry(
+    existing: Option<E2ERetryMetadata>,
+    incoming: Option<E2ERetryMetadata>,
+) -> Option<E2ERetryMetadata> {
+    match (existing, incoming) {
+        (None, None) => None,
+        (Some(existing), None) => Some(existing),
+        (None, Some(incoming)) => Some(incoming),
+        (Some(existing), Some(incoming)) => Some(E2ERetryMetadata {
+            replay_count: existing.replay_count.max(incoming.replay_count),
+            last_requested_at: incoming.last_requested_at.or(existing.last_requested_at),
+            last_replayed_at: incoming.last_replayed_at.or(existing.last_replayed_at),
+            last_reason: incoming.last_reason.or(existing.last_reason),
+        }),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -343,9 +377,45 @@ impl MessageStore {
             message,
             Some(&StoredMessageE2EMetadata {
                 deliveries: vec![delivery],
+                retry: None,
             }),
         );
         true
+    }
+
+    pub fn upsert_e2e_retry(
+        &mut self,
+        message_id: &str,
+        direction: MessageDirection,
+        retry: E2ERetryMetadata,
+    ) -> bool {
+        let Some(message) = self
+            .messages
+            .iter_mut()
+            .find(|message| message.id == message_id && message.direction == direction)
+        else {
+            return false;
+        };
+
+        merge_message_e2e(
+            message,
+            Some(&StoredMessageE2EMetadata {
+                deliveries: Vec::new(),
+                retry: Some(retry),
+            }),
+        );
+        true
+    }
+
+    pub fn get_message(
+        &self,
+        message_id: &str,
+        direction: MessageDirection,
+    ) -> Option<StoredMessage> {
+        self.messages
+            .iter()
+            .find(|message| message.id == message_id && message.direction == direction)
+            .cloned()
     }
 }
 
@@ -353,7 +423,7 @@ impl MessageStore {
 mod tests {
     use super::{
         effective_thread_id, parse_envelope_value, E2EDeliveryMetadata, E2EDeliveryState,
-        MessageDirection, MessageStore, StoredMessage, StoredMessageE2EMetadata,
+        E2ERetryMetadata, MessageDirection, MessageStore, StoredMessage, StoredMessageE2EMetadata,
     };
     use serde_json::json;
 
@@ -487,6 +557,7 @@ mod tests {
                     used_skipped_message_key: Some(false),
                     error: None,
                 }],
+                retry: None,
             }),
         });
         store.store(StoredMessage {
@@ -509,6 +580,7 @@ mod tests {
                     used_skipped_message_key: Some(true),
                     error: None,
                 }],
+                retry: None,
             }),
         });
 
@@ -516,6 +588,54 @@ mod tests {
         let (messages, total) = store.inbox_page(10, false, None);
         assert_eq!(total, 1);
         assert_eq!(messages[0].e2e.as_ref().expect("e2e metadata").deliveries.len(), 2);
+    }
+
+    #[test]
+    fn store_merges_outbound_retry_metadata() {
+        let mut store = MessageStore::new(10);
+        store.store(StoredMessage {
+            id: "msg-retry".to_string(),
+            from: "did:agent:me".to_string(),
+            to: "did:agent:peer".to_string(),
+            envelope: json!({"payload": {"text": "retry me"}}),
+            timestamp: 10,
+            thread_id: None,
+            read: true,
+            direction: MessageDirection::Outbound,
+            e2e: Some(StoredMessageE2EMetadata {
+                deliveries: vec![],
+                retry: Some(E2ERetryMetadata {
+                    replay_count: 0,
+                    last_requested_at: Some(100),
+                    last_replayed_at: None,
+                    last_reason: None,
+                }),
+            }),
+        });
+
+        assert!(store.upsert_e2e_retry(
+            "msg-retry",
+            MessageDirection::Outbound,
+            E2ERetryMetadata {
+                replay_count: 1,
+                last_requested_at: Some(200),
+                last_replayed_at: Some(250),
+                last_reason: Some("decrypt-failed".to_string()),
+            },
+        ));
+
+        let stored = store
+            .get_message("msg-retry", MessageDirection::Outbound)
+            .expect("message exists");
+        assert_eq!(
+            stored.e2e.expect("retry metadata").retry,
+            Some(E2ERetryMetadata {
+                replay_count: 1,
+                last_requested_at: Some(200),
+                last_replayed_at: Some(250),
+                last_reason: Some("decrypt-failed".to_string()),
+            })
+        );
     }
 
     #[test]

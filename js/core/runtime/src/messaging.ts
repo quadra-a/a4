@@ -5,10 +5,10 @@ import {
 } from '@quadra-a/protocol';
 import { readFile } from 'node:fs/promises';
 import { basename } from 'node:path';
-import { getAliases, setE2EConfig } from './config.js';
+import { getAliases } from './config.js';
 import { DaemonClient } from './daemon-client.js';
-import { resolveE2EConfig } from './e2e-config.js';
 import { prepareEncryptedSends } from './e2e-send.js';
+import { withLocalE2EStateTransaction } from './e2e-state.js';
 import {
   requireIdentity,
   searchAgents,
@@ -184,20 +184,22 @@ export async function dispatchMessage(input: DispatchMessageInput): Promise<Disp
       identity,
     },
     async ({ keyPair, relayClient }) => {
-      const encrypted = await prepareEncryptedSends({
-        identity,
-        keyPair,
-        relayClient,
-        e2eConfig: await resolveE2EConfig(identity),
-        to: input.to,
-        protocol,
-        payload: input.payload,
-        type,
-        replyTo: input.replyTo,
-        threadId: input.threadId,
+      const encrypted = await withLocalE2EStateTransaction(identity, async ({ e2eConfig, setE2EConfig }) => {
+        const prepared = await prepareEncryptedSends({
+          identity,
+          keyPair,
+          relayClient,
+          e2eConfig,
+          to: input.to,
+          protocol,
+          payload: input.payload,
+          type,
+          replyTo: input.replyTo,
+          threadId: input.threadId,
+        });
+        setE2EConfig(prepared.e2eConfig);
+        return prepared;
       });
-
-      setE2EConfig(encrypted.e2eConfig);
       for (const target of encrypted.targets) {
         await relayClient.sendEnvelope(input.to, target.outerEnvelopeBytes);
       }

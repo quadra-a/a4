@@ -17,14 +17,14 @@ use crate::config::{
     load_config, resolve_reachability_policy, resolve_relay_invite_token, save_config, Config,
     EndorsementV2, TrustConfig,
 };
+use crate::e2e_state::{with_local_e2e_state_transaction, with_locked_config_transaction};
 use crate::identity::KeyPair;
 use crate::protocol::{cbor_x_encode_json, AgentCard, Envelope, EnvelopeUnsigned};
 use crate::trust::{ActivityLevel, NetworkPosition, TrustEngine};
 use quadra_a_core::e2e::{
     assert_published_sender_device_matches_prekey_message,
-    decode_encrypted_application_envelope_payload, ensure_local_e2e_config,
-    DecodedEncryptedApplicationMessage, EncryptedApplicationEnvelopePayload,
-    E2E_APPLICATION_ENVELOPE_PROTOCOL,
+    decode_encrypted_application_envelope_payload, DecodedEncryptedApplicationMessage,
+    EncryptedApplicationEnvelopePayload, E2E_APPLICATION_ENVELOPE_PROTOCOL,
 };
 use quadra_a_runtime::card::{
     build_agent_card_from_config, build_published_prekey_bundles_from_config,
@@ -33,7 +33,7 @@ use quadra_a_runtime::e2e_receive::prepare_encrypted_receive;
 use quadra_a_runtime::e2e_send::prepare_encrypted_sends_with_session;
 use quadra_a_runtime::inbox::{
     effective_thread_id, parse_envelope_value, E2EDeliveryMetadata, E2EDeliveryState,
-    MessageDirection, MessageStore, StoredMessage, StoredMessageE2EMetadata,
+    E2ERetryMetadata, MessageDirection, MessageStore, StoredMessage, StoredMessageE2EMetadata,
 };
 use quadra_a_runtime::query::{
     connect_query_session, query_discovered_agents as runtime_query_discovered_agents,
@@ -144,11 +144,13 @@ fn clear_peer_sessions(config: &mut Config, peer_did: &str) -> usize {
     before.saturating_sub(device.sessions.len())
 }
 
-fn build_session_reset_envelope(
+fn build_signed_control_envelope(
     keypair: &KeyPair,
     from: &str,
     to: &str,
-    reason: &str,
+    protocol: &str,
+    payload: Value,
+    thread_id: Option<String>,
     timestamp: u64,
 ) -> Envelope {
     let unsigned = EnvelopeUnsigned {
@@ -160,19 +162,66 @@ fn build_session_reset_envelope(
         from: from.to_string(),
         to: to.to_string(),
         msg_type: "message".to_string(),
-        protocol: "e2e/session-reset".to_string(),
-        payload: json!({
+        protocol: protocol.to_string(),
+        payload,
+        timestamp,
+        reply_to: None,
+        thread_id,
+        group_id: None,
+    };
+    unsigned.sign(keypair)
+}
+
+fn build_session_reset_envelope(
+    keypair: &KeyPair,
+    from: &str,
+    to: &str,
+    reason: &str,
+    timestamp: u64,
+) -> Envelope {
+    build_signed_control_envelope(
+        keypair,
+        from,
+        to,
+        "e2e/session-reset",
+        json!({
             "from": from,
             "to": to,
             "reason": reason,
             "timestamp": timestamp,
         }),
+        None,
         timestamp,
-        reply_to: None,
-        thread_id: None,
-        group_id: None,
-    };
-    unsigned.sign(keypair)
+    )
+}
+
+fn build_session_retry_envelope(
+    keypair: &KeyPair,
+    from: &str,
+    to: &str,
+    message_id: &str,
+    reason: &str,
+    failed_transport: &str,
+    timestamp: u64,
+    thread_id: Option<String>,
+) -> Envelope {
+    build_signed_control_envelope(
+        keypair,
+        from,
+        to,
+        "e2e/session-retry",
+        json!({
+            "from": from,
+            "to": to,
+            "messageId": message_id,
+            "reason": reason,
+            "failedTransport": failed_transport,
+            "timestamp": timestamp,
+            "threadId": thread_id.clone(),
+        }),
+        thread_id,
+        timestamp,
+    )
 }
 
 fn encode_envelope_bytes(envelope: &Envelope) -> Result<Vec<u8>> {
@@ -317,43 +366,295 @@ impl DaemonServer {
                     let mut state_guard = state.write().await;
                     let envelope_protocol = envelope.get("protocol").and_then(|value| value.as_str());
 
-                    // Handle signed e2e/session-reset control messages outside the E2E transport.
-                    if envelope_protocol == Some("e2e/session-reset") {
-                        let reset_envelope: Envelope = match serde_json::from_value(envelope.clone()) {
+                    // Handle signed control messages outside the E2E transport.
+                    if matches!(envelope_protocol, Some("e2e/session-reset" | "e2e/session-retry")) {
+                        let control_envelope: Envelope = match serde_json::from_value(envelope.clone()) {
                             Ok(envelope) => envelope,
                             Err(err) => {
                                 eprintln!(
-                                    "Skipping malformed session reset {} from {} on {}: {}",
+                                    "Skipping malformed control envelope {} from {} on {}: {}",
                                     message_id, from, relay_url, err,
                                 );
                                 continue;
                             }
                         };
 
-                        if reset_envelope.from != from {
+                        if control_envelope.from != from {
                             eprintln!(
-                                "Skipping forged session reset {} on {}: relay sender {} does not match envelope sender {}",
-                                message_id, relay_url, from, reset_envelope.from,
+                                "Skipping forged control envelope {} on {}: relay sender {} does not match envelope sender {}",
+                                message_id, relay_url, from, control_envelope.from,
                             );
                             continue;
                         }
 
-                        if !reset_envelope.verify_signature().unwrap_or(false) {
+                        if !control_envelope.verify_signature().unwrap_or(false) {
                             eprintln!(
-                                "Skipping unsigned session reset {} from {} on {}",
+                                "Skipping unsigned control envelope {} from {} on {}",
                                 message_id, from, relay_url,
                             );
                             continue;
                         }
 
-                        let cleared = clear_peer_sessions(&mut state_guard.config, &from);
-                        if cleared > 0 {
-                            merge_cli_fields_before_save(&mut state_guard.config);
-                            let _ = save_config(&state_guard.config);
+                        if control_envelope.protocol == "e2e/session-reset" {
+                            let from_for_reset = from.clone();
+                            match with_locked_config_transaction(|mut config| async move {
+                                let cleared = clear_peer_sessions(&mut config, &from_for_reset);
+                                Ok((cleared, config))
+                            }).await {
+                                Ok((cleared, next_config)) => {
+                                    state_guard.config = next_config;
+                                    if cleared > 0 {
+                                        eprintln!(
+                                            "E2E session reset by peer {} ({} session(s) cleared)",
+                                            from, cleared
+                                        );
+                                    }
+                                }
+                                Err(err) => {
+                                    eprintln!(
+                                        "Failed to persist session reset from {} on {}: {}",
+                                        from, relay_url, err,
+                                    );
+                                }
+                            }
+                            continue;
+                        }
+
+                        let payload = control_envelope.payload.as_object();
+                        let retry_message_id = payload
+                            .and_then(|payload| payload.get("messageId"))
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string);
+                        let retry_reason = payload
+                            .and_then(|payload| payload.get("reason"))
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("decrypt-failed")
+                            .to_string();
+                        let retry_transport = payload
+                            .and_then(|payload| payload.get("failedTransport"))
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("session")
+                            .to_string();
+                        let retry_requested_at = json_u64(payload.and_then(|payload| payload.get("timestamp")))
+                            .unwrap_or(received_at);
+
+                        let Some(retry_message_id) = retry_message_id else {
                             eprintln!(
-                                "E2E session reset by peer {} ({} session(s) cleared)",
-                                from, cleared
+                                "Ignoring malformed session retry {} from {} on {}: missing messageId",
+                                message_id, from, relay_url,
                             );
+                            continue;
+                        };
+                        if retry_transport != "session" {
+                            eprintln!(
+                                "Ignoring unsupported session retry {} from {} on {}: failedTransport={}",
+                                message_id, from, relay_url, retry_transport,
+                            );
+                            continue;
+                        }
+
+                        let Some(original_message) = state_guard
+                            .messages
+                            .get_message(&retry_message_id, MessageDirection::Outbound)
+                        else {
+                            eprintln!(
+                                "Ignoring session retry {} from {} on {}: outbound message {} not found",
+                                message_id, from, relay_url, retry_message_id,
+                            );
+                            continue;
+                        };
+
+                        if original_message.to != from {
+                            eprintln!(
+                                "Ignoring session retry {} from {} on {}: outbound message {} targets {}",
+                                message_id, from, relay_url, retry_message_id, original_message.to,
+                            );
+                            continue;
+                        }
+
+                        let replay_count = original_message
+                            .e2e
+                            .as_ref()
+                            .and_then(|metadata| metadata.retry.as_ref())
+                            .map(|retry| retry.replay_count)
+                            .unwrap_or(0);
+                        state_guard.messages.upsert_e2e_retry(
+                            &retry_message_id,
+                            MessageDirection::Outbound,
+                            E2ERetryMetadata {
+                                replay_count,
+                                last_requested_at: Some(retry_requested_at),
+                                last_replayed_at: None,
+                                last_reason: Some(retry_reason.clone()),
+                            },
+                        );
+                        if replay_count > 0 {
+                            eprintln!(
+                                "Ignoring repeated session retry {} from {} on {} for message {}",
+                                message_id, from, relay_url, retry_message_id,
+                            );
+                            continue;
+                        }
+
+                        let application_envelope: Envelope = match serde_json::from_value(original_message.envelope.clone()) {
+                            Ok(envelope) => envelope,
+                            Err(err) => {
+                                eprintln!(
+                                    "Ignoring session retry {} from {} on {}: failed to parse outbound message {}: {}",
+                                    message_id, from, relay_url, retry_message_id, err,
+                                );
+                                continue;
+                            }
+                        };
+                        let Some(relay_sender) = state_guard.relay_sender.clone() else {
+                            eprintln!(
+                                "Ignoring session retry {} from {} on {}: relay sender unavailable",
+                                message_id, from, relay_url,
+                            );
+                            continue;
+                        };
+
+                        let relay_url_for_retry = relay_url.clone();
+                        let from_for_retry = from.clone();
+                        let retry_message_id_for_send = retry_message_id.clone();
+                        let application_envelope_for_send = application_envelope.clone();
+                        let replay_result = with_local_e2e_state_transaction(|mut config| async move {
+                            let relay_identity = config
+                                .identity
+                                .as_ref()
+                                .ok_or_else(|| anyhow::anyhow!("No identity found"))?
+                                .clone();
+                            let keypair = KeyPair::from_hex(&relay_identity.private_key)?;
+                            let _ = clear_peer_sessions(&mut config, &from_for_retry);
+                            let invite_token = resolve_relay_invite_token(None, Some(&config));
+                            let mut query_session = connect_query_session(
+                                &relay_url_for_retry,
+                                invite_token.as_deref(),
+                            )
+                            .await?;
+                            let prepared = prepare_encrypted_sends_with_session(
+                                &mut query_session,
+                                &config,
+                                &keypair,
+                                application_envelope_for_send.clone(),
+                            )
+                            .await?;
+                            let _ = query_session.goodbye().await;
+                            let next_config = prepared.config.clone();
+                            Ok((prepared, next_config))
+                        }).await;
+
+                        let (prepared, next_config) = match replay_result {
+                            Ok(result) => result,
+                            Err(err) => {
+                                eprintln!(
+                                    "Failed to replay outbound message {} after session retry from {} on {}: {}",
+                                    retry_message_id, from, relay_url, err,
+                                );
+                                continue;
+                            }
+                        };
+                        state_guard.config = next_config;
+
+                        let recorded_at = now_ms();
+                        state_guard.messages.upsert_e2e_retry(
+                            &retry_message_id_for_send,
+                            MessageDirection::Outbound,
+                            E2ERetryMetadata {
+                                replay_count: replay_count + 1,
+                                last_requested_at: Some(retry_requested_at),
+                                last_replayed_at: Some(recorded_at),
+                                last_reason: Some(retry_reason.clone()),
+                            },
+                        );
+
+                        let send_batches = prepared
+                            .targets
+                            .iter()
+                            .map(|target| (
+                                target.outer_envelope_bytes.clone(),
+                                E2EDeliveryMetadata {
+                                    transport: target.transport.clone(),
+                                    sender_device_id: target.sender_device_id.clone(),
+                                    receiver_device_id: target.recipient_device_id.clone(),
+                                    session_id: target.session_id.clone(),
+                                    state: E2EDeliveryState::Sent,
+                                    recorded_at,
+                                    used_skipped_message_key: None,
+                                    error: None,
+                                },
+                            ))
+                            .collect::<Vec<_>>();
+
+                        drop(state_guard);
+                        for (envelope_bytes, delivery) in send_batches {
+                            let (response_tx, response_rx) = oneshot::channel();
+                            if relay_sender
+                                .send(RelayWorkerCommand::SendEnvelope {
+                                    to: from.clone(),
+                                    envelope_bytes,
+                                    response: response_tx,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                let mut state_guard = state.write().await;
+                                state_guard.messages.upsert_e2e_delivery(
+                                    &retry_message_id_for_send,
+                                    MessageDirection::Outbound,
+                                    E2EDeliveryMetadata {
+                                        error: Some("Failed to reach relay worker".to_string()),
+                                        state: E2EDeliveryState::Failed,
+                                        recorded_at: now_ms(),
+                                        ..delivery.clone()
+                                    },
+                                );
+                                eprintln!(
+                                    "Failed to replay outbound message {} after session retry from {} on {}: relay worker unavailable",
+                                    retry_message_id_for_send, from, relay_url,
+                                );
+                                continue;
+                            }
+
+                            let send_result = response_rx.await;
+                            let mut state_guard = state.write().await;
+                            match send_result {
+                                Ok(Ok(())) => {
+                                    state_guard.messages.upsert_e2e_delivery(
+                                        &retry_message_id_for_send,
+                                        MessageDirection::Outbound,
+                                        delivery,
+                                    );
+                                }
+                                Ok(Err(err)) => {
+                                    state_guard.messages.upsert_e2e_delivery(
+                                        &retry_message_id_for_send,
+                                        MessageDirection::Outbound,
+                                        E2EDeliveryMetadata {
+                                            error: Some(err.to_string()),
+                                            state: E2EDeliveryState::Failed,
+                                            recorded_at: now_ms(),
+                                            ..delivery
+                                        },
+                                    );
+                                    eprintln!(
+                                        "Failed to replay outbound message {} after session retry from {} on {}: {}",
+                                        retry_message_id_for_send, from, relay_url, err,
+                                    );
+                                }
+                                Err(err) => {
+                                    state_guard.messages.upsert_e2e_delivery(
+                                        &retry_message_id_for_send,
+                                        MessageDirection::Outbound,
+                                        E2EDeliveryMetadata {
+                                            error: Some(err.to_string()),
+                                            state: E2EDeliveryState::Failed,
+                                            recorded_at: now_ms(),
+                                            ..delivery
+                                        },
+                                    );
+                                }
+                            }
                         }
                         continue;
                     }
@@ -384,6 +685,8 @@ impl DaemonServer {
                                 continue;
                             }
                         };
+                    let transport_message_id = transport_envelope.id.clone();
+                    let transport_thread_id = transport_envelope.thread_id.clone();
 
                     if let Ok(payload) = serde_json::from_value::<EncryptedApplicationEnvelopePayload>(
                         transport_envelope.payload.clone(),
@@ -443,50 +746,64 @@ impl DaemonServer {
                         }
                     }
 
-                    let decrypted = match prepare_encrypted_receive(
-                        &state_guard.config,
-                        &transport_envelope,
-                    ) {
-                        Ok(decrypted) => decrypted,
+                    let decrypted = match with_local_e2e_state_transaction(|config| async move {
+                        let decrypted = prepare_encrypted_receive(
+                            &config,
+                            &transport_envelope,
+                        )?;
+                        let next_config = decrypted.config.clone();
+                        Ok((decrypted, next_config))
+                    }).await {
+                        Ok((decrypted, next_config)) => {
+                            state_guard.config = next_config;
+                            decrypted
+                        }
                         Err(err) => {
                             eprintln!(
                                 "E2E decrypt failed for {} from {}: {}",
                                 message_id, from, err
                             );
 
-                            // 1) Clear stale session for this peer, will auto-renegotiate on next send
                             let my_did = state_guard
                                 .config
                                 .identity
                                 .as_ref()
                                 .map(|i| i.did.clone())
                                 .unwrap_or_default();
-
-                            let cleared = clear_peer_sessions(&mut state_guard.config, &from);
-                            if cleared > 0 {
-                                eprintln!(
-                                    "Cleared stale E2E session for {}, will auto-renegotiate",
-                                    from
-                                );
-                                merge_cli_fields_before_save(&mut state_guard.config);
-                                let _ = save_config(&state_guard.config);
-
-                                if let Some(sender) = &state_guard.relay_sender {
-                                    let reset_envelope = build_session_reset_envelope(
-                                        &state_guard.keypair,
-                                        &my_did,
-                                        &from,
-                                        "decrypt-failed",
-                                        received_at,
+                            let from_for_failure = from.clone();
+                            match with_locked_config_transaction(|mut config| async move {
+                                let cleared = clear_peer_sessions(&mut config, &from_for_failure);
+                                Ok((cleared, config))
+                            }).await {
+                                Ok((_, next_config)) => {
+                                    state_guard.config = next_config;
+                                }
+                                Err(persist_err) => {
+                                    eprintln!(
+                                        "Failed to clear stale E2E session for {} after decrypt failure on {}: {}",
+                                        from, relay_url, persist_err,
                                     );
-                                    if let Ok(envelope_bytes) = encode_envelope_bytes(&reset_envelope) {
-                                        let (response_tx, _response_rx) = oneshot::channel();
-                                        let _ = sender.send(RelayWorkerCommand::SendEnvelope {
-                                            to: from.clone(),
-                                            envelope_bytes,
-                                            response: response_tx,
-                                        }).await;
-                                    }
+                                }
+                            }
+
+                            if let Some(sender) = &state_guard.relay_sender {
+                                let retry_envelope = build_session_retry_envelope(
+                                    &state_guard.keypair,
+                                    &my_did,
+                                    &from,
+                                    &transport_message_id,
+                                    "decrypt-failed",
+                                    "session",
+                                    received_at,
+                                    transport_thread_id,
+                                );
+                                if let Ok(envelope_bytes) = encode_envelope_bytes(&retry_envelope) {
+                                    let (response_tx, _response_rx) = oneshot::channel();
+                                    let _ = sender.send(RelayWorkerCommand::SendEnvelope {
+                                        to: from.clone(),
+                                        envelope_bytes,
+                                        response: response_tx,
+                                    }).await;
                                 }
                             }
 
@@ -501,7 +818,7 @@ impl DaemonServer {
                                     "protocol": "e2e/decrypt-failed",
                                     "payload": {
                                         "error": err.to_string(),
-                                        "hint": "Session cleared. Next message will auto-renegotiate."
+                                        "hint": "Session cleared. Sender was asked to replay the message once."
                                     },
                                     "timestamp": received_at,
                                 }),
@@ -525,22 +842,13 @@ impl DaemonServer {
                                         used_skipped_message_key: None,
                                         error: Some(err.to_string()),
                                     }],
+                                    retry: None,
                                 }),
                             };
                             state_guard.messages.store(failed_msg);
                             continue;
                         }
                     };
-
-                    state_guard.config = decrypted.config.clone();
-                    merge_cli_fields_before_save(&mut state_guard.config);
-                    if let Err(err) = save_config(&state_guard.config) {
-                        eprintln!(
-                            "Failed to persist decrypted E2E state for {} from {} on {}: {}",
-                            message_id, from, relay_url, err,
-                        );
-                        continue;
-                    }
 
                     envelope = match serde_json::to_value(&decrypted.application_envelope) {
                         Ok(envelope) => envelope,
@@ -564,6 +872,7 @@ impl DaemonServer {
                             used_skipped_message_key: Some(decrypted.used_skipped_message_key),
                             error: None,
                         }],
+                        retry: None,
                     });
 
                     eprintln!(
@@ -888,8 +1197,6 @@ async fn handle_send(params: Value, state: Arc<RwLock<DaemonState>>) -> Result<V
                 None,
             )
         } else {
-            ensure_local_e2e_config(&mut state_guard.config)?;
-
             let msg_type = params
                 .get("type")
                 .and_then(|v| v.as_str())
@@ -917,24 +1224,29 @@ async fn handle_send(params: Value, state: Arc<RwLock<DaemonState>>) -> Result<V
                 crate::commands::tell::EnvelopeThreading::new(reply_to, thread_id.clone()),
                 &state_guard.keypair,
             )?;
-
-            let invite_token = resolve_relay_invite_token(None, Some(&state_guard.config));
-            let mut query_session = connect_query_session(
-                &state_guard.relay_runtime.relay_url,
-                invite_token.as_deref(),
-            )
-            .await?;
-            let prepared = prepare_encrypted_sends_with_session(
-                &mut query_session,
-                &state_guard.config,
-                &state_guard.keypair,
-                envelope,
-            )
-            .await?;
-            let _ = query_session.goodbye().await;
-            state_guard.config = prepared.config.clone();
-            merge_cli_fields_before_save(&mut state_guard.config);
-            save_config(&state_guard.config)?;
+            let relay_url = state_guard.relay_runtime.relay_url.clone();
+            let identity_for_send = identity.clone();
+            let envelope_for_send = envelope.clone();
+            let (prepared, next_config) = with_local_e2e_state_transaction(|config| async move {
+                let keypair = KeyPair::from_hex(&identity_for_send.private_key)?;
+                let invite_token = resolve_relay_invite_token(None, Some(&config));
+                let mut query_session = connect_query_session(
+                    &relay_url,
+                    invite_token.as_deref(),
+                )
+                .await?;
+                let prepared = prepare_encrypted_sends_with_session(
+                    &mut query_session,
+                    &config,
+                    &keypair,
+                    envelope_for_send.clone(),
+                )
+                .await?;
+                let _ = query_session.goodbye().await;
+                let next_config = prepared.config.clone();
+                Ok((prepared, next_config))
+            }).await?;
+            state_guard.config = next_config;
             let envelope_json = serde_json::to_value(&prepared.application_envelope)?;
             let initial_deliveries = prepared
                 .targets
@@ -967,6 +1279,7 @@ async fn handle_send(params: Value, state: Arc<RwLock<DaemonState>>) -> Result<V
                 send_batches,
                 Some(StoredMessageE2EMetadata {
                     deliveries: initial_deliveries,
+                    retry: None,
                 }),
             )
         };
@@ -1702,8 +2015,8 @@ impl DaemonClient {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_session_reset_envelope, encode_envelope_bytes, handle_e2e_reset_notify,
-        DaemonState, DEFAULT_JS_DAEMON_SOCKET, DEFAULT_RS_DAEMON_SOCKET,
+        build_session_reset_envelope, build_session_retry_envelope, encode_envelope_bytes,
+        handle_e2e_reset_notify, DaemonState, DEFAULT_JS_DAEMON_SOCKET, DEFAULT_RS_DAEMON_SOCKET,
     };
     use crate::config::{Config, IdentityConfig};
     use crate::identity::KeyPair;
@@ -1747,6 +2060,44 @@ mod tests {
                 .and_then(|value| value.get("reason"))
                 .and_then(|value| value.as_str()),
             Some("decrypt-failed")
+        );
+    }
+
+    #[test]
+    fn session_retry_envelope_is_signed_and_encoded_as_standard_envelope() {
+        let keypair = KeyPair::generate();
+        let did = quadra_a_core::identity::derive_did(keypair.verifying_key.as_bytes());
+        let envelope = build_session_retry_envelope(
+            &keypair,
+            &did,
+            "did:agent:zPeer",
+            "msg-original",
+            "decrypt-failed",
+            "session",
+            456,
+            Some("thread-1".to_string()),
+        );
+
+        assert_eq!(envelope.protocol, "e2e/session-retry");
+        assert!(envelope.verify_signature().expect("signature verifies"));
+
+        let encoded = encode_envelope_bytes(&envelope).expect("envelope encodes");
+        let decoded = parse_envelope_value(&encoded).expect("encoded envelope decodes");
+        assert_eq!(
+            decoded.get("protocol").and_then(|value| value.as_str()),
+            Some("e2e/session-retry")
+        );
+        assert_eq!(
+            decoded.get("payload")
+                .and_then(|value| value.get("messageId"))
+                .and_then(|value| value.as_str()),
+            Some("msg-original")
+        );
+        assert_eq!(
+            decoded.get("payload")
+                .and_then(|value| value.get("failedTransport"))
+                .and_then(|value| value.as_str()),
+            Some("session")
         );
     }
 

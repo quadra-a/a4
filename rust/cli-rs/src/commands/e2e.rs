@@ -2,8 +2,9 @@ use anyhow::{Context, Result};
 use serde_json::json;
 use std::collections::BTreeSet;
 
-use crate::config::{load_config, save_config};
+use crate::config::load_config;
 use crate::daemon::{daemon_socket_path, DaemonClient};
+use crate::e2e_state::with_locked_config_transaction;
 
 pub struct E2eStatusOptions {
     pub json: bool,
@@ -99,44 +100,54 @@ pub async fn e2e_status(opts: E2eStatusOptions) -> Result<()> {
 }
 
 pub async fn e2e_reset(opts: E2eResetOptions) -> Result<()> {
-    let mut config = load_config()?;
+    let config = load_config()?;
 
     // Resolve alias to DID if needed
     let peer_did = opts.peer_did.map(|input| {
         crate::commands::alias::resolve_did(&input, &config).unwrap_or(input)
     });
+    let peer_did_for_reset = peer_did.clone();
+    let (reset_result, _) = with_locked_config_transaction(|mut config| async move {
+        let e2e = config
+            .e2e
+            .as_mut()
+            .context("No E2E configuration found. Run 'a4 listen' to initialize.")?;
+        if !e2e.is_valid() {
+            anyhow::bail!("Invalid E2E configuration. Run 'a4 listen' to reinitialize.");
+        }
 
-    let e2e = config
-        .e2e
-        .as_mut()
-        .context("No E2E configuration found. Run 'a4 listen' to initialize.")?;
-    if !e2e.is_valid() {
-        anyhow::bail!("Invalid E2E configuration. Run 'a4 listen' to reinitialize.");
-    }
+        let device_id = &e2e.current_device_id.clone();
+        let device = e2e
+            .devices
+            .get_mut(device_id)
+            .context("Current device not found in E2E config")?;
 
-    let device_id = &e2e.current_device_id.clone();
-    let device = e2e
-        .devices
-        .get_mut(device_id)
-        .context("Current device not found in E2E config")?;
+        let before = device.sessions.len();
+        let peers_to_notify = collect_reset_peers(
+            device.sessions.keys().map(String::as_str),
+            peer_did_for_reset.as_deref(),
+        );
 
-    let before = device.sessions.len();
-    let peers_to_notify = collect_reset_peers(
-        device.sessions.keys().map(String::as_str),
-        peer_did.as_deref(),
-    );
+        let removed = if let Some(peer_did) = &peer_did_for_reset {
+            let session_prefix = format!("{}:", peer_did);
+            let before_peer = device.sessions.len();
+            device.sessions.retain(|key, _| !key.starts_with(&session_prefix));
+            before_peer - device.sessions.len()
+        } else {
+            let removed = device.sessions.len();
+            device.sessions.clear();
+            removed
+        };
+
+        Ok(((before, removed, peers_to_notify), config))
+    }).await?;
+    let (before, removed, peers_to_notify) = reset_result;
 
     if let Some(peer_did) = &peer_did {
-        let session_prefix = format!("{}:", peer_did);
-        device.sessions.retain(|key, _| !key.starts_with(&session_prefix));
-        let removed = before - device.sessions.len();
         println!("Cleared {} session(s) for peer {}", removed, peer_did);
     } else {
-        device.sessions.clear();
         println!("Cleared all {} session(s)", before);
     }
-
-    save_config(&config)?;
 
     // Notify daemon to reload E2E config if running
     let socket_path = daemon_socket_path();

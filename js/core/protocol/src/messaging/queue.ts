@@ -17,6 +17,7 @@ import type {
   SubscriptionFilter,
   QueueStats,
   E2EDeliveryMetadata,
+  E2ERetryMetadata,
 } from './types.js';
 
 const logger = createLogger('message-queue');
@@ -63,6 +64,10 @@ export class MessageQueue {
 
   async getMessage(id: string): Promise<StoredMessage | null> {
     return this.storage.getMessage(id);
+  }
+
+  async getOutboundMessage(id: string): Promise<StoredMessage | null> {
+    return this.storage.getMessage(id, 'outbound');
   }
 
   async markAsRead(id: string): Promise<void> {
@@ -129,6 +134,10 @@ export class MessageQueue {
 
   async appendE2EDelivery(id: string, delivery: E2EDeliveryMetadata): Promise<StoredMessage | null> {
     return this.storage.upsertE2EDeliveries(id, [delivery]);
+  }
+
+  async appendE2ERetry(id: string, retry: E2ERetryMetadata): Promise<StoredMessage | null> {
+    return this.storage.upsertE2ERetry(id, retry);
   }
 
   // ─── Subscriptions ────────────────────────────────────────────────────────

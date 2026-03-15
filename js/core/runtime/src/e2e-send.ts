@@ -42,6 +42,7 @@ export interface PrepareEncryptedSendInput {
   type?: MessageEnvelopeType;
   replyTo?: string;
   threadId?: string;
+  applicationEnvelope?: MessageEnvelope;
 }
 
 export interface PreparedEncryptedSendTarget {
@@ -118,16 +119,18 @@ async function assertRecipientSignedPreKeyBundle(
 export async function prepareEncryptedSends(
   input: PrepareEncryptedSendInput,
 ): Promise<PrepareEncryptedSendsResult> {
-  const unsignedEnvelope = createEnvelope(
-    input.identity.did,
-    input.to,
-    input.type ?? 'message',
-    input.protocol,
-    input.payload,
-    input.replyTo,
-    input.threadId,
+  const applicationEnvelope = input.applicationEnvelope ?? await signEnvelope(
+    createEnvelope(
+      input.identity.did,
+      input.to,
+      input.type ?? 'message',
+      input.protocol,
+      input.payload,
+      input.replyTo,
+      input.threadId,
+    ),
+    (data) => sign(data, input.keyPair.privateKey),
   );
-  const applicationEnvelope = await signEnvelope(unsignedEnvelope, (data) => sign(data, input.keyPair.privateKey));
 
   const recipientCard = await input.relayClient.fetchCard(input.to);
   const recipientDevices = selectRecipientDevices(recipientCard, input.to);

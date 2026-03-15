@@ -47,16 +47,19 @@ JS daemon 现在会识别 `/agent/e2e/1.0.0` transport envelope，调用 `prepar
 JS daemon 现在具备与 Rust 对齐的自动恢复能力：
 - 收到签名的 `e2e/session-reset` 会清理对应 peer 的本地 session
 - 解密失败时会清理 stale session
-- 会发送签名的 `e2e/session-reset`
+- 会发送签名的 `e2e/session-retry`
 - 会写入本地诊断消息 `e2e/decrypt-failed`
-- 下次发送会自动走 PREKEY_MESSAGE 重新协商
+- sender 收到 `e2e/session-retry` 后会清理旧 session，并自动重放原始业务消息一次
+- replay 后会自动重新走 PREKEY_MESSAGE 协商，不再要求用户手动再发一次
 
 这部分没有采用 router 白名单绕过签名，而是统一走标准签名 envelope，设计更干净。
 
 **落实点**
 - `js/core/runtime/src/daemon-server.ts`
 - `rust/cli-rs/src/daemon.rs`
-- `rust/runtime/src/relay_worker.rs`
+- `js/core/protocol/src/messaging/storage.ts`
+- `js/core/protocol/src/messaging/queue.ts`
+- `rust/runtime/src/inbox.rs`
 
 ### 5. Rust 空 `e2e` config 启动崩溃已修复
 
@@ -93,14 +96,20 @@ Rust `LocalE2EConfig` 现在允许 `{}` 反序列化，并增加了统一的 `is
 - legacy 签名兼容验签
 - `groupId` 参与签名面
 - signed `e2e/session-reset`
+- signed `e2e/session-retry`
 - JS daemon decrypt-failure auto-recovery
+- outbound retry metadata merge / replay-once
 - Rust 空 `e2e` config 重建
 
 **验证结果**
-- `pnpm --filter @quadra-a/protocol exec vitest run`
-- `pnpm --filter @quadra-a/runtime exec vitest run`
-- `pnpm --filter @quadra-a/relay exec vitest run`
-- `cargo test`
+- `pnpm --filter @quadra-a/protocol exec vitest run src/messaging/storage.test.ts`
+- `pnpm --filter @quadra-a/runtime exec vitest run src/daemon-server.test.ts`
+- `pnpm --filter @quadra-a/protocol build`
+- `pnpm --filter @quadra-a/runtime build`
+- `pnpm --filter @quadra-a/relay build`
+- `cargo test -p quadra-a-runtime`
+- `cargo test -p quadra-a-cli-rs`
+- 本机 `1 relay + 2 Rust agent` 实测：ratchet mismatch 后，receiver 发送 `e2e/session-retry`，sender 自动 replay 原业务消息成功
 
 ### 8. Relay ACK / delivery 语义已修复
 
@@ -187,6 +196,30 @@ device ID 的派生方式为 domain-separated hash：
 - `rust/core/src/config.rs`
 - `rust/core/src/e2e/device_state.rs`
 
+### 12. 本地 E2E 状态并发写入已收口
+
+**状态**: 已完成
+
+JS daemon / JS CLI / Rust daemon / Rust CLI 现在都不再各自裸读裸写本地 `config.json` 里的 E2E 状态。当前实现引入了跨进程目录锁：
+- JS 使用 `$QUADRA_A_HOME/locks/e2e-state.lock`
+- Rust 使用同一路径的同名目录锁
+
+所有会修改 ratchet/session/pre-key 本地状态的关键路径，都会在锁内执行“读取配置 -> 突变 E2E 状态 -> 持久化配置”事务，避免 daemon 与前台 `tell` / `e2e reset` / reload / replay 并发时互相覆盖。
+
+目前已经切到事务路径的关键调用点包括：
+- JS daemon 的 send / receive / retry-replay / reload
+- Rust daemon 的 send / receive / retry-replay / manual reset
+- Rust CLI 的 direct `tell` 与 `wait` 解密路径
+
+**落实点**
+- `js/core/runtime/src/e2e-state.ts`
+- `js/core/runtime/src/daemon-server.ts`
+- `js/core/runtime/src/messaging.ts`
+- `rust/cli-rs/src/e2e_state.rs`
+- `rust/cli-rs/src/daemon.rs`
+- `rust/cli-rs/src/commands/tell.rs`
+- `rust/cli-rs/src/commands/e2e.rs`
+
 ---
 
 ## 三、建议的修复顺序
@@ -211,10 +244,11 @@ device ID 的派生方式为 domain-separated hash：
 跨语言 E2E 通信里最危险的一批问题已经处理完：
 - canonical 签名迁移已完成
 - signed `session-reset` 已打通
-- JS auto-recovery 已补齐
+- signed `session-retry` + sender replay 已打通
 - Rust 空 `e2e` config 容错已补齐
 - relay ACK / delivery 语义已改成 `accepted` + ACK 后 `delivered`
 - Rust 手动 `e2e reset` 已会通知 peer
+- 本地 E2E 状态并发写入已切到跨进程事务锁
 
 目前剩下的已经不再是基础链路打不通，而是后续收口与产品化问题：
 - 是否继续收缩隐藏兼容命令

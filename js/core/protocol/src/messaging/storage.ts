@@ -23,6 +23,7 @@ import type {
   PaginationOptions,
   MessagePage,
   E2EDeliveryMetadata,
+  E2ERetryMetadata,
 } from './types.js';
 import { normalizeEnvelope } from './envelope.js';
 import { compareMessagesBySortTimestamp, getMessageSortTimestamp } from './timestamp.js';
@@ -68,7 +69,28 @@ function mergeStoredMessageE2EDeliveries(
     ...message,
     e2e: {
       deliveries: mergeE2EDeliveries(message.e2e?.deliveries ?? [], deliveries),
+      retry: message.e2e?.retry,
     },
+  };
+}
+
+function mergeE2ERetryMetadata(
+  existing: E2ERetryMetadata | undefined,
+  incoming: E2ERetryMetadata | undefined,
+): E2ERetryMetadata | undefined {
+  if (!existing) {
+    return incoming ? { ...incoming } : undefined;
+  }
+
+  if (!incoming) {
+    return existing;
+  }
+
+  return {
+    replayCount: Math.max(existing.replayCount, incoming.replayCount),
+    lastRequestedAt: incoming.lastRequestedAt ?? existing.lastRequestedAt,
+    lastReplayedAt: incoming.lastReplayedAt ?? existing.lastReplayedAt,
+    lastReason: incoming.lastReason ?? existing.lastReason,
   };
 }
 
@@ -89,8 +111,18 @@ function mergeStoredMessages(existing: StoredMessage, incoming: StoredMessage): 
     error: incoming.error ?? existing.error,
     e2e: existing.e2e,
   };
+  const withDeliveries = mergeStoredMessageE2EDeliveries(merged, incoming.e2e?.deliveries ?? []);
+  if (!existing.e2e?.retry && !incoming.e2e?.retry) {
+    return withDeliveries;
+  }
 
-  return mergeStoredMessageE2EDeliveries(merged, incoming.e2e?.deliveries ?? []);
+  return {
+    ...withDeliveries,
+    e2e: {
+      deliveries: withDeliveries.e2e?.deliveries ?? [],
+      retry: mergeE2ERetryMetadata(existing.e2e?.retry, incoming.e2e?.retry),
+    },
+  };
 }
 
 export class MessageStorage {
@@ -154,8 +186,8 @@ export class MessageStorage {
     }
   }
 
-  async getMessage(id: string): Promise<StoredMessage | null> {
-    const match = await this.findStoredMessageRecord(id);
+  async getMessage(id: string, direction?: 'inbound' | 'outbound'): Promise<StoredMessage | null> {
+    const match = await this.findStoredMessageRecord(id, direction);
     return match?.message ?? null;
   }
 
@@ -174,6 +206,21 @@ export class MessageStorage {
     if (!match) return null;
 
     const merged = mergeStoredMessageE2EDeliveries(match.message, deliveries);
+    await this.db.put(match.key, merged);
+    return merged;
+  }
+
+  async upsertE2ERetry(id: string, retry: E2ERetryMetadata): Promise<StoredMessage | null> {
+    const match = await this.findStoredMessageRecord(id, 'outbound');
+    if (!match) return null;
+
+    const merged: StoredMessage = {
+      ...match.message,
+      e2e: {
+        deliveries: match.message.e2e?.deliveries ?? [],
+        retry: mergeE2ERetryMetadata(match.message.e2e?.retry, retry),
+      },
+    };
     await this.db.put(match.key, merged);
     return merged;
   }
@@ -297,9 +344,13 @@ export class MessageStorage {
     return normalized;
   }
 
-  private async findStoredMessageRecord(id: string): Promise<{ key: string; message: StoredMessage } | null> {
-    for (const direction of ['inbound', 'outbound'] as const) {
-      const prefix = `msg:${direction}:`;
+  private async findStoredMessageRecord(
+    id: string,
+    direction?: 'inbound' | 'outbound',
+  ): Promise<{ key: string; message: StoredMessage } | null> {
+    const directions = direction ? [direction] : ['inbound', 'outbound'] as const;
+    for (const currentDirection of directions) {
+      const prefix = `msg:${currentDirection}:`;
       for await (const [key, value] of this.db.iterator<string, StoredMessage>({
         gte: prefix,
         lte: prefix + '\xff',

@@ -30,8 +30,16 @@ export interface E2EDeliveryMetadata {
   error?: string;
 }
 
+export interface E2ERetryMetadata {
+  replayCount: number;
+  lastRequestedAt?: number;
+  lastReplayedAt?: number;
+  lastReason?: string;
+}
+
 export interface StoredMessageE2EMetadata {
   deliveries: E2EDeliveryMetadata[];
+  retry?: E2ERetryMetadata;
 }
 
 /**
