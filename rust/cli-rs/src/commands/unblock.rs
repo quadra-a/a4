@@ -40,11 +40,14 @@ pub async fn run(opts: UnblockOptions) -> Result<()> {
     let _ = inform_daemon_of_unblock(&target_did, reset_trust).await;
 
     if opts.json {
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-            "target": target_did,
-            "status": "unblocked",
-            "resetTrust": reset_trust,
-        }))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "target": target_did,
+                "status": "unblocked",
+                "resetTrust": reset_trust,
+            }))?
+        );
         return Ok(());
     }
 

@@ -39,11 +39,14 @@ pub async fn run(opts: AllowOptions) -> Result<()> {
     let _ = inform_daemon_of_allow(&target_did, opts.note.as_deref()).await;
 
     if opts.json {
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-            "target": target_did,
-            "status": "allowed",
-            "note": opts.note,
-        }))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "target": target_did,
+                "status": "allowed",
+                "note": opts.note,
+            }))?
+        );
         return Ok(());
     }
 
@@ -62,7 +65,10 @@ pub async fn run(opts: AllowOptions) -> Result<()> {
             LlmFormatter::key_value("Note", note);
         }
         LlmFormatter::key_value("Status", "allowed");
-        LlmFormatter::key_value("Effect", "Bypasses blocklist, rate limits, and trust checks");
+        LlmFormatter::key_value(
+            "Effect",
+            "Bypasses blocklist, rate limits, and trust checks",
+        );
         println!();
     }
 

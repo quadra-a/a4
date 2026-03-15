@@ -68,7 +68,7 @@ pub async fn e2e_status(opts: E2eStatusOptions) -> Result<()> {
             let parts: Vec<&str> = k.split(':').collect();
             json!({
                 "key": k,
-                "peer": parts.get(0).unwrap_or(&"unknown"),
+                "peer": parts.first().unwrap_or(&"unknown"),
             })
         })
         .collect();
@@ -103,9 +103,9 @@ pub async fn e2e_reset(opts: E2eResetOptions) -> Result<()> {
     let config = load_config()?;
 
     // Resolve alias to DID if needed
-    let peer_did = opts.peer_did.map(|input| {
-        crate::commands::alias::resolve_did(&input, &config).unwrap_or(input)
-    });
+    let peer_did = opts
+        .peer_did
+        .map(|input| crate::commands::alias::resolve_did(&input, &config).unwrap_or(input));
     let peer_did_for_reset = peer_did.clone();
     let (reset_result, _) = with_locked_config_transaction(|mut config| async move {
         let e2e = config
@@ -131,7 +131,9 @@ pub async fn e2e_reset(opts: E2eResetOptions) -> Result<()> {
         let removed = if let Some(peer_did) = &peer_did_for_reset {
             let session_prefix = format!("{}:", peer_did);
             let before_peer = device.sessions.len();
-            device.sessions.retain(|key, _| !key.starts_with(&session_prefix));
+            device
+                .sessions
+                .retain(|key, _| !key.starts_with(&session_prefix));
             before_peer - device.sessions.len()
         } else {
             let removed = device.sessions.len();
@@ -140,7 +142,8 @@ pub async fn e2e_reset(opts: E2eResetOptions) -> Result<()> {
         };
 
         Ok(((before, removed, peers_to_notify), config))
-    }).await?;
+    })
+    .await?;
     let (before, removed, peers_to_notify) = reset_result;
 
     if let Some(peer_did) = &peer_did {
@@ -153,7 +156,10 @@ pub async fn e2e_reset(opts: E2eResetOptions) -> Result<()> {
     let socket_path = daemon_socket_path();
     let client = DaemonClient::new(&socket_path);
     if client.is_running().await {
-        match client.send_command("reload-e2e", serde_json::json!({})).await {
+        match client
+            .send_command("reload-e2e", serde_json::json!({}))
+            .await
+        {
             Ok(_) => {
                 println!("\nDaemon E2E config reloaded.");
             }
@@ -210,7 +216,7 @@ mod tests {
 
     #[test]
     fn collect_reset_peers_uses_exact_peer_prefixes() {
-        let session_keys = vec![
+        let session_keys = [
             "did:agent:zAlice:device-1",
             "did:agent:zAliceExtra:device-2",
             "did:agent:zBob:device-3",
@@ -224,7 +230,7 @@ mod tests {
 
     #[test]
     fn collect_reset_peers_dedupes_all_matching_peers() {
-        let session_keys = vec![
+        let session_keys = [
             "did:agent:zAlice:device-1",
             "did:agent:zAlice:device-2",
             "did:agent:zBob:device-3",
@@ -232,10 +238,7 @@ mod tests {
 
         assert_eq!(
             collect_reset_peers(session_keys.iter().copied(), None),
-            vec![
-                "did:agent:zAlice".to_string(),
-                "did:agent:zBob".to_string(),
-            ]
+            vec!["did:agent:zAlice".to_string(), "did:agent:zBob".to_string(),]
         );
     }
 }

@@ -33,7 +33,11 @@ pub struct E2EDeliveryMetadata {
     pub state: E2EDeliveryState,
     #[serde(rename = "recordedAt")]
     pub recorded_at: u64,
-    #[serde(default, rename = "usedSkippedMessageKey", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "usedSkippedMessageKey",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub used_skipped_message_key: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -43,11 +47,23 @@ pub struct E2EDeliveryMetadata {
 pub struct E2ERetryMetadata {
     #[serde(rename = "replayCount")]
     pub replay_count: u32,
-    #[serde(default, rename = "lastRequestedAt", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "lastRequestedAt",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub last_requested_at: Option<u64>,
-    #[serde(default, rename = "lastReplayedAt", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "lastReplayedAt",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub last_replayed_at: Option<u64>,
-    #[serde(default, rename = "lastReason", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "lastReason",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub last_reason: Option<String>,
 }
 
@@ -196,7 +212,13 @@ fn merge_message_e2e(existing: &mut StoredMessage, incoming: Option<&StoredMessa
     );
     existing.e2e = Some(StoredMessageE2EMetadata {
         deliveries: merged,
-        retry: merge_e2e_retry(existing.e2e.as_ref().and_then(|metadata| metadata.retry.clone()), incoming.retry.clone()),
+        retry: merge_e2e_retry(
+            existing
+                .e2e
+                .as_ref()
+                .and_then(|metadata| metadata.retry.clone()),
+            incoming.retry.clone(),
+        ),
     });
 }
 
@@ -587,7 +609,15 @@ mod tests {
         assert_eq!(store.len(), 1);
         let (messages, total) = store.inbox_page(10, false, None);
         assert_eq!(total, 1);
-        assert_eq!(messages[0].e2e.as_ref().expect("e2e metadata").deliveries.len(), 2);
+        assert_eq!(
+            messages[0]
+                .e2e
+                .as_ref()
+                .expect("e2e metadata")
+                .deliveries
+                .len(),
+            2
+        );
     }
 
     #[test]

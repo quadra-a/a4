@@ -39,7 +39,10 @@ pub(crate) struct EnvelopeThreading {
 
 impl EnvelopeThreading {
     pub(crate) fn new(reply_to: Option<String>, thread_id: Option<String>) -> Self {
-        Self { reply_to, thread_id }
+        Self {
+            reply_to,
+            thread_id,
+        }
     }
 }
 
@@ -79,10 +82,15 @@ pub async fn run(opts: TellOptions) -> Result<()> {
             extract_primary_protocol(card).unwrap_or_else(|| opts.protocol.clone())
         } else if daemon_status.is_some() {
             // Try querying the card via daemon
-            match daemon.send_command("query-card", json!({"did": &recipient_did})).await {
+            match daemon
+                .send_command("query-card", json!({"did": &recipient_did}))
+                .await
+            {
                 Ok(response) => {
                     if let Some(card_value) = response.get("card") {
-                        if let Ok(card) = serde_json::from_value::<crate::protocol::AgentCard>(card_value.clone()) {
+                        if let Ok(card) =
+                            serde_json::from_value::<crate::protocol::AgentCard>(card_value.clone())
+                        {
                             extract_primary_protocol(&card).unwrap_or_else(|| opts.protocol.clone())
                         } else {
                             opts.protocol.clone()
@@ -173,22 +181,27 @@ pub async fn run(opts: TellOptions) -> Result<()> {
                             .await?;
 
                     if opts.json {
-                        println!("{}", serde_json::to_string_pretty(&json!({
-                            "messageId": message_id,
-                            "to": recipient_did,
-                            "protocol": effective_protocol,
-                            "payload": payload,
-                            "threadId": thread_id,
-                            "waitSeconds": timeout_secs,
-                            "result": outcome.as_ref().map(|o| json!({
-                                "kind": o.kind.as_str(),
-                                "status": o.status,
-                                "jobId": o.job_id,
-                                "terminal": o.terminal,
-                            })),
-                            "timedOut": outcome.is_none(),
-                        }))?);
-                        if outcome.is_none() { std::process::exit(1); }
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&json!({
+                                "messageId": message_id,
+                                "to": recipient_did,
+                                "protocol": effective_protocol,
+                                "payload": payload,
+                                "threadId": thread_id,
+                                "waitSeconds": timeout_secs,
+                                "result": outcome.as_ref().map(|o| json!({
+                                    "kind": o.kind.as_str(),
+                                    "status": o.status,
+                                    "jobId": o.job_id,
+                                    "terminal": o.terminal,
+                                })),
+                                "timedOut": outcome.is_none(),
+                            }))?
+                        );
+                        if outcome.is_none() {
+                            std::process::exit(1);
+                        }
                         return Ok(());
                     }
 
@@ -211,14 +224,17 @@ pub async fn run(opts: TellOptions) -> Result<()> {
                         std::process::exit(1);
                     }
                 } else if opts.json {
-                    println!("{}", serde_json::to_string_pretty(&json!({
-                        "messageId": message_id,
-                        "to": recipient_did,
-                        "protocol": effective_protocol,
-                        "payload": payload,
-                        "threadId": thread_id,
-                        "status": "accepted_locally",
-                    }))?);
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({
+                            "messageId": message_id,
+                            "to": recipient_did,
+                            "protocol": effective_protocol,
+                            "payload": payload,
+                            "threadId": thread_id,
+                            "status": "accepted_locally",
+                        }))?
+                    );
                 } else if opts.human {
                     println!("Message accepted locally via daemon ({})", message_id);
                     if let Some(thread_id) = &thread_id {
@@ -243,17 +259,23 @@ pub async fn run(opts: TellOptions) -> Result<()> {
             }
             Err(error) => {
                 if opts.json {
-                    println!("{}", serde_json::to_string_pretty(&json!({
-                        "error": format!("{}", error),
-                        "to": recipient_did,
-                        "protocol": effective_protocol,
-                        "payload": payload,
-                        "threadId": thread_id,
-                        "status": "send_failed",
-                    }))?);
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({
+                            "error": format!("{}", error),
+                            "to": recipient_did,
+                            "protocol": effective_protocol,
+                            "payload": payload,
+                            "threadId": thread_id,
+                            "status": "send_failed",
+                        }))?
+                    );
                     std::process::exit(1);
                 }
-                bail!("Daemon send failed: {}. Stop daemon first for direct relay mode: a4 stop", error);
+                bail!(
+                    "Daemon send failed: {}. Stop daemon first for direct relay mode: a4 stop",
+                    error
+                );
             }
         }
     }
@@ -296,13 +318,9 @@ pub async fn run(opts: TellOptions) -> Result<()> {
         let envelope_for_send = envelope_for_send.clone();
         async move {
             let keypair = KeyPair::from_hex(&identity_for_send.private_key)?;
-            let prepared = prepare_encrypted_sends_with_session(
-                session,
-                &config,
-                &keypair,
-                envelope_for_send,
-            )
-            .await?;
+            let prepared =
+                prepare_encrypted_sends_with_session(session, &config, &keypair, envelope_for_send)
+                    .await?;
             let next_config = prepared.config.clone();
             Ok((prepared, next_config))
         }
@@ -335,22 +353,27 @@ pub async fn run(opts: TellOptions) -> Result<()> {
         session.goodbye().await?;
 
         if opts.json {
-            println!("{}", serde_json::to_string_pretty(&json!({
-                "messageId": prepared.application_envelope.id,
-                "to": recipient_did,
-                "protocol": effective_protocol,
-                "payload": payload,
-                "threadId": thread_id,
-                "waitSeconds": timeout_secs,
-                "result": outcome.as_ref().map(|o| json!({
-                    "kind": o.kind.as_str(),
-                    "status": o.status,
-                    "jobId": o.job_id,
-                    "terminal": o.terminal,
-                })),
-                "timedOut": outcome.is_none(),
-            }))?);
-            if outcome.is_none() { std::process::exit(1); }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "messageId": prepared.application_envelope.id,
+                    "to": recipient_did,
+                    "protocol": effective_protocol,
+                    "payload": payload,
+                    "threadId": thread_id,
+                    "waitSeconds": timeout_secs,
+                    "result": outcome.as_ref().map(|o| json!({
+                        "kind": o.kind.as_str(),
+                        "status": o.status,
+                        "jobId": o.job_id,
+                        "terminal": o.terminal,
+                    })),
+                    "timedOut": outcome.is_none(),
+                }))?
+            );
+            if outcome.is_none() {
+                std::process::exit(1);
+            }
         } else {
             render_wait_outcome(
                 opts.human,
@@ -395,15 +418,18 @@ pub async fn run(opts: TellOptions) -> Result<()> {
         session.goodbye().await?;
 
         if opts.json {
-            println!("{}", serde_json::to_string_pretty(&json!({
-                "messageId": prepared.application_envelope.id,
-                "to": recipient_did,
-                "protocol": effective_protocol,
-                "payload": payload,
-                "threadId": thread_id,
-                "status": final_status,
-                "relayDelivered": final_status == "delivered",
-            }))?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "messageId": prepared.application_envelope.id,
+                    "to": recipient_did,
+                    "protocol": effective_protocol,
+                    "payload": payload,
+                    "threadId": thread_id,
+                    "status": final_status,
+                    "relayDelivered": final_status == "delivered",
+                }))?
+            );
         } else if opts.human {
             match final_status.as_str() {
                 "accepted" => {
@@ -507,8 +533,10 @@ async fn wait_for_message_outcome_via_daemon(
     message_id: &str,
     timeout_secs: u64,
 ) -> Result<Option<MessageOutcome>> {
+    use crate::commands::message_lifecycle::{
+        message_id as get_message_id, sort_messages_by_timestamp,
+    };
     use std::collections::HashSet;
-    use crate::commands::message_lifecycle::{message_id as get_message_id, sort_messages_by_timestamp};
 
     let start_time = SystemTime::now();
     let timeout_duration = Duration::from_secs(timeout_secs);
@@ -594,7 +622,9 @@ async fn wait_for_message_outcome_via_relay(
         }
 
         // If the envelope is E2E encrypted, decrypt it
-        if envelope.get("protocol").and_then(|v| v.as_str()) == Some(E2E_APPLICATION_ENVELOPE_PROTOCOL) {
+        if envelope.get("protocol").and_then(|v| v.as_str())
+            == Some(E2E_APPLICATION_ENVELOPE_PROTOCOL)
+        {
             let transport_envelope: Envelope = match serde_json::from_value(envelope.clone()) {
                 Ok(e) => e,
                 Err(err) => {
@@ -616,7 +646,10 @@ async fn wait_for_message_outcome_via_relay(
                     envelope = match serde_json::to_value(&decrypted.application_envelope) {
                         Ok(v) => v,
                         Err(err) => {
-                            eprintln!("Skipping decrypted envelope due to serialization failure: {}", err);
+                            eprintln!(
+                                "Skipping decrypted envelope due to serialization failure: {}",
+                                err
+                            );
                             continue;
                         }
                     };

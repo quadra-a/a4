@@ -823,7 +823,9 @@ mod tests {
             signature,
         };
 
-        assert!(envelope.verify_signature().expect("legacy signature verifies"));
+        assert!(envelope
+            .verify_signature()
+            .expect("legacy signature verifies"));
     }
 
     #[test]
@@ -865,6 +867,8 @@ mod tests {
             signature: hex::encode(keypair.sign(legacy_payload.as_bytes())),
         };
 
-        assert!(card.verify_signature().expect("legacy card signature verifies"));
+        assert!(card
+            .verify_signature()
+            .expect("legacy card signature verifies"));
     }
 }

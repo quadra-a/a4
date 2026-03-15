@@ -651,8 +651,19 @@ async fn main() -> Result<()> {
             .await?;
         }
 
-        Commands::Unblock { target, keep_history, json, human } => {
-            commands::unblock::run(commands::unblock::UnblockOptions { target, keep_history, json, human }).await?;
+        Commands::Unblock {
+            target,
+            keep_history,
+            json,
+            human,
+        } => {
+            commands::unblock::run(commands::unblock::UnblockOptions {
+                target,
+                keep_history,
+                json,
+                human,
+            })
+            .await?;
         }
 
         Commands::Allow {
@@ -698,7 +709,8 @@ async fn main() -> Result<()> {
         }
 
         Commands::Publish { relay, json, human } => {
-            commands::publish::run(commands::publish::PublishOptions { relay, json, human }).await?;
+            commands::publish::run(commands::publish::PublishOptions { relay, json, human })
+                .await?;
         }
 
         Commands::Unpublish { relay, json, human } => {
@@ -837,8 +849,7 @@ async fn main() -> Result<()> {
                 commands::e2e::e2e_status(commands::e2e::E2eStatusOptions { json }).await?;
             }
             E2eAction::Reset { peer } => {
-                commands::e2e::e2e_reset(commands::e2e::E2eResetOptions { peer_did: peer })
-                    .await?;
+                commands::e2e::e2e_reset(commands::e2e::E2eResetOptions { peer_did: peer }).await?;
             }
         },
     }

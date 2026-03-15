@@ -168,8 +168,7 @@ pub struct LocalE2EConfig {
 
 impl LocalE2EConfig {
     pub fn is_valid(&self) -> bool {
-        !self.current_device_id.is_empty()
-            && self.devices.contains_key(&self.current_device_id)
+        !self.current_device_id.is_empty() && self.devices.contains_key(&self.current_device_id)
     }
 }
 

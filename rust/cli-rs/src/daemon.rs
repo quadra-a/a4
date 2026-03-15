@@ -195,6 +195,7 @@ fn build_session_reset_envelope(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_session_retry_envelope(
     keypair: &KeyPair,
     from: &str,
@@ -364,20 +365,25 @@ impl DaemonServer {
                     };
 
                     let mut state_guard = state.write().await;
-                    let envelope_protocol = envelope.get("protocol").and_then(|value| value.as_str());
+                    let envelope_protocol =
+                        envelope.get("protocol").and_then(|value| value.as_str());
 
                     // Handle signed control messages outside the E2E transport.
-                    if matches!(envelope_protocol, Some("e2e/session-reset" | "e2e/session-retry")) {
-                        let control_envelope: Envelope = match serde_json::from_value(envelope.clone()) {
-                            Ok(envelope) => envelope,
-                            Err(err) => {
-                                eprintln!(
-                                    "Skipping malformed control envelope {} from {} on {}: {}",
-                                    message_id, from, relay_url, err,
-                                );
-                                continue;
-                            }
-                        };
+                    if matches!(
+                        envelope_protocol,
+                        Some("e2e/session-reset" | "e2e/session-retry")
+                    ) {
+                        let control_envelope: Envelope =
+                            match serde_json::from_value(envelope.clone()) {
+                                Ok(envelope) => envelope,
+                                Err(err) => {
+                                    eprintln!(
+                                        "Skipping malformed control envelope {} from {} on {}: {}",
+                                        message_id, from, relay_url, err,
+                                    );
+                                    continue;
+                                }
+                            };
 
                         if control_envelope.from != from {
                             eprintln!(
@@ -400,7 +406,9 @@ impl DaemonServer {
                             match with_locked_config_transaction(|mut config| async move {
                                 let cleared = clear_peer_sessions(&mut config, &from_for_reset);
                                 Ok((cleared, config))
-                            }).await {
+                            })
+                            .await
+                            {
                                 Ok((cleared, next_config)) => {
                                     state_guard.config = next_config;
                                     if cleared > 0 {
@@ -435,8 +443,9 @@ impl DaemonServer {
                             .and_then(|value| value.as_str())
                             .unwrap_or("session")
                             .to_string();
-                        let retry_requested_at = json_u64(payload.and_then(|payload| payload.get("timestamp")))
-                            .unwrap_or(received_at);
+                        let retry_requested_at =
+                            json_u64(payload.and_then(|payload| payload.get("timestamp")))
+                                .unwrap_or(received_at);
 
                         let Some(retry_message_id) = retry_message_id else {
                             eprintln!(
@@ -496,7 +505,9 @@ impl DaemonServer {
                             continue;
                         }
 
-                        let application_envelope: Envelope = match serde_json::from_value(original_message.envelope.clone()) {
+                        let application_envelope: Envelope = match serde_json::from_value(
+                            original_message.envelope.clone(),
+                        ) {
                             Ok(envelope) => envelope,
                             Err(err) => {
                                 eprintln!(
@@ -518,31 +529,33 @@ impl DaemonServer {
                         let from_for_retry = from.clone();
                         let retry_message_id_for_send = retry_message_id.clone();
                         let application_envelope_for_send = application_envelope.clone();
-                        let replay_result = with_local_e2e_state_transaction(|mut config| async move {
-                            let relay_identity = config
-                                .identity
-                                .as_ref()
-                                .ok_or_else(|| anyhow::anyhow!("No identity found"))?
-                                .clone();
-                            let keypair = KeyPair::from_hex(&relay_identity.private_key)?;
-                            let _ = clear_peer_sessions(&mut config, &from_for_retry);
-                            let invite_token = resolve_relay_invite_token(None, Some(&config));
-                            let mut query_session = connect_query_session(
-                                &relay_url_for_retry,
-                                invite_token.as_deref(),
-                            )
-                            .await?;
-                            let prepared = prepare_encrypted_sends_with_session(
-                                &mut query_session,
-                                &config,
-                                &keypair,
-                                application_envelope_for_send.clone(),
-                            )
-                            .await?;
-                            let _ = query_session.goodbye().await;
-                            let next_config = prepared.config.clone();
-                            Ok((prepared, next_config))
-                        }).await;
+                        let replay_result =
+                            with_local_e2e_state_transaction(|mut config| async move {
+                                let relay_identity = config
+                                    .identity
+                                    .as_ref()
+                                    .ok_or_else(|| anyhow::anyhow!("No identity found"))?
+                                    .clone();
+                                let keypair = KeyPair::from_hex(&relay_identity.private_key)?;
+                                let _ = clear_peer_sessions(&mut config, &from_for_retry);
+                                let invite_token = resolve_relay_invite_token(None, Some(&config));
+                                let mut query_session = connect_query_session(
+                                    &relay_url_for_retry,
+                                    invite_token.as_deref(),
+                                )
+                                .await?;
+                                let prepared = prepare_encrypted_sends_with_session(
+                                    &mut query_session,
+                                    &config,
+                                    &keypair,
+                                    application_envelope_for_send.clone(),
+                                )
+                                .await?;
+                                let _ = query_session.goodbye().await;
+                                let next_config = prepared.config.clone();
+                                Ok((prepared, next_config))
+                            })
+                            .await;
 
                         let (prepared, next_config) = match replay_result {
                             Ok(result) => result,
@@ -571,19 +584,21 @@ impl DaemonServer {
                         let send_batches = prepared
                             .targets
                             .iter()
-                            .map(|target| (
-                                target.outer_envelope_bytes.clone(),
-                                E2EDeliveryMetadata {
-                                    transport: target.transport.clone(),
-                                    sender_device_id: target.sender_device_id.clone(),
-                                    receiver_device_id: target.recipient_device_id.clone(),
-                                    session_id: target.session_id.clone(),
-                                    state: E2EDeliveryState::Sent,
-                                    recorded_at,
-                                    used_skipped_message_key: None,
-                                    error: None,
-                                },
-                            ))
+                            .map(|target| {
+                                (
+                                    target.outer_envelope_bytes.clone(),
+                                    E2EDeliveryMetadata {
+                                        transport: target.transport.clone(),
+                                        sender_device_id: target.sender_device_id.clone(),
+                                        receiver_device_id: target.recipient_device_id.clone(),
+                                        session_id: target.session_id.clone(),
+                                        state: E2EDeliveryState::Sent,
+                                        recorded_at,
+                                        used_skipped_message_key: None,
+                                        error: None,
+                                    },
+                                )
+                            })
                             .collect::<Vec<_>>();
 
                         drop(state_guard);
@@ -659,8 +674,7 @@ impl DaemonServer {
                         continue;
                     }
 
-                    if envelope_protocol != Some(E2E_APPLICATION_ENVELOPE_PROTOCOL)
-                    {
+                    if envelope_protocol != Some(E2E_APPLICATION_ENVELOPE_PROTOCOL) {
                         eprintln!(
                             "Rejecting legacy plaintext relay message {} from {} on {} with protocol {}",
                             message_id,
@@ -679,9 +693,9 @@ impl DaemonServer {
                             Ok(envelope) => envelope,
                             Err(err) => {
                                 eprintln!(
-                                    "Skipping malformed E2E transport envelope {} from {} on {}: {}",
-                                    message_id, from, relay_url, err,
-                                );
+                                "Skipping malformed E2E transport envelope {} from {} on {}: {}",
+                                message_id, from, relay_url, err,
+                            );
                                 continue;
                             }
                         };
@@ -698,7 +712,8 @@ impl DaemonServer {
                                 resolve_relay_invite_token(None, Some(&state_guard.config));
                             match connect_query_session(&relay_url, invite_token.as_deref()).await {
                                 Ok(mut query_session) => {
-                                    let sender_card = query_session.fetch_card(&message.sender_did).await;
+                                    let sender_card =
+                                        query_session.fetch_card(&message.sender_did).await;
                                     let _ = query_session.goodbye().await;
                                     match sender_card {
                                         Ok(Some(card)) => {
@@ -747,13 +762,12 @@ impl DaemonServer {
                     }
 
                     let decrypted = match with_local_e2e_state_transaction(|config| async move {
-                        let decrypted = prepare_encrypted_receive(
-                            &config,
-                            &transport_envelope,
-                        )?;
+                        let decrypted = prepare_encrypted_receive(&config, &transport_envelope)?;
                         let next_config = decrypted.config.clone();
                         Ok((decrypted, next_config))
-                    }).await {
+                    })
+                    .await
+                    {
                         Ok((decrypted, next_config)) => {
                             state_guard.config = next_config;
                             decrypted
@@ -774,7 +788,9 @@ impl DaemonServer {
                             match with_locked_config_transaction(|mut config| async move {
                                 let cleared = clear_peer_sessions(&mut config, &from_for_failure);
                                 Ok((cleared, config))
-                            }).await {
+                            })
+                            .await
+                            {
                                 Ok((_, next_config)) => {
                                     state_guard.config = next_config;
                                 }
@@ -799,11 +815,13 @@ impl DaemonServer {
                                 );
                                 if let Ok(envelope_bytes) = encode_envelope_bytes(&retry_envelope) {
                                     let (response_tx, _response_rx) = oneshot::channel();
-                                    let _ = sender.send(RelayWorkerCommand::SendEnvelope {
-                                        to: from.clone(),
-                                        envelope_bytes,
-                                        response: response_tx,
-                                    }).await;
+                                    let _ = sender
+                                        .send(RelayWorkerCommand::SendEnvelope {
+                                            to: from.clone(),
+                                            envelope_bytes,
+                                            response: response_tx,
+                                        })
+                                        .await;
                                 }
                             }
 
@@ -1230,11 +1248,8 @@ async fn handle_send(params: Value, state: Arc<RwLock<DaemonState>>) -> Result<V
             let (prepared, next_config) = with_local_e2e_state_transaction(|config| async move {
                 let keypair = KeyPair::from_hex(&identity_for_send.private_key)?;
                 let invite_token = resolve_relay_invite_token(None, Some(&config));
-                let mut query_session = connect_query_session(
-                    &relay_url,
-                    invite_token.as_deref(),
-                )
-                .await?;
+                let mut query_session =
+                    connect_query_session(&relay_url, invite_token.as_deref()).await?;
                 let prepared = prepare_encrypted_sends_with_session(
                     &mut query_session,
                     &config,
@@ -1245,7 +1260,8 @@ async fn handle_send(params: Value, state: Arc<RwLock<DaemonState>>) -> Result<V
                 let _ = query_session.goodbye().await;
                 let next_config = prepared.config.clone();
                 Ok((prepared, next_config))
-            }).await?;
+            })
+            .await?;
             state_guard.config = next_config;
             let envelope_json = serde_json::to_value(&prepared.application_envelope)?;
             let initial_deliveries = prepared
@@ -1266,10 +1282,9 @@ async fn handle_send(params: Value, state: Arc<RwLock<DaemonState>>) -> Result<V
                 .targets
                 .iter()
                 .zip(initial_deliveries.iter())
-                .map(|(target, delivery)| (
-                    target.outer_envelope_bytes.clone(),
-                    Some(delivery.clone()),
-                ))
+                .map(|(target, delivery)| {
+                    (target.outer_envelope_bytes.clone(), Some(delivery.clone()))
+                })
                 .collect::<Vec<_>>();
 
             (
@@ -1309,7 +1324,8 @@ async fn handle_send(params: Value, state: Arc<RwLock<DaemonState>>) -> Result<V
 
         match response_rx
             .await
-            .context("Relay worker dropped send response")? {
+            .context("Relay worker dropped send response")?
+        {
             Ok(()) => {
                 if let Some(mut delivery) = delivery {
                     delivery.state = E2EDeliveryState::Sent;
@@ -1871,7 +1887,6 @@ async fn handle_e2e_reset_notify(params: Value, state: Arc<RwLock<DaemonState>>)
     }))
 }
 
-
 fn activity_level_name(level: &ActivityLevel) -> &'static str {
     match level {
         ActivityLevel::Low => "Low",
@@ -2020,8 +2035,8 @@ mod tests {
     };
     use crate::config::{Config, IdentityConfig};
     use crate::identity::KeyPair;
-    use quadra_a_runtime::relay_worker::RelayWorkerCommand;
     use quadra_a_runtime::inbox::parse_envelope_value;
+    use quadra_a_runtime::relay_worker::RelayWorkerCommand;
     use quadra_a_runtime::session_manager::ManagedRelayState;
     use serde_json::json;
     use std::sync::Arc;
@@ -2038,13 +2053,8 @@ mod tests {
     fn session_reset_envelope_is_signed_and_encoded_as_standard_envelope() {
         let keypair = KeyPair::generate();
         let did = quadra_a_core::identity::derive_did(keypair.verifying_key.as_bytes());
-        let envelope = build_session_reset_envelope(
-            &keypair,
-            &did,
-            "did:agent:zPeer",
-            "decrypt-failed",
-            123,
-        );
+        let envelope =
+            build_session_reset_envelope(&keypair, &did, "did:agent:zPeer", "decrypt-failed", 123);
 
         assert_eq!(envelope.protocol, "e2e/session-reset");
         assert!(envelope.verify_signature().expect("signature verifies"));
@@ -2056,7 +2066,8 @@ mod tests {
             Some("e2e/session-reset")
         );
         assert_eq!(
-            decoded.get("payload")
+            decoded
+                .get("payload")
                 .and_then(|value| value.get("reason"))
                 .and_then(|value| value.as_str()),
             Some("decrypt-failed")
@@ -2088,13 +2099,15 @@ mod tests {
             Some("e2e/session-retry")
         );
         assert_eq!(
-            decoded.get("payload")
+            decoded
+                .get("payload")
                 .and_then(|value| value.get("messageId"))
                 .and_then(|value| value.as_str()),
             Some("msg-original")
         );
         assert_eq!(
-            decoded.get("payload")
+            decoded
+                .get("payload")
                 .and_then(|value| value.get("failedTransport"))
                 .and_then(|value| value.as_str()),
             Some("session")
@@ -2105,14 +2118,17 @@ mod tests {
     async fn e2e_reset_notify_sends_signed_manual_reset_envelopes() {
         let keypair = KeyPair::generate();
         let did = quadra_a_core::identity::derive_did(keypair.verifying_key.as_bytes());
-        let mut config = Config::default();
-        config.identity = Some(IdentityConfig {
-            did: did.clone(),
-            public_key: keypair.public_key_hex(),
-            private_key: keypair.private_key_hex(),
-        });
+        let config = Config {
+            identity: Some(IdentityConfig {
+                did: did.clone(),
+                public_key: keypair.public_key_hex(),
+                private_key: keypair.private_key_hex(),
+            }),
+            ..Config::default()
+        };
 
-        let mut relay_runtime = ManagedRelayState::new(quadra_a_core::config::ReachabilityPolicy::default());
+        let mut relay_runtime =
+            ManagedRelayState::new(quadra_a_core::config::ReachabilityPolicy::default());
         relay_runtime.connected = true;
 
         let (relay_tx, mut relay_rx) = mpsc::channel(1);
@@ -2146,7 +2162,8 @@ mod tests {
                 response,
             } => {
                 assert_eq!(to, "did:agent:zPeer");
-                let decoded = parse_envelope_value(&envelope_bytes).expect("encoded envelope decodes");
+                let decoded =
+                    parse_envelope_value(&envelope_bytes).expect("encoded envelope decodes");
                 assert_eq!(
                     decoded.get("protocol").and_then(|value| value.as_str()),
                     Some("e2e/session-reset")
@@ -2163,7 +2180,10 @@ mod tests {
             RelayWorkerCommand::Stop => panic!("unexpected stop command"),
         }
 
-        let result = notify_task.await.expect("notify task joins").expect("notify succeeds");
+        let result = notify_task
+            .await
+            .expect("notify task joins")
+            .expect("notify succeeds");
         assert_eq!(
             result
                 .get("notified")

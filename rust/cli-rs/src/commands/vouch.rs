@@ -83,18 +83,21 @@ pub async fn run(opts: VouchOptions) -> Result<()> {
     }
 
     if opts.json {
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-            "endorser": identity.did,
-            "endorsee": target_did,
-            "domain": opts.domain,
-            "type": opts.endorsement_type,
-            "strength": opts.strength,
-            "comment": opts.comment,
-            "timestamp": timestamp,
-            "expires": expires,
-            "signature": signature,
-            "status": "signed_and_stored_locally",
-        }))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "endorser": identity.did,
+                "endorsee": target_did,
+                "domain": opts.domain,
+                "type": opts.endorsement_type,
+                "strength": opts.strength,
+                "comment": opts.comment,
+                "timestamp": timestamp,
+                "expires": expires,
+                "signature": signature,
+                "status": "signed_and_stored_locally",
+            }))?
+        );
         return Ok(());
     }
 

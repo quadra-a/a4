@@ -175,7 +175,8 @@ pub async fn prepare_encrypted_send_with_session(
     application_envelope: Envelope,
 ) -> Result<PreparedEncryptedSend> {
     let prepared =
-        prepare_encrypted_sends_with_session(session, config, keypair, application_envelope).await?;
+        prepare_encrypted_sends_with_session(session, config, keypair, application_envelope)
+            .await?;
     let target_count = prepared.targets.len();
     if target_count != 1 {
         anyhow::bail!(
@@ -211,9 +212,8 @@ mod tests {
     use quadra_a_core::e2e::{
         build_claimed_pre_key_bundle, build_published_device_directory,
         build_published_pre_key_bundles, create_local_device_state,
-        rotate_local_device_signed_pre_key,
         decode_encrypted_application_envelope_payload, ensure_local_e2e_config,
-        DecodedEncryptedApplicationMessage, E2EMessageType,
+        rotate_local_device_signed_pre_key, DecodedEncryptedApplicationMessage, E2EMessageType,
         EncryptedApplicationEnvelopePayload, E2E_APPLICATION_ENVELOPE_PROTOCOL,
     };
     use quadra_a_core::identity::{derive_did, KeyPair};
@@ -503,7 +503,8 @@ mod tests {
             .expect("alice card builds");
 
         let bob_identity = bob_config.identity.as_ref().expect("bob identity").clone();
-        let bob_signing_keypair = KeyPair::from_hex(&bob_identity.private_key).expect("bob keypair");
+        let bob_signing_keypair =
+            KeyPair::from_hex(&bob_identity.private_key).expect("bob keypair");
         let second_bob_device = create_local_device_state(
             &bob_signing_keypair,
             Some("device-bob-secondary".to_string()),
@@ -521,17 +522,17 @@ mod tests {
 
         let bob_card =
             build_agent_card_from_config(&bob_config, &bob_identity).expect("bob card builds");
-        let mut bob_devices = build_published_device_directory(bob_config.e2e.as_ref().expect("bob e2e"));
+        let mut bob_devices =
+            build_published_device_directory(bob_config.e2e.as_ref().expect("bob e2e"));
         bob_devices.sort_by(|left, right| left.device_id.cmp(&right.device_id));
-        let bob_bundles = build_published_pre_key_bundles(bob_config.e2e.as_ref().expect("bob e2e"));
+        let bob_bundles =
+            build_published_pre_key_bundles(bob_config.e2e.as_ref().expect("bob e2e"));
 
         let fetch_prekey_bundles = bob_bundles
             .iter()
             .map(|bundle| {
-                let claimed_bundle = build_claimed_pre_key_bundle(
-                    bundle,
-                    bundle.one_time_pre_keys.first().cloned(),
-                );
+                let claimed_bundle =
+                    build_claimed_pre_key_bundle(bundle, bundle.one_time_pre_keys.first().cloned());
                 (
                     format!("{}:{}", bob_identity.did, bundle.device_id),
                     vec![serde_json::to_value(&claimed_bundle).expect("serialize claimed bundle")],
@@ -682,7 +683,6 @@ mod tests {
             .expect("relay result");
     }
 
-
     #[tokio::test]
     async fn prepare_encrypted_send_rejects_invalid_signed_pre_key_signature() {
         let alice_config = build_config("Alice");
@@ -760,14 +760,18 @@ mod tests {
         }
         .sign(&alice_keypair);
 
-        let err = prepare_encrypted_send_with_session(&mut session, &alice_config, &alice_keypair, envelope)
-            .await
-            .err()
-            .expect("invalid signed pre-key signature should fail");
+        let err = prepare_encrypted_send_with_session(
+            &mut session,
+            &alice_config,
+            &alice_keypair,
+            envelope,
+        )
+        .await
+        .err()
+        .expect("invalid signed pre-key signature should fail");
         assert!(err.to_string().contains(&format!(
             "Target {}:{} publishes invalid signed pre-key signature",
-            bob_identity.did,
-            bob_device.device_id
+            bob_identity.did, bob_device.device_id
         )));
 
         session.goodbye().await.expect("close relay session");
@@ -896,7 +900,6 @@ mod tests {
             .expect("relay result");
     }
 
-
     #[tokio::test]
     async fn prepare_encrypted_receive_rejects_replayed_prekey_message_after_initial_consumption() {
         let alice_config = build_config("Alice");
@@ -970,11 +973,9 @@ mod tests {
         let replay_error = prepare_encrypted_receive(&first_received.config, &first.outer_envelope)
             .err()
             .expect("replayed prekey message should fail");
-        assert!(
-            replay_error
-                .to_string()
-                .contains("Claimed one-time pre-key already consumed for PREKEY_MESSAGE")
-        );
+        assert!(replay_error
+            .to_string()
+            .contains("Claimed one-time pre-key already consumed for PREKEY_MESSAGE"));
 
         session.goodbye().await.expect("close relay session");
         relay_task
@@ -1051,7 +1052,8 @@ mod tests {
         .await
         .expect("prepare first encrypted send");
 
-        let bob_signing_keypair = KeyPair::from_hex(&bob_identity.private_key).expect("bob keypair");
+        let bob_signing_keypair =
+            KeyPair::from_hex(&bob_identity.private_key).expect("bob keypair");
         let bob_current_device_id = bob_config
             .e2e
             .as_ref()
@@ -1073,9 +1075,9 @@ mod tests {
         let error = prepare_encrypted_receive(&rotated_bob_config, &first.outer_envelope)
             .err()
             .expect("rotated-out signed pre-key should fail");
-        assert!(error
-            .to_string()
-            .contains("PREKEY_MESSAGE signed pre-key id does not match current receiver device state"));
+        assert!(error.to_string().contains(
+            "PREKEY_MESSAGE signed pre-key id does not match current receiver device state"
+        ));
 
         session.goodbye().await.expect("close relay session");
         relay_task
@@ -1120,5 +1122,4 @@ mod tests {
             .to_string()
             .contains(E2E_APPLICATION_ENVELOPE_PROTOCOL));
     }
-
 }

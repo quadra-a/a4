@@ -45,12 +45,15 @@ pub async fn run(opts: UnpublishOptions) -> Result<()> {
     save_config(&config)?;
 
     if opts.json {
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-            "relay": relay_url,
-            "agentDid": identity.did,
-            "status": status,
-            "discoverable": false,
-        }))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "relay": relay_url,
+                "agentDid": identity.did,
+                "status": status,
+                "discoverable": false,
+            }))?
+        );
         return Ok(());
     }
 

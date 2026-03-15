@@ -62,7 +62,10 @@ pub async fn run(opts: FindOptions) -> Result<()> {
 
         if let Some(card) = agent_card {
             if opts.json {
-                println!("{}", serde_json::to_string_pretty(&agent_card_to_json(&card))?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&agent_card_to_json(&card))?
+                );
                 return Ok(());
             }
             render_agent_card(&card, opts.human);
@@ -81,10 +84,13 @@ pub async fn run(opts: FindOptions) -> Result<()> {
                 }
             }
         } else if opts.json {
-            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                "status": "not_found",
-                "did": target_did,
-            }))?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "not_found",
+                    "did": target_did,
+                }))?
+            );
         } else if opts.human {
             println!("Agent not found: {}", target_did);
         } else {
@@ -135,14 +141,15 @@ pub async fn run(opts: FindOptions) -> Result<()> {
 
     // JSON output
     if opts.json {
-        let agents_json: Vec<serde_json::Value> = filtered_agents
-            .iter()
-            .map(|a| agent_card_to_json(a))
-            .collect();
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-            "agents": agents_json,
-            "count": filtered_agents.len(),
-        }))?);
+        let agents_json: Vec<serde_json::Value> =
+            filtered_agents.iter().map(agent_card_to_json).collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "agents": agents_json,
+                "count": filtered_agents.len(),
+            }))?
+        );
 
         // Auto-alias top result if requested
         if let Some(alias_name) = &opts.alias {

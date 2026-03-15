@@ -28,7 +28,8 @@ fn generate_device_id() -> String {
 }
 
 pub fn derive_device_id(seed_hex: &str) -> Result<String> {
-    let seed = hex::decode(seed_hex).map_err(|error| anyhow!("Invalid device identity seed: {}", error))?;
+    let seed = hex::decode(seed_hex)
+        .map_err(|error| anyhow!("Invalid device identity seed: {}", error))?;
     let mut hasher = Sha256::new();
     hasher.update(DEVICE_ID_DERIVATION_DOMAIN);
     hasher.update(seed);
@@ -185,7 +186,8 @@ pub fn rotate_local_device_signed_pre_key(
         signature: bytes_to_hex(&signed_pre_key_record.signature),
         created_at,
     };
-    next_device.one_time_pre_keys = build_one_time_pre_keys(next_one_time_pre_key_count, created_at);
+    next_device.one_time_pre_keys =
+        build_one_time_pre_keys(next_one_time_pre_key_count, created_at);
     next_device.last_resupply_at = created_at;
 
     Ok(next_config)
@@ -235,7 +237,9 @@ pub fn ensure_local_e2e_config(config: &mut Config) -> Result<bool> {
         .as_ref()
         .map(|device_identity| device_identity.device_id.clone())
         .ok_or_else(|| anyhow!("Device identity must exist before E2E state can be created"))?;
-    config.e2e = Some(create_initial_local_e2e_config_with_device_id(&keypair, device_id)?);
+    config.e2e = Some(create_initial_local_e2e_config_with_device_id(
+        &keypair, device_id,
+    )?);
     Ok(true)
 }
 
@@ -313,7 +317,7 @@ pub fn build_claimed_pre_key_bundle(
     }
 }
 
-pub fn current_device_state<'a>(e2e: &'a LocalE2EConfig) -> Result<&'a LocalDeviceState> {
+pub fn current_device_state(e2e: &LocalE2EConfig) -> Result<&LocalDeviceState> {
     e2e.devices
         .get(&e2e.current_device_id)
         .ok_or_else(|| anyhow!("Missing current E2E device {}", e2e.current_device_id))
@@ -330,15 +334,17 @@ mod tests {
     #[test]
     fn rotates_one_device_signed_pre_key_without_disturbing_sessions() {
         let signing_keypair = KeyPair::generate();
-        let mut e2e = create_initial_local_e2e_config(&signing_keypair).expect("create initial e2e");
+        let mut e2e =
+            create_initial_local_e2e_config(&signing_keypair).expect("create initial e2e");
         let device_id = e2e.current_device_id.clone();
         let original = e2e
             .devices
             .get_mut(&device_id)
             .expect("current device exists");
-        original
-            .sessions
-            .insert("did:agent:zpeer:device-peer".to_string(), serde_json::json!({"sessionId": "session-existing"}));
+        original.sessions.insert(
+            "did:agent:zpeer:device-peer".to_string(),
+            serde_json::json!({"sessionId": "session-existing"}),
+        );
         let original = original.clone();
 
         let rotated = rotate_local_device_signed_pre_key(
@@ -350,12 +356,21 @@ mod tests {
             Some(123456),
         )
         .expect("rotate signed pre-key");
-        let rotated_device = rotated.devices.get(&device_id).expect("rotated device exists");
+        let rotated_device = rotated
+            .devices
+            .get(&device_id)
+            .expect("rotated device exists");
 
         assert_eq!(rotated_device.identity_key, original.identity_key);
         assert_eq!(rotated_device.sessions, original.sessions);
-        assert!(rotated_device.signed_pre_key.signed_pre_key_id > original.signed_pre_key.signed_pre_key_id);
-        assert_ne!(rotated_device.signed_pre_key.public_key, original.signed_pre_key.public_key);
+        assert!(
+            rotated_device.signed_pre_key.signed_pre_key_id
+                > original.signed_pre_key.signed_pre_key_id
+        );
+        assert_ne!(
+            rotated_device.signed_pre_key.public_key,
+            original.signed_pre_key.public_key
+        );
         assert_eq!(rotated_device.last_resupply_at, 123456);
         assert_eq!(rotated_device.one_time_pre_keys.len(), 16);
     }
@@ -375,10 +390,9 @@ mod tests {
 
     #[test]
     fn derive_device_id_is_stable_for_same_seed() {
-        let device_id = derive_device_id(
-            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
-        )
-        .expect("derive device id");
+        let device_id =
+            derive_device_id("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+                .expect("derive device id");
 
         assert_eq!(device_id, "device-f2f59669be519c02");
     }

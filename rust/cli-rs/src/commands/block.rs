@@ -43,11 +43,14 @@ pub async fn run(opts: BlockOptions) -> Result<()> {
     let _ = inform_daemon_of_block(&target_did).await;
 
     if opts.json {
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-            "target": target_did,
-            "reason": opts.reason,
-            "status": "blocked_and_stored",
-        }))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "target": target_did,
+                "reason": opts.reason,
+                "status": "blocked_and_stored",
+            }))?
+        );
         return Ok(());
     }
 

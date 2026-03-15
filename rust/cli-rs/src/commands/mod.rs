@@ -1,9 +1,12 @@
 // Legacy commands
 pub mod alias;
 pub mod daemon;
+#[allow(dead_code)]
 pub mod discover;
 pub mod inbox;
+#[allow(dead_code)]
 pub mod init;
+#[allow(dead_code)]
 pub mod send;
 pub mod sessions;
 pub mod status;
@@ -24,6 +27,7 @@ pub mod score;
 pub mod target_resolution;
 pub mod tell;
 pub mod trace;
+#[allow(dead_code)]
 pub mod trust_cli;
 pub mod unblock;
 pub mod unpublish;

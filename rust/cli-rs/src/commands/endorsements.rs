@@ -94,13 +94,16 @@ pub async fn run(opts: EndorsementsOptions) -> Result<()> {
     };
 
     if opts.json {
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-            "target": target_did,
-            "createdBy": created_by_did,
-            "domain": opts.domain,
-            "count": endorsements.len(),
-            "endorsements": endorsements,
-        }))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "target": target_did,
+                "createdBy": created_by_did,
+                "domain": opts.domain,
+                "count": endorsements.len(),
+                "endorsements": endorsements,
+            }))?
+        );
         return Ok(());
     }
 

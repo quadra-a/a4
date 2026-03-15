@@ -314,7 +314,7 @@ fn double_ratchet_fixture_matches_bootstrap_and_dh_reply() {
             role: "initiator".to_string(),
             root_key: shared_secret.clone(),
             current_ratchet_key: crate::e2e::X25519KeyPair {
-                public_key: initiator_ratchet_public.clone(),
+                public_key: initiator_ratchet_public,
                 private_key: initiator_ratchet_private
                     .clone()
                     .try_into()
@@ -358,7 +358,7 @@ fn double_ratchet_fixture_matches_bootstrap_and_dh_reply() {
             role: "responder".to_string(),
             root_key: shared_secret,
             current_ratchet_key: crate::e2e::X25519KeyPair {
-                public_key: responder_ratchet_public.clone(),
+                public_key: responder_ratchet_public,
                 private_key: responder_ratchet_private
                     .clone()
                     .try_into()
@@ -496,7 +496,7 @@ fn double_ratchet_fixture_matches_bootstrap_and_dh_reply() {
         ),
         nonce: Some(responder_reply_nonce),
         ratchet_keypair: Some(crate::e2e::X25519KeyPair {
-            public_key: responder_reply_ratchet_public.clone(),
+            public_key: responder_reply_ratchet_public,
             private_key: responder_reply_ratchet_private
                 .try_into()
                 .expect("responder reply ratchet private length"),
@@ -1161,18 +1161,22 @@ fn rejects_prekey_message_with_sender_device_identity_key_mismatch_against_publi
         "hello bob",
         100,
     );
-    let encrypted = crate::e2e::encrypt_application_envelope(crate::e2e::EncryptApplicationEnvelopeInput {
-        e2e: &fixture.alice_e2e,
-        application_envelope: &application_envelope,
-        recipient_device: &fixture.bob_device,
-        claimed_bundle: Some(&fixture.claimed_bundle),
-    })
-    .expect("encrypt application envelope");
-    let decoded_message = crate::e2e::decode_encrypted_application_envelope_payload(&encrypted.payload)
-        .expect("decode encrypted payload");
+    let encrypted =
+        crate::e2e::encrypt_application_envelope(crate::e2e::EncryptApplicationEnvelopeInput {
+            e2e: &fixture.alice_e2e,
+            application_envelope: &application_envelope,
+            recipient_device: &fixture.bob_device,
+            claimed_bundle: Some(&fixture.claimed_bundle),
+        })
+        .expect("encrypt application envelope");
+    let decoded_message =
+        crate::e2e::decode_encrypted_application_envelope_payload(&encrypted.payload)
+            .expect("decode encrypted payload");
     let prekey_message = match decoded_message {
         crate::e2e::DecodedEncryptedApplicationMessage::PreKey(message) => message,
-        crate::e2e::DecodedEncryptedApplicationMessage::Session(_) => panic!("expected PREKEY_MESSAGE"),
+        crate::e2e::DecodedEncryptedApplicationMessage::Session(_) => {
+            panic!("expected PREKEY_MESSAGE")
+        }
     };
 
     let sender_card = crate::protocol::AgentCard {
@@ -1197,8 +1201,7 @@ fn rejects_prekey_message_with_sender_device_identity_key_mismatch_against_publi
         &sender_card,
         &prekey_message,
     )
-    .err()
-    .expect("sender device identity mismatch should fail");
+    .expect_err("sender device identity mismatch should fail");
     assert!(err
         .to_string()
         .contains("published identity key does not match PREKEY_MESSAGE"));
@@ -1215,13 +1218,14 @@ fn rejects_tampered_encrypted_transport_envelope_signature() {
         "hello bob",
         100,
     );
-    let encrypted = crate::e2e::encrypt_application_envelope(crate::e2e::EncryptApplicationEnvelopeInput {
-        e2e: &fixture.alice_e2e,
-        application_envelope: &application_envelope,
-        recipient_device: &fixture.bob_device,
-        claimed_bundle: Some(&fixture.claimed_bundle),
-    })
-    .expect("encrypt application envelope");
+    let encrypted =
+        crate::e2e::encrypt_application_envelope(crate::e2e::EncryptApplicationEnvelopeInput {
+            e2e: &fixture.alice_e2e,
+            application_envelope: &application_envelope,
+            recipient_device: &fixture.bob_device,
+            claimed_bundle: Some(&fixture.claimed_bundle),
+        })
+        .expect("encrypt application envelope");
     let mut transport_envelope = crate::e2e::build_encrypted_transport_envelope(
         &application_envelope,
         encrypted.payload,
@@ -1229,13 +1233,15 @@ fn rejects_tampered_encrypted_transport_envelope_signature() {
     );
     transport_envelope.signature = "00".repeat(64);
 
-    let err = crate::e2e::decrypt_application_envelope(crate::e2e::DecryptApplicationEnvelopeInput {
-        e2e: &fixture.bob_e2e,
-        receiver_did: &fixture.bob_did,
-        transport_envelope: &transport_envelope,
-        now: Some(1000),
-    })
-    .err().expect("tampered transport signature should fail");
+    let err =
+        crate::e2e::decrypt_application_envelope(crate::e2e::DecryptApplicationEnvelopeInput {
+            e2e: &fixture.bob_e2e,
+            receiver_did: &fixture.bob_did,
+            transport_envelope: &transport_envelope,
+            now: Some(1000),
+        })
+        .err()
+        .expect("tampered transport signature should fail");
     assert!(err
         .to_string()
         .contains("Encrypted transport envelope signature verification failed"));
@@ -1253,26 +1259,29 @@ fn rejects_impersonated_decrypted_application_envelope_signature() {
         "mallory says hi",
         100,
     );
-    let encrypted = crate::e2e::encrypt_application_envelope(crate::e2e::EncryptApplicationEnvelopeInput {
-        e2e: &fixture.alice_e2e,
-        application_envelope: &impersonated_application_envelope,
-        recipient_device: &fixture.bob_device,
-        claimed_bundle: Some(&fixture.claimed_bundle),
-    })
-    .expect("encrypt application envelope");
+    let encrypted =
+        crate::e2e::encrypt_application_envelope(crate::e2e::EncryptApplicationEnvelopeInput {
+            e2e: &fixture.alice_e2e,
+            application_envelope: &impersonated_application_envelope,
+            recipient_device: &fixture.bob_device,
+            claimed_bundle: Some(&fixture.claimed_bundle),
+        })
+        .expect("encrypt application envelope");
     let transport_envelope = crate::e2e::build_encrypted_transport_envelope(
         &impersonated_application_envelope,
         encrypted.payload,
         &fixture.alice_signing,
     );
 
-    let err = crate::e2e::decrypt_application_envelope(crate::e2e::DecryptApplicationEnvelopeInput {
-        e2e: &fixture.bob_e2e,
-        receiver_did: &fixture.bob_did,
-        transport_envelope: &transport_envelope,
-        now: Some(1000),
-    })
-    .err().expect("impersonated inner signature should fail");
+    let err =
+        crate::e2e::decrypt_application_envelope(crate::e2e::DecryptApplicationEnvelopeInput {
+            e2e: &fixture.bob_e2e,
+            receiver_did: &fixture.bob_did,
+            transport_envelope: &transport_envelope,
+            now: Some(1000),
+        })
+        .err()
+        .expect("impersonated inner signature should fail");
     assert!(err
         .to_string()
         .contains("Decrypted application envelope signature verification failed"));
@@ -1289,38 +1298,41 @@ fn rejects_double_consumption_of_the_same_one_time_pre_key() {
         "hello once",
         100,
     );
-    let encrypted = crate::e2e::encrypt_application_envelope(crate::e2e::EncryptApplicationEnvelopeInput {
-        e2e: &fixture.alice_e2e,
-        application_envelope: &application_envelope,
-        recipient_device: &fixture.bob_device,
-        claimed_bundle: Some(&fixture.claimed_bundle),
-    })
-    .expect("encrypt application envelope");
+    let encrypted =
+        crate::e2e::encrypt_application_envelope(crate::e2e::EncryptApplicationEnvelopeInput {
+            e2e: &fixture.alice_e2e,
+            application_envelope: &application_envelope,
+            recipient_device: &fixture.bob_device,
+            claimed_bundle: Some(&fixture.claimed_bundle),
+        })
+        .expect("encrypt application envelope");
     let transport_envelope = crate::e2e::build_encrypted_transport_envelope(
         &application_envelope,
         encrypted.payload,
         &fixture.alice_signing,
     );
-    let first = crate::e2e::decrypt_application_envelope(crate::e2e::DecryptApplicationEnvelopeInput {
-        e2e: &fixture.bob_e2e,
-        receiver_did: &fixture.bob_did,
-        transport_envelope: &transport_envelope,
-        now: Some(1000),
-    })
-    .expect("first decrypt succeeds");
+    let first =
+        crate::e2e::decrypt_application_envelope(crate::e2e::DecryptApplicationEnvelopeInput {
+            e2e: &fixture.bob_e2e,
+            receiver_did: &fixture.bob_did,
+            transport_envelope: &transport_envelope,
+            now: Some(1000),
+        })
+        .expect("first decrypt succeeds");
 
-    let err = crate::e2e::decrypt_application_envelope(crate::e2e::DecryptApplicationEnvelopeInput {
-        e2e: &first.e2e,
-        receiver_did: &fixture.bob_did,
-        transport_envelope: &transport_envelope,
-        now: Some(2000),
-    })
-    .err().expect("reusing claimed OTK should fail");
+    let err =
+        crate::e2e::decrypt_application_envelope(crate::e2e::DecryptApplicationEnvelopeInput {
+            e2e: &first.e2e,
+            receiver_did: &fixture.bob_did,
+            transport_envelope: &transport_envelope,
+            now: Some(2000),
+        })
+        .err()
+        .expect("reusing claimed OTK should fail");
     assert!(err
         .to_string()
         .contains("Claimed one-time pre-key already consumed for PREKEY_MESSAGE"));
 }
-
 
 #[test]
 fn rejects_session_message_with_tampered_ciphertext_before_application_delivery() {
@@ -1336,26 +1348,28 @@ fn rejects_session_message_with_tampered_ciphertext_before_application_delivery(
         "hello bob",
         100,
     );
-    let first_encrypted = crate::e2e::encrypt_application_envelope(crate::e2e::EncryptApplicationEnvelopeInput {
-        e2e: &alice_e2e,
-        application_envelope: &first_application_envelope,
-        recipient_device: &fixture.bob_device,
-        claimed_bundle: Some(&fixture.claimed_bundle),
-    })
-    .expect("encrypt first application envelope");
+    let first_encrypted =
+        crate::e2e::encrypt_application_envelope(crate::e2e::EncryptApplicationEnvelopeInput {
+            e2e: &alice_e2e,
+            application_envelope: &first_application_envelope,
+            recipient_device: &fixture.bob_device,
+            claimed_bundle: Some(&fixture.claimed_bundle),
+        })
+        .expect("encrypt first application envelope");
     alice_e2e = first_encrypted.e2e.clone();
     let first_transport_envelope = crate::e2e::build_encrypted_transport_envelope(
         &first_application_envelope,
         first_encrypted.payload,
         &fixture.alice_signing,
     );
-    let first_decrypted = crate::e2e::decrypt_application_envelope(crate::e2e::DecryptApplicationEnvelopeInput {
-        e2e: &bob_e2e,
-        receiver_did: &fixture.bob_did,
-        transport_envelope: &first_transport_envelope,
-        now: Some(1000),
-    })
-    .expect("decrypt first application envelope");
+    let first_decrypted =
+        crate::e2e::decrypt_application_envelope(crate::e2e::DecryptApplicationEnvelopeInput {
+            e2e: &bob_e2e,
+            receiver_did: &fixture.bob_did,
+            transport_envelope: &first_transport_envelope,
+            now: Some(1000),
+        })
+        .expect("decrypt first application envelope");
     bob_e2e = first_decrypted.e2e.clone();
 
     let second_application_envelope = signed_application_envelope(
@@ -1366,36 +1380,44 @@ fn rejects_session_message_with_tampered_ciphertext_before_application_delivery(
         "hello again",
         200,
     );
-    let second_encrypted = crate::e2e::encrypt_application_envelope(crate::e2e::EncryptApplicationEnvelopeInput {
-        e2e: &alice_e2e,
-        application_envelope: &second_application_envelope,
-        recipient_device: &fixture.bob_device,
-        claimed_bundle: None,
-    })
-    .expect("encrypt second application envelope");
+    let second_encrypted =
+        crate::e2e::encrypt_application_envelope(crate::e2e::EncryptApplicationEnvelopeInput {
+            e2e: &alice_e2e,
+            application_envelope: &second_application_envelope,
+            recipient_device: &fixture.bob_device,
+            claimed_bundle: None,
+        })
+        .expect("encrypt second application envelope");
     let mut payload = second_encrypted.payload.clone();
-    let mut session_message = match crate::e2e::decode_encrypted_application_envelope_payload(&payload)
-        .expect("decode encrypted payload")
-    {
-        crate::e2e::DecodedEncryptedApplicationMessage::Session(message) => message,
-        crate::e2e::DecodedEncryptedApplicationMessage::PreKey(_) => panic!("expected SESSION_MESSAGE"),
-    };
+    let mut session_message =
+        match crate::e2e::decode_encrypted_application_envelope_payload(&payload)
+            .expect("decode encrypted payload")
+        {
+            crate::e2e::DecodedEncryptedApplicationMessage::Session(message) => message,
+            crate::e2e::DecodedEncryptedApplicationMessage::PreKey(_) => {
+                panic!("expected SESSION_MESSAGE")
+            }
+        };
     let last = session_message.ciphertext.len() - 1;
     session_message.ciphertext[last] ^= 0x01;
-    payload.wire_message = bytes_to_hex(&encode_session_message(&session_message).expect("encode tampered session message"));
+    payload.wire_message = bytes_to_hex(
+        &encode_session_message(&session_message).expect("encode tampered session message"),
+    );
     let tampered_transport_envelope = crate::e2e::build_encrypted_transport_envelope(
         &second_application_envelope,
         payload,
         &fixture.alice_signing,
     );
 
-    let err = crate::e2e::decrypt_application_envelope(crate::e2e::DecryptApplicationEnvelopeInput {
-        e2e: &bob_e2e,
-        receiver_did: &fixture.bob_did,
-        transport_envelope: &tampered_transport_envelope,
-        now: Some(2000),
-    })
-    .err().expect("tampered ciphertext should fail");
+    let err =
+        crate::e2e::decrypt_application_envelope(crate::e2e::DecryptApplicationEnvelopeInput {
+            e2e: &bob_e2e,
+            receiver_did: &fixture.bob_did,
+            transport_envelope: &tampered_transport_envelope,
+            now: Some(2000),
+        })
+        .err()
+        .expect("tampered ciphertext should fail");
     assert!(err
         .to_string()
         .contains("Failed to decrypt with XChaCha20-Poly1305"));
@@ -1415,26 +1437,28 @@ fn rejects_session_message_with_tampered_ratchet_header_before_application_deliv
         "hello bob",
         100,
     );
-    let first_encrypted = crate::e2e::encrypt_application_envelope(crate::e2e::EncryptApplicationEnvelopeInput {
-        e2e: &alice_e2e,
-        application_envelope: &first_application_envelope,
-        recipient_device: &fixture.bob_device,
-        claimed_bundle: Some(&fixture.claimed_bundle),
-    })
-    .expect("encrypt first application envelope");
+    let first_encrypted =
+        crate::e2e::encrypt_application_envelope(crate::e2e::EncryptApplicationEnvelopeInput {
+            e2e: &alice_e2e,
+            application_envelope: &first_application_envelope,
+            recipient_device: &fixture.bob_device,
+            claimed_bundle: Some(&fixture.claimed_bundle),
+        })
+        .expect("encrypt first application envelope");
     alice_e2e = first_encrypted.e2e.clone();
     let first_transport_envelope = crate::e2e::build_encrypted_transport_envelope(
         &first_application_envelope,
         first_encrypted.payload,
         &fixture.alice_signing,
     );
-    let first_decrypted = crate::e2e::decrypt_application_envelope(crate::e2e::DecryptApplicationEnvelopeInput {
-        e2e: &bob_e2e,
-        receiver_did: &fixture.bob_did,
-        transport_envelope: &first_transport_envelope,
-        now: Some(1000),
-    })
-    .expect("decrypt first application envelope");
+    let first_decrypted =
+        crate::e2e::decrypt_application_envelope(crate::e2e::DecryptApplicationEnvelopeInput {
+            e2e: &bob_e2e,
+            receiver_did: &fixture.bob_did,
+            transport_envelope: &first_transport_envelope,
+            now: Some(1000),
+        })
+        .expect("decrypt first application envelope");
     bob_e2e = first_decrypted.e2e.clone();
 
     let second_application_envelope = signed_application_envelope(
@@ -1445,35 +1469,43 @@ fn rejects_session_message_with_tampered_ratchet_header_before_application_deliv
         "hello again",
         200,
     );
-    let second_encrypted = crate::e2e::encrypt_application_envelope(crate::e2e::EncryptApplicationEnvelopeInput {
-        e2e: &alice_e2e,
-        application_envelope: &second_application_envelope,
-        recipient_device: &fixture.bob_device,
-        claimed_bundle: None,
-    })
-    .expect("encrypt second application envelope");
+    let second_encrypted =
+        crate::e2e::encrypt_application_envelope(crate::e2e::EncryptApplicationEnvelopeInput {
+            e2e: &alice_e2e,
+            application_envelope: &second_application_envelope,
+            recipient_device: &fixture.bob_device,
+            claimed_bundle: None,
+        })
+        .expect("encrypt second application envelope");
     let mut payload = second_encrypted.payload.clone();
-    let mut session_message = match crate::e2e::decode_encrypted_application_envelope_payload(&payload)
-        .expect("decode encrypted payload")
-    {
-        crate::e2e::DecodedEncryptedApplicationMessage::Session(message) => message,
-        crate::e2e::DecodedEncryptedApplicationMessage::PreKey(_) => panic!("expected SESSION_MESSAGE"),
-    };
+    let mut session_message =
+        match crate::e2e::decode_encrypted_application_envelope_payload(&payload)
+            .expect("decode encrypted payload")
+        {
+            crate::e2e::DecodedEncryptedApplicationMessage::Session(message) => message,
+            crate::e2e::DecodedEncryptedApplicationMessage::PreKey(_) => {
+                panic!("expected SESSION_MESSAGE")
+            }
+        };
     session_message.message_number += 1;
-    payload.wire_message = bytes_to_hex(&encode_session_message(&session_message).expect("encode tampered session message"));
+    payload.wire_message = bytes_to_hex(
+        &encode_session_message(&session_message).expect("encode tampered session message"),
+    );
     let tampered_transport_envelope = crate::e2e::build_encrypted_transport_envelope(
         &second_application_envelope,
         payload,
         &fixture.alice_signing,
     );
 
-    let err = crate::e2e::decrypt_application_envelope(crate::e2e::DecryptApplicationEnvelopeInput {
-        e2e: &bob_e2e,
-        receiver_did: &fixture.bob_did,
-        transport_envelope: &tampered_transport_envelope,
-        now: Some(2000),
-    })
-    .err().expect("tampered ratchet header should fail");
+    let err =
+        crate::e2e::decrypt_application_envelope(crate::e2e::DecryptApplicationEnvelopeInput {
+            e2e: &bob_e2e,
+            receiver_did: &fixture.bob_did,
+            transport_envelope: &tampered_transport_envelope,
+            now: Some(2000),
+        })
+        .err()
+        .expect("tampered ratchet header should fail");
     assert!(err
         .to_string()
         .contains("Failed to decrypt with XChaCha20-Poly1305"));
@@ -1493,26 +1525,28 @@ fn rejects_replayed_session_message_after_ratchet_state_advances() {
         "hello bob",
         100,
     );
-    let first_encrypted = crate::e2e::encrypt_application_envelope(crate::e2e::EncryptApplicationEnvelopeInput {
-        e2e: &alice_e2e,
-        application_envelope: &first_application_envelope,
-        recipient_device: &fixture.bob_device,
-        claimed_bundle: Some(&fixture.claimed_bundle),
-    })
-    .expect("encrypt first application envelope");
+    let first_encrypted =
+        crate::e2e::encrypt_application_envelope(crate::e2e::EncryptApplicationEnvelopeInput {
+            e2e: &alice_e2e,
+            application_envelope: &first_application_envelope,
+            recipient_device: &fixture.bob_device,
+            claimed_bundle: Some(&fixture.claimed_bundle),
+        })
+        .expect("encrypt first application envelope");
     alice_e2e = first_encrypted.e2e.clone();
     let first_transport_envelope = crate::e2e::build_encrypted_transport_envelope(
         &first_application_envelope,
         first_encrypted.payload,
         &fixture.alice_signing,
     );
-    let first_decrypted = crate::e2e::decrypt_application_envelope(crate::e2e::DecryptApplicationEnvelopeInput {
-        e2e: &bob_e2e,
-        receiver_did: &fixture.bob_did,
-        transport_envelope: &first_transport_envelope,
-        now: Some(1000),
-    })
-    .expect("decrypt first application envelope");
+    let first_decrypted =
+        crate::e2e::decrypt_application_envelope(crate::e2e::DecryptApplicationEnvelopeInput {
+            e2e: &bob_e2e,
+            receiver_did: &fixture.bob_did,
+            transport_envelope: &first_transport_envelope,
+            now: Some(1000),
+        })
+        .expect("decrypt first application envelope");
     bob_e2e = first_decrypted.e2e.clone();
 
     let second_application_envelope = signed_application_envelope(
@@ -1523,33 +1557,37 @@ fn rejects_replayed_session_message_after_ratchet_state_advances() {
         "hello again",
         200,
     );
-    let second_encrypted = crate::e2e::encrypt_application_envelope(crate::e2e::EncryptApplicationEnvelopeInput {
-        e2e: &alice_e2e,
-        application_envelope: &second_application_envelope,
-        recipient_device: &fixture.bob_device,
-        claimed_bundle: None,
-    })
-    .expect("encrypt second application envelope");
+    let second_encrypted =
+        crate::e2e::encrypt_application_envelope(crate::e2e::EncryptApplicationEnvelopeInput {
+            e2e: &alice_e2e,
+            application_envelope: &second_application_envelope,
+            recipient_device: &fixture.bob_device,
+            claimed_bundle: None,
+        })
+        .expect("encrypt second application envelope");
     let second_transport_envelope = crate::e2e::build_encrypted_transport_envelope(
         &second_application_envelope,
         second_encrypted.payload,
         &fixture.alice_signing,
     );
-    let second_decrypted = crate::e2e::decrypt_application_envelope(crate::e2e::DecryptApplicationEnvelopeInput {
-        e2e: &bob_e2e,
-        receiver_did: &fixture.bob_did,
-        transport_envelope: &second_transport_envelope,
-        now: Some(2000),
-    })
-    .expect("decrypt second application envelope");
+    let second_decrypted =
+        crate::e2e::decrypt_application_envelope(crate::e2e::DecryptApplicationEnvelopeInput {
+            e2e: &bob_e2e,
+            receiver_did: &fixture.bob_did,
+            transport_envelope: &second_transport_envelope,
+            now: Some(2000),
+        })
+        .expect("decrypt second application envelope");
 
-    let err = crate::e2e::decrypt_application_envelope(crate::e2e::DecryptApplicationEnvelopeInput {
-        e2e: &second_decrypted.e2e,
-        receiver_did: &fixture.bob_did,
-        transport_envelope: &second_transport_envelope,
-        now: Some(3000),
-    })
-    .err().expect("replayed session message should fail");
+    let err =
+        crate::e2e::decrypt_application_envelope(crate::e2e::DecryptApplicationEnvelopeInput {
+            e2e: &second_decrypted.e2e,
+            receiver_did: &fixture.bob_did,
+            transport_envelope: &second_transport_envelope,
+            now: Some(3000),
+        })
+        .err()
+        .expect("replayed session message should fail");
     assert!(err
         .to_string()
         .contains("Failed to decrypt with XChaCha20-Poly1305"));

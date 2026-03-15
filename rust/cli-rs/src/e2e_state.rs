@@ -137,10 +137,13 @@ async fn acquire_process_lock() -> Result<()> {
                 }
 
                 if tokio::time::Instant::now() >= deadline {
-                    anyhow::bail!("Timed out acquiring local E2E state lock at {}", path.display());
+                    anyhow::bail!(
+                        "Timed out acquiring local E2E state lock at {}",
+                        path.display()
+                    );
                 }
 
-                let jitter = (now_ms() % LOCK_RETRY_JITTER_MS.max(1)) as u64;
+                let jitter = now_ms() % LOCK_RETRY_JITTER_MS.max(1);
                 tokio::time::sleep(Duration::from_millis(LOCK_RETRY_BASE_MS + jitter)).await;
             }
             Err(error) => {

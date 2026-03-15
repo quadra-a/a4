@@ -45,13 +45,16 @@ pub async fn run(opts: PublishOptions) -> Result<()> {
     save_config(&config)?;
 
     if opts.json {
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-            "relay": relay_url,
-            "agentDid": card.did,
-            "agentName": card.name,
-            "status": status,
-            "discoverable": status == "published" || status == "updated",
-        }))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "relay": relay_url,
+                "agentDid": card.did,
+                "agentName": card.name,
+                "status": status,
+                "discoverable": status == "published" || status == "updated",
+            }))?
+        );
         return Ok(());
     }
 
