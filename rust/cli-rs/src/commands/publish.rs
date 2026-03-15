@@ -6,6 +6,7 @@ use anyhow::Result;
 
 pub struct PublishOptions {
     pub relay: Option<String>,
+    pub json: bool,
     pub human: bool,
 }
 
@@ -17,7 +18,7 @@ pub async fn run(opts: PublishOptions) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("No identity found. Run `agent listen` to create one."))?;
 
     let keypair = KeyPair::from_hex(&identity.private_key)?;
-    let card = crate::commands::discover::build_card(&config, identity)?;
+    let card = crate::config::build_card(&config, identity)?;
     let (mut session, relay_url) = connect_first_available(
         opts.relay.as_deref(),
         Some(&config),
@@ -42,6 +43,17 @@ pub async fn run(opts: PublishOptions) -> Result<()> {
 
     config.published = Some(true);
     save_config(&config)?;
+
+    if opts.json {
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "relay": relay_url,
+            "agentDid": card.did,
+            "agentName": card.name,
+            "status": status,
+            "discoverable": status == "published" || status == "updated",
+        }))?);
+        return Ok(());
+    }
 
     if opts.human {
         match status {

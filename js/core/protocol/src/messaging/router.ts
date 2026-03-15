@@ -1,7 +1,7 @@
 import type { MessageEnvelope } from './envelope.js';
 import type { RelayClient } from '../transport/relay-client.js';
 import { encodeMessage, decodeMessage } from './codec.js';
-import { validateEnvelope, verifyEnvelope } from './envelope.js';
+import { getEnvelopeSignaturePayloads, validateEnvelope, verifyEnvelope } from './envelope.js';
 import { createLogger } from '../utils/logger.js';
 import { MessagingError } from '../utils/errors.js';
 import { extractPublicKey } from '../identity/did.js';
@@ -96,9 +96,16 @@ export function createMessageRouter(
 
           try {
             const { signature, ...envelopeWithoutSig } = envelope;
-            const dataBytes = new TextEncoder().encode(JSON.stringify(envelopeWithoutSig));
             const signatureBytes = Buffer.from(signature, 'hex');
-            const hookValid = await verifyFn(signatureBytes, dataBytes);
+            let hookValid = false;
+
+            for (const dataBytes of getEnvelopeSignaturePayloads(envelopeWithoutSig)) {
+              if (await verifyFn(signatureBytes, dataBytes)) {
+                hookValid = true;
+                break;
+              }
+            }
+
             if (!hookValid) {
               logger.warn('Message rejected by custom verifier', {
                 id: envelope.id,

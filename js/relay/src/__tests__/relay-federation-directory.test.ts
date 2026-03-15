@@ -19,6 +19,7 @@ function createCaptureWs() {
   const sent: any[] = [];
   return {
     sent,
+    readyState: 1,
     send(payload: Uint8Array) {
       sent.push(decodeCBOR(payload));
     },

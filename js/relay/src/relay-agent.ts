@@ -3,6 +3,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { AgentRegistry } from './registry.js';
 import { HeartbeatTracker } from './heartbeat.js';
 import { MessageQueue } from './queue.js';
+import { PreKeyStore } from './prekey-store.js';
 import { SubscriptionManager } from './subscription-manager.js';
 import { EndorsementIndex } from './endorsement-index.js';
 import { TokenStore } from './token-store.js';
@@ -31,6 +32,8 @@ import type {
   HelloMessage,
   PingMessage,
   PublishCardMessage,
+  PublishPreKeysMessage,
+  FetchPreKeyBundleMessage,
   RelayMessage,
   SendMessage,
   SubscribeMessage,
@@ -47,6 +50,7 @@ export class RelayAgent {
   private registry = new AgentRegistry();
   private heartbeat: HeartbeatTracker;
   private queue: MessageQueue | null = null;
+  private preKeyStore: PreKeyStore | null = null;
   private wsToDidMap = new Map<WebSocket, string>();
   private subscriptions = new SubscriptionManager();
   private endorsements: EndorsementIndex;
@@ -89,6 +93,9 @@ export class RelayAgent {
     this.queue = new MessageQueue({ storagePath: this.config.storagePath });
     await this.queue.start();
 
+    this.preKeyStore = new PreKeyStore({ storagePath: `${this.config.storagePath}/prekeys` });
+    await this.preKeyStore.start();
+
     if (this.config.privateRelay || this.config.operatorPublicKey) {
       this.tokenStore = new TokenStore(`${this.config.storagePath}/tokens.json`);
       this.revocationList = new RevocationList(`${this.config.storagePath}/revoked.json`);
@@ -109,7 +116,7 @@ export class RelayAgent {
         failedHandshakeWindowMs: this.config.federationFailedHandshakeWindowMs,
         failedHandshakeThreshold: this.config.federationFailedHandshakeThreshold,
         failedHandshakeQuarantineMs: this.config.federationFailedHandshakeQuarantineMs,
-      });
+      }, this.preKeyStore);
       await this.federationManager.start();
     }
 
@@ -196,6 +203,11 @@ export class RelayAgent {
       this.queue = null;
     }
 
+    if (this.preKeyStore) {
+      await this.preKeyStore.stop();
+      this.preKeyStore = null;
+    }
+
     if (this.wss) {
       for (const client of this.wss.clients) {
         client.close();
@@ -217,6 +229,7 @@ export class RelayAgent {
       registry: this.registry,
       heartbeat: this.heartbeat,
       queue: this.queue,
+      preKeyStore: this.preKeyStore,
       wsToDidMap: this.wsToDidMap,
       subscriptions: this.subscriptions,
       endorsements: this.endorsements,
@@ -278,6 +291,12 @@ export class RelayAgent {
         break;
       case 'UNPUBLISH_CARD':
         await this.handleUnpublishCard(did);
+        break;
+      case 'PUBLISH_PREKEYS':
+        await this.handlePublishPreKeys(ws, did, msg as PublishPreKeysMessage);
+        break;
+      case 'FETCH_PREKEY_BUNDLE':
+        await this.handleFetchPreKeyBundle(ws, did, msg as FetchPreKeyBundleMessage);
         break;
       case 'GOODBYE':
         ws.close();
@@ -412,6 +431,14 @@ export class RelayAgent {
 
   private async handleUnpublishCard(did: string): Promise<void> {
     await clientHandlers.handleUnpublishCard(this.getRuntime(), did);
+  }
+
+  private async handlePublishPreKeys(ws: WebSocket, did: string, msg: PublishPreKeysMessage): Promise<void> {
+    await clientHandlers.handlePublishPreKeys(this.getRuntime(), ws, did, msg);
+  }
+
+  private async handleFetchPreKeyBundle(ws: WebSocket, did: string, msg: FetchPreKeyBundleMessage): Promise<void> {
+    await clientHandlers.handleFetchPreKeyBundle(this.getRuntime(), ws, did, msg);
   }
 
   private async retryUnackedMessages(): Promise<void> {

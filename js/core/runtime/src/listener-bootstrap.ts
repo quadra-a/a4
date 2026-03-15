@@ -11,6 +11,7 @@ import {
   setPublished,
   setRelayInviteToken,
 } from './config.js';
+import { ensurePersistedE2EConfig } from './e2e-config.js';
 import {
   getDaemonStatus,
   restartDaemon,
@@ -98,6 +99,11 @@ export async function prepareListenerState(
 
   if (!identity) {
     throw new Error('Failed to create local identity');
+  }
+
+  const { created: createdE2EConfig } = await ensurePersistedE2EConfig(identity);
+  if (createdE2EConfig) {
+    configChanged = true;
   }
 
   if (options.discoverable) {

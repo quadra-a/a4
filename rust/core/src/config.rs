@@ -1,3 +1,4 @@
+use crate::e2e::LocalE2EConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -5,6 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     pub identity: Option<IdentityConfig>,
+    #[serde(default, rename = "deviceIdentity")]
+    pub device_identity: Option<DeviceIdentityConfig>,
     #[serde(rename = "agentCard")]
     pub agent_card: Option<AgentCardConfig>,
     #[serde(default)]
@@ -17,6 +20,8 @@ pub struct Config {
     pub trust_config: Option<TrustConfig>,
     #[serde(default, rename = "reachabilityPolicy")]
     pub reachability_policy: Option<ReachabilityPolicy>,
+    #[serde(default)]
+    pub e2e: Option<LocalE2EConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -52,6 +57,13 @@ pub struct IdentityConfig {
     pub public_key: String,
     #[serde(rename = "privateKey")]
     pub private_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeviceIdentityConfig {
+    pub seed: String,
+    #[serde(rename = "deviceId")]
+    pub device_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -422,4 +434,87 @@ pub fn endorsement_cache_key(endorsement: &EndorsementV2) -> String {
         endorsement.domain.as_deref().unwrap_or("*"),
         endorsement.endorsement_type
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+    use crate::e2e::ensure_local_e2e_config;
+    use crate::identity::{derive_did, KeyPair};
+    use serde_json::json;
+
+    #[test]
+    fn parses_empty_e2e_config_and_rebuilds_valid_state() {
+        let keypair = KeyPair::generate();
+        let did = derive_did(keypair.verifying_key.as_bytes());
+        let mut config: Config = serde_json::from_value(json!({
+            "identity": {
+                "did": did,
+                "publicKey": keypair.public_key_hex(),
+                "privateKey": keypair.private_key_hex(),
+            },
+            "e2e": {}
+        }))
+        .expect("config parses");
+
+        assert!(config.e2e.as_ref().is_some_and(|e2e| !e2e.is_valid()));
+
+        let created = ensure_local_e2e_config(&mut config).expect("e2e config rebuilt");
+        assert!(created);
+        assert!(config.e2e.as_ref().is_some_and(|e2e| e2e.is_valid()));
+        assert!(config
+            .device_identity
+            .as_ref()
+            .is_some_and(|device_identity| !device_identity.seed.is_empty()
+                && !device_identity.device_id.is_empty()));
+    }
+
+    #[test]
+    fn backfills_device_identity_from_existing_device_id() {
+        let keypair = KeyPair::generate();
+        let did = derive_did(keypair.verifying_key.as_bytes());
+        let device_id = "device-existing".to_string();
+        let mut config: Config = serde_json::from_value(json!({
+            "identity": {
+                "did": did,
+                "publicKey": keypair.public_key_hex(),
+                "privateKey": keypair.private_key_hex(),
+            },
+            "e2e": {
+                "currentDeviceId": device_id,
+                "devices": {
+                    "device-existing": {
+                        "deviceId": "device-existing",
+                        "createdAt": 1,
+                        "identityKey": {
+                            "publicKey": "11",
+                            "privateKey": "22"
+                        },
+                        "signedPreKey": {
+                            "signedPreKeyId": 1,
+                            "publicKey": "33",
+                            "privateKey": "44",
+                            "signature": "55",
+                            "createdAt": 1
+                        },
+                        "oneTimePreKeys": [],
+                        "lastResupplyAt": 1,
+                        "sessions": {}
+                    }
+                }
+            }
+        }))
+        .expect("config parses");
+
+        let created = ensure_local_e2e_config(&mut config).expect("device identity backfilled");
+        assert!(!created);
+        assert_eq!(
+            config
+                .device_identity
+                .as_ref()
+                .expect("device identity present")
+                .device_id,
+            "device-existing"
+        );
+    }
 }

@@ -4,6 +4,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::{sleep, Duration};
 
 use quadra_a_core::config::{IdentityConfig, ReachabilityMode};
+use quadra_a_core::e2e::PublishedPreKeyBundle;
 use quadra_a_core::identity::KeyPair;
 use quadra_a_core::protocol::AgentCard;
 
@@ -75,6 +76,7 @@ pub struct RelayWorkerOptions {
     pub identity: IdentityConfig,
     pub card: AgentCard,
     pub invite_token: Option<String>,
+    pub prekey_bundles: Vec<PublishedPreKeyBundle>,
     pub should_publish: bool,
     pub relay_discovery_capability: String,
     pub maintenance_interval: Duration,
@@ -88,6 +90,7 @@ impl RelayWorkerOptions {
             identity,
             card,
             invite_token,
+            prekey_bundles: Vec::new(),
             should_publish: false,
             relay_discovery_capability: DEFAULT_RELAY_DISCOVERY_CAPABILITY.to_string(),
             maintenance_interval: Duration::from_secs(DEFAULT_RELAY_MAINTENANCE_INTERVAL_SECS),
@@ -156,6 +159,24 @@ async fn connect_managed_session(
         {
             Ok(mut session) => {
                 clear_failure(relay_state, event_tx, &relay_url).await;
+                if !options.prekey_bundles.is_empty() {
+                    if let Err(error) = session
+                        .publish_prekey_bundles(&options.prekey_bundles)
+                        .await
+                    {
+                        record_failure(
+                            relay_state,
+                            event_tx,
+                            &relay_url,
+                            format!("pre-key publish failed: {}", error),
+                        )
+                        .await;
+                        let _ = session.goodbye().await;
+                        errors.push(format!("{}: pre-key publish failed: {}", relay_url, error));
+                        continue;
+                    }
+                }
+
                 if options.should_publish {
                     if let Err(error) = session.publish_card().await {
                         record_failure(

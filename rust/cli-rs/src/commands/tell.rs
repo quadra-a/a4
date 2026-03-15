@@ -4,32 +4,42 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 use crate::commands::message_lifecycle::{
-    envelope_payload, find_message_outcome, MessageOutcome, MessageOutcomeKind,
-    MessageOutcomeTracker,
+    envelope_payload, MessageOutcome, MessageOutcomeKind, MessageOutcomeTracker,
 };
-use crate::config::load_config;
+use crate::config::{load_config, save_config};
 use crate::daemon::{daemon_socket_path, DaemonClient};
 use crate::identity::KeyPair;
-use crate::protocol::{cbor_decode_value, cbor_x_encode_json, Envelope, EnvelopeUnsigned};
+use crate::protocol::{cbor_decode_value, Envelope, EnvelopeUnsigned};
 use crate::relay::{connect_first_available, RelaySession};
 use crate::ui::LlmFormatter;
+use quadra_a_core::e2e::{ensure_local_e2e_config, E2E_APPLICATION_ENVELOPE_PROTOCOL};
+use quadra_a_runtime::e2e_receive::prepare_encrypted_receive;
+use quadra_a_runtime::e2e_send::prepare_encrypted_sends_with_session;
 
 pub struct TellOptions {
     pub target: String,
     pub message: Option<String>,
     pub payload: Option<String>,
     pub protocol: String,
+    pub protocol_explicit: bool,
     pub reply_to: Option<String>,
     pub thread: Option<String>,
     pub new_thread: bool,
     pub wait: Option<Option<u64>>,
     pub relay: Option<String>,
+    pub json: bool,
     pub human: bool,
 }
 
-struct EnvelopeThreading {
-    reply_to: Option<String>,
-    thread_id: Option<String>,
+pub(crate) struct EnvelopeThreading {
+    pub reply_to: Option<String>,
+    pub thread_id: Option<String>,
+}
+
+impl EnvelopeThreading {
+    pub(crate) fn new(reply_to: Option<String>, thread_id: Option<String>) -> Self {
+        Self { reply_to, thread_id }
+    }
 }
 
 struct WaitOutcomeDisplay<'a> {
@@ -43,7 +53,9 @@ struct WaitOutcomeDisplay<'a> {
 }
 
 pub async fn run(opts: TellOptions) -> Result<()> {
-    let config = load_config()?;
+    let mut config = load_config()?;
+    ensure_local_e2e_config(&mut config)?;
+
     let identity = config
         .identity
         .as_ref()
@@ -61,10 +73,41 @@ pub async fn run(opts: TellOptions) -> Result<()> {
             .await?;
     let recipient_did = resolved_target.did.clone();
 
+    // Auto-detect protocol from Agent Card if not explicitly set
+    let effective_protocol = if !opts.protocol_explicit && opts.protocol == "/agent/msg/1.0.0" {
+        if let Some(card) = &resolved_target.agent {
+            extract_primary_protocol(card).unwrap_or_else(|| opts.protocol.clone())
+        } else if daemon_status.is_some() {
+            // Try querying the card via daemon
+            match daemon.send_command("query-card", json!({"did": &recipient_did})).await {
+                Ok(response) => {
+                    if let Some(card_value) = response.get("card") {
+                        if let Ok(card) = serde_json::from_value::<crate::protocol::AgentCard>(card_value.clone()) {
+                            extract_primary_protocol(&card).unwrap_or_else(|| opts.protocol.clone())
+                        } else {
+                            opts.protocol.clone()
+                        }
+                    } else {
+                        opts.protocol.clone()
+                    }
+                }
+                Err(_) => opts.protocol.clone(),
+            }
+        } else {
+            opts.protocol.clone()
+        }
+    } else {
+        opts.protocol.clone()
+    };
+
     let payload: Value = if let Some(payload) = &opts.payload {
         serde_json::from_str(payload).unwrap_or_else(|_| json!({ "text": payload }))
     } else if let Some(message) = &opts.message {
-        json!({ "text": message })
+        if effective_protocol == "/shell/exec/1.0.0" {
+            json!({ "command": message })
+        } else {
+            json!({ "text": message })
+        }
     } else {
         bail!("Provide a message or --payload");
     };
@@ -96,7 +139,7 @@ pub async fn run(opts: TellOptions) -> Result<()> {
         let mut params = json!({
             "to": recipient_did,
             "type": "message",
-            "protocol": opts.protocol,
+            "protocol": effective_protocol,
             "payload": payload,
         });
 
@@ -111,7 +154,8 @@ pub async fn run(opts: TellOptions) -> Result<()> {
         match daemon.send_command("send", params).await {
             Ok(response) => {
                 let message_id = response
-                    .get("messageId")
+                    .get("id")
+                    .or_else(|| response.get("messageId"))
                     .and_then(|value| value.as_str())
                     .unwrap_or("unknown");
 
@@ -127,6 +171,27 @@ pub async fn run(opts: TellOptions) -> Result<()> {
                     let outcome =
                         wait_for_message_outcome_via_daemon(&daemon, message_id, timeout_secs)
                             .await?;
+
+                    if opts.json {
+                        println!("{}", serde_json::to_string_pretty(&json!({
+                            "messageId": message_id,
+                            "to": recipient_did,
+                            "protocol": effective_protocol,
+                            "payload": payload,
+                            "threadId": thread_id,
+                            "waitSeconds": timeout_secs,
+                            "result": outcome.as_ref().map(|o| json!({
+                                "kind": o.kind.as_str(),
+                                "status": o.status,
+                                "jobId": o.job_id,
+                                "terminal": o.terminal,
+                            })),
+                            "timedOut": outcome.is_none(),
+                        }))?);
+                        if outcome.is_none() { std::process::exit(1); }
+                        return Ok(());
+                    }
+
                     let trace_hint = format!("agent trace {}", message_id);
                     render_wait_outcome(
                         opts.human,
@@ -134,7 +199,7 @@ pub async fn run(opts: TellOptions) -> Result<()> {
                         WaitOutcomeDisplay {
                             message_id,
                             recipient_did: &recipient_did,
-                            protocol: &opts.protocol,
+                            protocol: &effective_protocol,
                             payload: &payload,
                             thread_id: thread_id.as_deref(),
                             timeout_secs,
@@ -145,6 +210,15 @@ pub async fn run(opts: TellOptions) -> Result<()> {
                     if outcome.is_none() {
                         std::process::exit(1);
                     }
+                } else if opts.json {
+                    println!("{}", serde_json::to_string_pretty(&json!({
+                        "messageId": message_id,
+                        "to": recipient_did,
+                        "protocol": effective_protocol,
+                        "payload": payload,
+                        "threadId": thread_id,
+                        "status": "accepted_locally",
+                    }))?);
                 } else if opts.human {
                     println!("Message accepted locally via daemon ({})", message_id);
                     if let Some(thread_id) = &thread_id {
@@ -155,7 +229,7 @@ pub async fn run(opts: TellOptions) -> Result<()> {
                     LlmFormatter::section("Message Sent");
                     LlmFormatter::key_value("Message ID", message_id);
                     LlmFormatter::key_value("To", &recipient_did);
-                    LlmFormatter::key_value("Protocol", &opts.protocol);
+                    LlmFormatter::key_value("Protocol", &effective_protocol);
                     LlmFormatter::key_value("Type", "message");
                     LlmFormatter::key_value("Payload", &payload.to_string());
                     if let Some(thread_id) = &thread_id {
@@ -168,18 +242,24 @@ pub async fn run(opts: TellOptions) -> Result<()> {
                 return Ok(());
             }
             Err(error) => {
-                if opts.human {
-                    eprintln!(
-                        "Daemon send failed ({}), falling back to direct relay",
-                        error
-                    );
+                if opts.json {
+                    println!("{}", serde_json::to_string_pretty(&json!({
+                        "error": format!("{}", error),
+                        "to": recipient_did,
+                        "protocol": effective_protocol,
+                        "payload": payload,
+                        "threadId": thread_id,
+                        "status": "send_failed",
+                    }))?);
+                    std::process::exit(1);
                 }
+                bail!("Daemon send failed: {}. Stop daemon first for direct relay mode: a4 stop", error);
             }
         }
     }
 
     let keypair = KeyPair::from_hex(&identity.private_key)?;
-    let card = crate::commands::discover::build_card(&config, identity)?;
+    let card = crate::config::build_card(&config, identity)?;
     if opts.human {
         eprintln!("Connecting to configured relays...");
     }
@@ -200,7 +280,7 @@ pub async fn run(opts: TellOptions) -> Result<()> {
         &identity.did,
         &recipient_did,
         "message",
-        &opts.protocol,
+        &effective_protocol,
         payload.clone(),
         EnvelopeThreading {
             reply_to: opts.reply_to.clone(),
@@ -208,91 +288,152 @@ pub async fn run(opts: TellOptions) -> Result<()> {
         },
         &keypair,
     )?;
-    let envelope_json = serde_json::to_value(&envelope)?;
-    let envelope_bytes = cbor_x_encode_json(&envelope_json);
+    let prepared =
+        prepare_encrypted_sends_with_session(&mut session, &config, &keypair, envelope).await?;
+    config = prepared.config.clone();
+    save_config(&config)?;
 
-    session
-        .send_envelope(&recipient_did, envelope_bytes)
-        .await?;
+    for target in &prepared.targets {
+        session
+            .send_envelope(&recipient_did, target.outer_envelope_bytes.clone())
+            .await?;
+    }
 
     if let Some(timeout_secs) = wait_timeout_secs {
         if opts.human {
-            println!("Message ID: {}", envelope.id);
+            println!("Message ID: {}", prepared.application_envelope.id);
             println!(
                 "Message sent, waiting for result ({}s timeout)...",
                 timeout_secs
             );
         }
 
-        let outcome =
-            wait_for_message_outcome_via_relay(&mut session, &envelope.id, timeout_secs).await?;
+        let outcome = wait_for_message_outcome_via_relay(
+            &mut session,
+            &mut config,
+            &prepared.application_envelope.id,
+            timeout_secs,
+        )
+        .await?;
         session.goodbye().await?;
 
-        render_wait_outcome(
-            opts.human,
-            outcome.as_ref(),
-            WaitOutcomeDisplay {
-                message_id: &envelope.id,
-                recipient_did: &recipient_did,
-                protocol: &opts.protocol,
-                payload: &payload,
-                thread_id: thread_id.as_deref(),
-                timeout_secs,
-                timeout_hint: Some(
-                    "This send used direct relay mode, so daemon-backed trace data is unavailable.",
-                ),
-            },
-        );
+        if opts.json {
+            println!("{}", serde_json::to_string_pretty(&json!({
+                "messageId": prepared.application_envelope.id,
+                "to": recipient_did,
+                "protocol": effective_protocol,
+                "payload": payload,
+                "threadId": thread_id,
+                "waitSeconds": timeout_secs,
+                "result": outcome.as_ref().map(|o| json!({
+                    "kind": o.kind.as_str(),
+                    "status": o.status,
+                    "jobId": o.job_id,
+                    "terminal": o.terminal,
+                })),
+                "timedOut": outcome.is_none(),
+            }))?);
+            if outcome.is_none() { std::process::exit(1); }
+        } else {
+            render_wait_outcome(
+                opts.human,
+                outcome.as_ref(),
+                WaitOutcomeDisplay {
+                    message_id: &prepared.application_envelope.id,
+                    recipient_did: &recipient_did,
+                    protocol: &effective_protocol,
+                    payload: &payload,
+                    thread_id: thread_id.as_deref(),
+                    timeout_secs,
+                    timeout_hint: Some(
+                        "This send used direct relay mode, so daemon-backed trace data is unavailable.",
+                    ),
+                },
+            );
 
-        if outcome.is_none() {
-            std::process::exit(1);
+            if outcome.is_none() {
+                std::process::exit(1);
+            }
         }
     } else {
-        match session.wait_delivery_report().await {
-            Ok(status) => {
-                session.goodbye().await?;
-                if opts.human {
-                    match status.as_str() {
-                        "delivered" => {
-                            println!("Relay handoff reported delivered");
-                            if let Some(thread_id) = &thread_id {
-                                println!("Thread: {}", thread_id);
-                            }
-                            println!("Remote execution is still unknown until a reply or result arrives.");
-                        }
-                        "queue_full" => bail!("Relay queue full for recipient"),
-                        "unknown_recipient" => bail!("Recipient not found on relay"),
-                        other => println!("Delivery status: {}", other),
+        let mut final_status = String::from("delivered");
+        for _ in 0..prepared.targets.len() {
+            match session.wait_delivery_report().await {
+                Ok(status) => match status.as_str() {
+                    "accepted" => final_status = "accepted".to_string(),
+                    "delivered" => {}
+                    "queue_full" => bail!("Relay queue full for recipient"),
+                    "unknown_recipient" => bail!("Recipient not found on relay"),
+                    other => final_status = other.to_string(),
+                },
+                Err(error) => {
+                    if opts.human {
+                        eprintln!("Warning: no delivery report received ({})", error);
                     }
-                } else {
-                    LlmFormatter::section("Message Sent");
-                    LlmFormatter::key_value("Message ID", &envelope.id);
-                    LlmFormatter::key_value("To", &recipient_did);
-                    LlmFormatter::key_value("Protocol", &opts.protocol);
-                    LlmFormatter::key_value("Type", "message");
-                    LlmFormatter::key_value("Payload", &payload.to_string());
+                    session.goodbye().await?;
+                    return Ok(());
+                }
+            }
+        }
+        session.goodbye().await?;
+
+        if opts.json {
+            println!("{}", serde_json::to_string_pretty(&json!({
+                "messageId": prepared.application_envelope.id,
+                "to": recipient_did,
+                "protocol": effective_protocol,
+                "payload": payload,
+                "threadId": thread_id,
+                "status": final_status,
+                "relayDelivered": final_status == "delivered",
+            }))?);
+        } else if opts.human {
+            match final_status.as_str() {
+                "accepted" => {
+                    println!("Relay accepted message for delivery");
                     if let Some(thread_id) = &thread_id {
-                        LlmFormatter::key_value("Thread ID", thread_id);
+                        println!("Thread: {}", thread_id);
                     }
-                    LlmFormatter::key_value(
-                        "Relay Delivered",
-                        if status == "delivered" {
-                            "true"
-                        } else {
-                            "false"
-                        },
-                    );
-                    LlmFormatter::key_value("Status", &status);
-                    LlmFormatter::key_value("Execution State", "unknown_without_result");
-                    println!();
+                    println!("Remote delivery and execution are still unknown until a reply or result arrives.");
                 }
-            }
-            Err(error) => {
-                if opts.human {
-                    eprintln!("Warning: no delivery report received ({})", error);
+                "delivered" => {
+                    println!("Relay handoff reported delivered");
+                    if let Some(thread_id) = &thread_id {
+                        println!("Thread: {}", thread_id);
+                    }
+                    println!("Remote execution is still unknown until a reply or result arrives.");
                 }
-                session.goodbye().await?;
+                other => println!("Delivery status: {}", other),
             }
+        } else {
+            LlmFormatter::section("Message Sent");
+            LlmFormatter::key_value("Message ID", &prepared.application_envelope.id);
+            LlmFormatter::key_value("To", &recipient_did);
+            LlmFormatter::key_value("Protocol", &effective_protocol);
+            LlmFormatter::key_value("Type", "message");
+            LlmFormatter::key_value("Payload", &payload.to_string());
+            if let Some(thread_id) = &thread_id {
+                LlmFormatter::key_value("Thread ID", thread_id);
+            }
+            LlmFormatter::key_value(
+                "Relay Delivered",
+                if final_status == "delivered" {
+                    "true"
+                } else {
+                    "false"
+                },
+            );
+            LlmFormatter::key_value(
+                "Relay Accepted",
+                if final_status == "accepted" || final_status == "delivered" {
+                    "true"
+                } else {
+                    "false"
+                },
+            );
+            LlmFormatter::key_value("Status", &final_status);
+            LlmFormatter::key_value("Execution State", "unknown_without_result");
+            println!();
         }
     }
 
@@ -308,7 +449,7 @@ fn generate_thread_id() -> String {
     format!("thread_{}_{}", timestamp, random)
 }
 
-fn build_envelope(
+pub(crate) fn build_envelope(
     from: &str,
     to: &str,
     msg_type: &str,
@@ -338,6 +479,7 @@ fn build_envelope(
         timestamp,
         reply_to: threading.reply_to,
         thread_id: threading.thread_id,
+        group_id: None,
     };
 
     Ok(unsigned.sign(keypair))
@@ -348,8 +490,13 @@ async fn wait_for_message_outcome_via_daemon(
     message_id: &str,
     timeout_secs: u64,
 ) -> Result<Option<MessageOutcome>> {
+    use std::collections::HashSet;
+    use crate::commands::message_lifecycle::{message_id as get_message_id, sort_messages_by_timestamp};
+
     let start_time = SystemTime::now();
     let timeout_duration = Duration::from_secs(timeout_secs);
+    let mut tracker = MessageOutcomeTracker::new(message_id);
+    let mut seen_ids: HashSet<String> = HashSet::new();
 
     loop {
         if start_time.elapsed().unwrap_or_default() > timeout_duration {
@@ -366,9 +513,21 @@ async fn wait_for_message_outcome_via_daemon(
                 .and_then(|messages| messages.as_array())
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
-            if let Some(outcome) = find_message_outcome(messages, message_id) {
-                if outcome.terminal {
-                    return Ok(Some(outcome));
+
+            // Sort messages by timestamp and process only new ones
+            for message in sort_messages_by_timestamp(messages) {
+                if let Some(id) = get_message_id(&message) {
+                    let id_string = id.to_string();
+                    if seen_ids.contains(&id_string) {
+                        continue;
+                    }
+                    seen_ids.insert(id_string);
+                }
+
+                if let Some(outcome) = tracker.observe(&message) {
+                    if outcome.terminal {
+                        return Ok(Some(outcome));
+                    }
                 }
             }
         }
@@ -379,6 +538,7 @@ async fn wait_for_message_outcome_via_daemon(
 
 async fn wait_for_message_outcome_via_relay(
     session: &mut RelaySession,
+    config: &mut crate::config::Config,
     message_id: &str,
     timeout_secs: u64,
 ) -> Result<Option<MessageOutcome>> {
@@ -414,6 +574,36 @@ async fn wait_for_message_outcome_via_relay(
             object
                 .entry("from".to_string())
                 .or_insert_with(|| json!(from));
+        }
+
+        // If the envelope is E2E encrypted, decrypt it
+        if envelope.get("protocol").and_then(|v| v.as_str()) == Some(E2E_APPLICATION_ENVELOPE_PROTOCOL) {
+            let transport_envelope: Envelope = match serde_json::from_value(envelope.clone()) {
+                Ok(e) => e,
+                Err(err) => {
+                    eprintln!("Skipping E2E envelope with invalid structure: {}", err);
+                    continue;
+                }
+            };
+            match prepare_encrypted_receive(config, &transport_envelope) {
+                Ok(decrypted) => {
+                    *config = decrypted.config;
+                    if let Err(err) = save_config(config) {
+                        eprintln!("Failed to persist E2E state after decryption: {}", err);
+                    }
+                    envelope = match serde_json::to_value(&decrypted.application_envelope) {
+                        Ok(v) => v,
+                        Err(err) => {
+                            eprintln!("Skipping decrypted envelope due to serialization failure: {}", err);
+                            continue;
+                        }
+                    };
+                }
+                Err(err) => {
+                    eprintln!("Failed to decrypt E2E envelope: {}", err);
+                    continue;
+                }
+            }
         }
 
         let inbound_message = json!({
@@ -539,7 +729,7 @@ fn render_human_wait_outcome(
     }
 
     eprintln!("No result within {}s", timeout_secs);
-    eprintln!("This timeout does not prove remote execution failed.");
+    eprintln!("Check inbox for late results: a4 inbox --limit 5");
     if let Some(timeout_hint) = timeout_hint {
         eprintln!("{}", timeout_hint);
     }
@@ -547,4 +737,26 @@ fn render_human_wait_outcome(
 
 fn outcome_payload(outcome: &MessageOutcome) -> Option<&Value> {
     envelope_payload(&outcome.message)
+}
+
+fn extract_primary_protocol(card: &crate::protocol::AgentCard) -> Option<String> {
+    // 1) Check capabilities for explicit metadata.protocol
+    for capability in &card.capabilities {
+        if let Some(metadata) = &capability.metadata {
+            if let Some(protocol) = metadata.get("protocol").and_then(|v| v.as_str()) {
+                return Some(protocol.to_string());
+            }
+        }
+    }
+
+    // 2) Infer protocol from well-known capability IDs
+    for capability in &card.capabilities {
+        match capability.id.as_str() {
+            "shell/exec" => return Some("/shell/exec/1.0.0".to_string()),
+            "gpu/compute" => return Some("/shell/exec/1.0.0".to_string()),
+            _ => {}
+        }
+    }
+
+    None
 }

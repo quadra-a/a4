@@ -1,0 +1,21 @@
+{
+  "suite": "agent-card-devices",
+  "version": 1,
+  "encoding": "hex",
+  "cases": [
+    {
+      "id": "E2E-CARD-001",
+      "description": "Recipient signed pre-key is bound to the DID signing key",
+      "inputs": {
+        "deviceId": "device-b-01",
+        "signedPreKeyId": 7,
+        "signedPreKeyPublic": "9fd7ad6dcff4298dd3f96d5b1b2af910a0535b1488d7f8fabb349a982880b615"
+      },
+      "expected": {
+        "didSigningPublic": "29acbae141bccaf0b22e1a94d34d0bc7361e526d0bfe12c89794bc9322966dd7",
+        "signaturePayload": "b9000564747970656e5349474e45445f5052455f4b45596776657273696f6e016864657669636549646b6465766963652d622d30316e7369676e65645072654b6579496407727369676e65645072654b65795075626c6963d84058209fd7ad6dcff4298dd3f96d5b1b2af910a0535b1488d7f8fabb349a982880b615",
+        "signedPreKeySignature": "ac4cf570812a1a2220173a280c7af1142bef46d0b273c3a898503c65a18cf0b844a61ec3963cc27b5a2de2ddfbcd47f5a335a396e7de8293899dcc93a9bda006"
+      }
+    }
+  ]
+}

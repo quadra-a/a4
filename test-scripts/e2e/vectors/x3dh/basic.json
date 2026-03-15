@@ -1,0 +1,26 @@
+{
+  "suite": "x3dh",
+  "version": 1,
+  "encoding": "hex",
+  "cases": [
+    {
+      "id": "E2E-X3DH-001",
+      "description": "Shared secret derivation with signed pre-key and one-time pre-key",
+      "inputs": {
+        "initiatorIdentityPrivate": "707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f",
+        "initiatorEphemeralPrivate": "505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f",
+        "recipientIdentityPrivate": "303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f",
+        "recipientSignedPreKeyPrivate": "909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
+        "recipientOneTimePreKeyPrivate": "b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecf"
+      },
+      "expected": {
+        "initiatorIdentityPublic": "23b7bb8c91ae008711fb12846780bcdf1e065f821bdfec49f57e7c7dcd4c4823",
+        "initiatorEphemeralPublic": "392d174a38b3b1beafaf1fe824870841c5fa531bc6eafdb6402c124664488c1c",
+        "recipientIdentityPublic": "34e42d4af5ef94a07a3a84201b889d4cd1a743cb27b11b6a10438a8feb8e5847",
+        "recipientSignedPreKeyPublic": "9fd7ad6dcff4298dd3f96d5b1b2af910a0535b1488d7f8fabb349a982880b615",
+        "recipientOneTimePreKeyPublic": "3f3e5f6d86926c9c128cf84581574f96840d98ee5ab53b1ec3b76e2bb25b945e",
+        "sharedSecret": "737917b2e0a6d84cfd2c9392f8c580bbe88e853c9f00051611134b349ed45b2a"
+      }
+    }
+  ]
+}

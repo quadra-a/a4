@@ -49,6 +49,7 @@ pub async fn show(opts: TrustShowOptions) -> Result<()> {
     crate::commands::score::run(crate::commands::score::ScoreOptions {
         target: opts.target,
         detailed: opts.detailed,
+        json: false,
         human: opts.human,
     })
     .await
@@ -61,6 +62,7 @@ pub async fn endorse(opts: TrustEndorseOptions) -> Result<()> {
         strength: opts.score,
         comment: Some(opts.reason),
         domain: opts.domain,
+        json: false,
         human: opts.human,
     })
     .await
@@ -72,6 +74,7 @@ pub async fn history(opts: TrustHistoryOptions) -> Result<()> {
         created_by: None,
         domain: None,
         limit: opts.limit,
+        json: false,
         human: opts.human,
     })
     .await
@@ -83,6 +86,7 @@ pub async fn query(opts: TrustQueryOptions) -> Result<()> {
         created_by: None,
         domain: opts.domain,
         limit: opts.limit,
+        json: false,
         human: opts.human,
     })
     .await
@@ -92,13 +96,20 @@ pub async fn block(target: String, reason: Option<String>, human: bool) -> Resul
     crate::commands::block::run(crate::commands::block::BlockOptions {
         target,
         reason,
+        json: false,
         human,
     })
     .await
 }
 
 pub async fn unblock(target: String, human: bool) -> Result<()> {
-    crate::commands::unblock::run(crate::commands::unblock::UnblockOptions { target, human }).await
+    crate::commands::unblock::run(crate::commands::unblock::UnblockOptions {
+        target,
+        keep_history: false,
+        json: false,
+        human,
+    })
+    .await
 }
 
 pub async fn allow(opts: TrustAllowOptions) -> Result<()> {

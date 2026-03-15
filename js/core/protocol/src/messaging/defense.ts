@@ -48,6 +48,10 @@ export class DefenseMiddleware {
   // In-memory token buckets (backed by LevelDB for persistence)
   private readonly buckets = new Map<string, TokenBucket>();
 
+  // Grace period tracking: DID → unblock timestamp
+  private readonly recentlyUnblocked = new Map<string, number>();
+  private readonly UNBLOCK_GRACE_PERIOD_MS = 60 * 60 * 1000; // 1 hour
+
   constructor(config: DefenseConfig) {
     this.trust = config.trustSystem;
     this.storage = config.storage;
@@ -107,7 +111,11 @@ export class DefenseMiddleware {
       }
 
       // Auto-block: ≥20 interactions, recent failure rate > 70%
-      if (totalInteractions >= 20 && recentFailureRate > 0.7) {
+      // Skip if agent was recently manually unblocked (grace period)
+      const unblockTime = this.recentlyUnblocked.get(did);
+      const inGracePeriod = unblockTime && (Date.now() - unblockTime) < this.UNBLOCK_GRACE_PERIOD_MS;
+
+      if (totalInteractions >= 20 && recentFailureRate > 0.7 && !inGracePeriod) {
         logger.warn('Auto-blocking high-failure-rate agent', { did, recentFailureRate: recentFailureRate.toFixed(2), totalInteractions });
         await this.blockAgent(did, `Auto-blocked: ${(recentFailureRate * 100).toFixed(0)}% failure rate over last 20 interactions`);
         return { allowed: false, reason: 'blocked' };
@@ -151,6 +159,7 @@ export class DefenseMiddleware {
 
   async unblockAgent(did: string): Promise<void> {
     await this.storage.deleteBlock(did);
+    this.recentlyUnblocked.set(did, Date.now());
     logger.info('Agent unblocked', { did });
   }
 
@@ -237,6 +246,12 @@ export class DefenseMiddleware {
       if (seenAt < cutoff) this.seenCache.delete(id);
     }
     await this.storage.cleanupSeen(this.seenTtlMs);
+
+    // Cleanup expired grace period entries
+    const graceCutoff = Date.now() - this.UNBLOCK_GRACE_PERIOD_MS;
+    for (const [did, unblockTime] of this.recentlyUnblocked) {
+      if (unblockTime < graceCutoff) this.recentlyUnblocked.delete(did);
+    }
   }
 
   /** Periodic cleanup of stale rate limit buckets (24h inactive) */

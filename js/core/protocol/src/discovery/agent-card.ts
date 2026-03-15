@@ -1,5 +1,6 @@
 import Ajv, { JSONSchemaType } from 'ajv';
 import { DiscoveryError } from '../utils/errors.js';
+import { encodeCanonicalJson, encodeJsonSignaturePayloads } from '../utils/canonical-json.js';
 
 // Re-export Phase 2 types
 export type { AgentCard, Capability, CapabilityParameter, LegacyAgentCard } from './agent-card-types.js';
@@ -136,9 +137,7 @@ export async function signAgentCard(
   signFn: (data: Uint8Array) => Promise<Uint8Array>
 ): Promise<AgentCard> {
   try {
-    const cardJson = JSON.stringify(card);
-    const cardBytes = new TextEncoder().encode(cardJson);
-    const signature = await signFn(cardBytes);
+    const signature = await signFn(encodeCanonicalJson(card));
 
     return {
       ...card,
@@ -158,11 +157,15 @@ export async function verifyAgentCard(
 ): Promise<boolean> {
   try {
     const { signature, ...cardWithoutSig } = card;
-    const cardJson = JSON.stringify(cardWithoutSig);
-    const cardBytes = new TextEncoder().encode(cardJson);
     const signatureBytes = Buffer.from(signature, 'hex');
 
-    return await verifyFn(signatureBytes, cardBytes);
+    for (const payloadBytes of encodeJsonSignaturePayloads(cardWithoutSig)) {
+      if (await verifyFn(signatureBytes, payloadBytes)) {
+        return true;
+      }
+    }
+
+    return false;
   } catch (error) {
     throw new DiscoveryError('Failed to verify Agent Card', error);
   }

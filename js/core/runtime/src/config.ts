@@ -1,3 +1,4 @@
+import type { LocalE2EConfig } from '@quadra-a/protocol';
 import Conf from 'conf';
 import { QUADRA_A_HOME } from './constants.js';
 import {
@@ -15,11 +16,16 @@ export interface QuadraAConfig {
     publicKey: string;
     privateKey: string;
   };
+  deviceIdentity?: {
+    seed: string;
+    deviceId: string;
+  };
   agentCard?: {
     name: string;
     description: string;
     capabilities: string[];
   };
+  e2e?: LocalE2EConfig;
   published?: boolean;
   relayInviteToken?: string;
   reachabilityPolicy?: Partial<ReachabilityPolicy>;
@@ -62,6 +68,20 @@ export function setIdentity(identity: QuadraAConfig['identity']): void {
 }
 
 /**
+ * Read the persisted stable local device identity metadata.
+ */
+export function getDeviceIdentity(): QuadraAConfig['deviceIdentity'] {
+  return config.get('deviceIdentity');
+}
+
+/**
+ * Persist the stable local device identity metadata.
+ */
+export function setDeviceIdentity(deviceIdentity: QuadraAConfig['deviceIdentity']): void {
+  config.set('deviceIdentity', deviceIdentity);
+}
+
+/**
  * Read the locally configured Agent Card fields.
  */
 export function getAgentCard(): QuadraAConfig['agentCard'] {
@@ -73,6 +93,20 @@ export function getAgentCard(): QuadraAConfig['agentCard'] {
  */
 export function setAgentCard(card: QuadraAConfig['agentCard']): void {
   config.set('agentCard', card);
+}
+
+/**
+ * Read the persisted local E2E device state.
+ */
+export function getE2EConfig(): QuadraAConfig['e2e'] {
+  return config.get('e2e');
+}
+
+/**
+ * Persist the local E2E device state.
+ */
+export function setE2EConfig(e2e: QuadraAConfig['e2e']): void {
+  config.set('e2e', e2e);
 }
 
 /**

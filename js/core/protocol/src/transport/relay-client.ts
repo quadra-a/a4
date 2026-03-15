@@ -6,9 +6,12 @@ import { WebSocket } from 'ws';
 import { encode as encodeCBOR, decode as decodeCBOR } from 'cbor-x';
 import { createLogger } from '../utils/logger.js';
 import { TransportError } from '../utils/errors.js';
-import { sign } from '../identity/keys.js';
+import { extractPublicKey, validateDID } from '../identity/did.js';
+import { sign, verify } from '../identity/keys.js';
 import type { KeyPair } from '../identity/keys.js';
+import { verifyAgentCard } from '../discovery/agent-card.js';
 import type { AgentCard, Capability } from '../discovery/agent-card-types.js';
+import type { ClaimedPreKeyBundle, PublishedPreKeyBundle } from '../e2e/types.js';
 import type {
   RelayMessage,
   HelloMessage,
@@ -63,6 +66,8 @@ export interface RelayClient {
   sendEnvelope(toDid: string, envelopeBytes: Uint8Array): Promise<void>;
   discover(input: string | { query?: string; capability?: string }, minTrust?: number, limit?: number): Promise<DiscoveredAgent[]>;
   fetchCard(did: string): Promise<AgentCard | null>;
+  publishPreKeyBundles(bundles: PublishedPreKeyBundle[]): Promise<void>;
+  fetchPreKeyBundle(did: string, deviceId: string): Promise<ClaimedPreKeyBundle | null>;
   queryTrust(target: string, domain?: string, since?: number, cursor?: string): Promise<TrustResultMessage>;
   publishCard(card?: AgentCard): Promise<void>;
   unpublishCard(): Promise<void>;
@@ -73,6 +78,16 @@ export interface RelayClient {
   getKnownRelays(): string[];
   getReachabilityStatus(): RelayReachabilityStatus;
   getPeerCount(): number;
+}
+
+interface PendingControlRequest {
+  description: string;
+  matches: (msg: RelayMessage) => boolean;
+  timeout: NodeJS.Timeout;
+  resolve: (msg: RelayMessage) => void;
+  reject: (error: TransportError) => void;
+  queuedMatch: RelayMessage | null;
+  allowOutOfBandResponse: boolean;
 }
 
 interface RelayConnection {
@@ -86,6 +101,10 @@ interface RelayConnection {
   stableTimer: NodeJS.Timeout | null;
   pingTimer: NodeJS.Timeout | null;
   peerCount: number;
+  pendingRequest: PendingControlRequest | null;
+  inboundDispatchChain: Promise<void>;
+  deliveryHandlerDepth: number;
+  relayId: string | null;
 }
 
 const DEFAULT_RECONNECT = {
@@ -122,6 +141,56 @@ function isRelayProvider(agent: DiscoveredAgent): boolean {
   return hasRelayCapability(agent.card.capabilities) && extractRelayEndpoints(agent.card).length > 0;
 }
 
+async function verifyCardBinding(card: AgentCard | null | undefined, expectedDid?: string): Promise<{ valid: boolean; reason?: string }> {
+  if (!card) {
+    return { valid: false, reason: 'missing card payload' };
+  }
+
+  if (!validateDID(card.did)) {
+    return { valid: false, reason: `invalid card DID: ${card.did}` };
+  }
+
+  if (expectedDid && card.did !== expectedDid) {
+    return {
+      valid: false,
+      reason: `envelope DID ${expectedDid} does not match card DID ${card.did}`,
+    };
+  }
+
+  try {
+    const publicKey = extractPublicKey(card.did);
+    const valid = await verifyAgentCard(card, (signature, data) => verify(signature, data, publicKey));
+
+    return valid
+      ? { valid: true }
+      : { valid: false, reason: `invalid signature for ${card.did}` };
+  } catch (error) {
+    return {
+      valid: false,
+      reason: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+async function filterVerifiedDiscoveredAgents(agents: DiscoveredAgent[]): Promise<DiscoveredAgent[]> {
+  const verifiedAgents: DiscoveredAgent[] = [];
+
+  for (const agent of agents) {
+    const verification = await verifyCardBinding(agent.card, agent.did);
+    if (!verification.valid) {
+      logger.warn('Discarded discovered agent card with invalid signature', {
+        did: agent.did,
+        reason: verification.reason,
+      });
+      continue;
+    }
+
+    verifiedAgents.push(agent);
+  }
+
+  return verifiedAgents;
+}
+
 export function createRelayClient(config: RelayClientConfig): RelayClient {
   const { inviteToken, did, keyPair } = config;
   const reconnectConfig = { ...DEFAULT_RECONNECT, ...config.reconnect };
@@ -150,6 +219,103 @@ export function createRelayClient(config: RelayClientConfig): RelayClient {
     return connections.find((connection) => connection.url === url);
   }
 
+  function clearPendingRequest(conn: RelayConnection): PendingControlRequest | null {
+    const pending = conn.pendingRequest;
+    if (!pending) {
+      return null;
+    }
+
+    clearTimeout(pending.timeout);
+    conn.pendingRequest = null;
+    return pending;
+  }
+
+  function rejectPendingRequest(conn: RelayConnection, error: TransportError, force = false): void {
+    const pending = conn.pendingRequest;
+    if (!pending) {
+      return;
+    }
+
+    if (!force && pending.queuedMatch) {
+      return;
+    }
+
+    clearPendingRequest(conn)?.reject(error);
+  }
+
+  function queueInboundRelayMessage(conn: RelayConnection, msg: RelayMessage): void {
+    const processMessage = async (): Promise<void> => {
+      try {
+        await dispatchRelayMessage(conn, msg);
+      } catch (error) {
+        logger.warn('Failed to process relay message', {
+          url: conn.url,
+          type: msg.type,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    };
+
+    conn.inboundDispatchChain = conn.inboundDispatchChain.then(processMessage, processMessage);
+  }
+
+  async function dispatchRelayMessage(conn: RelayConnection, msg: RelayMessage): Promise<void> {
+    const pending = conn.pendingRequest;
+    if (pending && pending.matches(msg)) {
+      clearPendingRequest(conn)?.resolve(msg);
+      return;
+    }
+
+    await handleRelayMessage(conn, msg);
+  }
+
+  function awaitControlResponse<T extends RelayMessage>(
+    conn: RelayConnection,
+    request: RelayMessage,
+    timeoutMs: number,
+    timeoutMessage: string,
+    matches: (msg: RelayMessage) => msg is T,
+  ): Promise<T> {
+    const ws = conn.ws;
+    if (!conn.connected || !ws) {
+      throw new TransportError('No connected relay');
+    }
+
+    if (conn.pendingRequest) {
+      throw new TransportError(`Relay request already pending: ${conn.pendingRequest.description}`);
+    }
+
+    return new Promise<T>((resolve, reject) => {
+      const pending: PendingControlRequest = {
+        description: request.type,
+        matches,
+        timeout: setTimeout(() => {
+          if (conn.pendingRequest === pending) {
+            conn.pendingRequest = null;
+          }
+          reject(new TransportError(timeoutMessage, { relayUrl: conn.url, requestType: request.type }));
+        }, timeoutMs),
+        resolve: (msg) => resolve(msg as T),
+        reject,
+        queuedMatch: null,
+        allowOutOfBandResponse: conn.deliveryHandlerDepth > 0,
+      };
+
+      conn.pendingRequest = pending;
+
+      try {
+        ws.send(encodeCBOR(request));
+      } catch (error) {
+        clearPendingRequest(conn);
+        reject(new TransportError(`Failed to send ${request.type}`, {
+          relayUrl: conn.url,
+          requestType: request.type,
+          error: error instanceof Error ? error.message : String(error),
+        }));
+      }
+    });
+  }
+
   function ensureConnection(url: string): RelayConnection {
     const normalized = normalizeRelayUrl(url);
     const existing = getConnection(normalized);
@@ -168,6 +334,10 @@ export function createRelayClient(config: RelayClientConfig): RelayClient {
       stableTimer: null,
       pingTimer: null,
       peerCount: 0,
+      pendingRequest: null,
+      inboundDispatchChain: Promise.resolve(),
+      deliveryHandlerDepth: 0,
+      relayId: null,
     };
 
     connections.push(connection);
@@ -219,6 +389,16 @@ export function createRelayClient(config: RelayClientConfig): RelayClient {
 
   function listConnectedRelays(): string[] {
     return connections.filter((connection) => connection.connected).map((connection) => connection.url);
+  }
+
+  function getConnectedRelayIds(): Set<string> {
+    const ids = new Set<string>();
+    for (const conn of connections) {
+      if (conn.connected && conn.relayId) {
+        ids.add(conn.relayId);
+      }
+    }
+    return ids;
   }
 
   function listKnownRelays(): string[] {
@@ -278,10 +458,18 @@ export function createRelayClient(config: RelayClientConfig): RelayClient {
         });
       });
 
-      ws.on('message', async (data: Buffer) => {
+      ws.on('message', (data: Buffer) => {
         try {
           const msg: RelayMessage = decodeCBOR(data);
-          await handleRelayMessage(conn, msg);
+          const pending = conn.pendingRequest;
+          if (pending && pending.matches(msg)) {
+            pending.queuedMatch = msg;
+            if (pending.allowOutOfBandResponse) {
+              clearPendingRequest(conn)?.resolve(msg);
+              return;
+            }
+          }
+          queueInboundRelayMessage(conn, msg);
         } catch (error) {
           logger.warn('Failed to parse relay message', { error: (error as Error).message });
         }
@@ -302,6 +490,12 @@ export function createRelayClient(config: RelayClientConfig): RelayClient {
           clearInterval(conn.pingTimer);
           conn.pingTimer = null;
         }
+
+        rejectPendingRequest(conn, new TransportError('Relay connection closed before response', {
+          relayUrl: conn.url,
+          closeCode: code,
+          closeReason: reason,
+        }));
 
         const fatalError = mapRelayCloseError(conn.url, code, reason);
         if (fatalError) {
@@ -356,6 +550,30 @@ export function createRelayClient(config: RelayClientConfig): RelayClient {
       case 'WELCOME': {
         const welcome = msg as WelcomeMessage;
         logger.info('Received WELCOME', { relayId: welcome.relayId, peers: welcome.peers, url: conn.url });
+        conn.relayId = welcome.relayId ?? null;
+
+        // Deduplicate: if another connection already has this relayId, close this one
+        if (conn.relayId) {
+          const duplicate = connections.find(
+            (other) => other !== conn && other.connected && other.relayId === conn.relayId,
+          );
+          if (duplicate) {
+            logger.info('Closing duplicate relay connection', {
+              url: conn.url,
+              existingUrl: duplicate.url,
+              relayId: conn.relayId,
+            });
+            conn.connected = false;
+            conn.connecting = false;
+            conn.fatalError = new TransportError('Duplicate relay connection', { relayUrl: conn.url });
+            if (conn.ws) {
+              conn.ws.close(1000, 'Duplicate relay');
+              conn.ws = null;
+            }
+            break;
+          }
+        }
+
         conn.connected = true;
         conn.connecting = false;
         conn.peerCount = welcome.peers;
@@ -387,7 +605,12 @@ export function createRelayClient(config: RelayClientConfig): RelayClient {
         const deliver = msg as DeliverMessage;
         logger.info('Received DELIVER', { messageId: deliver.messageId, from: deliver.from });
         if (deliveryHandler) {
-          await deliveryHandler(deliver);
+          conn.deliveryHandlerDepth += 1;
+          try {
+            await deliveryHandler(deliver);
+          } finally {
+            conn.deliveryHandlerDepth = Math.max(0, conn.deliveryHandlerDepth - 1);
+          }
         }
         if (conn.ws && conn.connected) {
           conn.ws.send(encodeCBOR({ type: 'ACK', messageId: deliver.messageId }));
@@ -448,36 +671,23 @@ export function createRelayClient(config: RelayClientConfig): RelayClient {
     limit?: number,
   ): Promise<DiscoveredAgent[]> {
     const conn = getConnectedConnection();
-    const ws = conn?.ws;
-    if (!conn || !ws) {
+    if (!conn) {
       throw new TransportError('No connected relay');
     }
 
-    return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        reject(new TransportError('Discover timeout'));
-      }, 10000);
+    const discoverMessage = typeof input === 'string'
+      ? { type: 'DISCOVER', query: input, minTrust, limit }
+      : { type: 'DISCOVER', ...input, minTrust, limit };
 
-      const handler = (data: Buffer) => {
-        try {
-          const msg: RelayMessage = decodeCBOR(data);
-          if (msg.type === 'DISCOVERED') {
-            clearTimeout(timeout);
-            ws.off('message', handler);
-            resolve(msg.agents);
-          }
-        } catch {
-          // Ignore parse errors
-        }
-      };
+    const response = await awaitControlResponse(
+      conn,
+      discoverMessage as RelayMessage,
+      10000,
+      'Discover timeout',
+      (msg): msg is Extract<RelayMessage, { type: 'DISCOVERED' }> => msg.type === 'DISCOVERED',
+    );
 
-      const discoverMessage = typeof input === 'string'
-        ? { type: 'DISCOVER', query: input, minTrust, limit }
-        : { type: 'DISCOVER', ...input, minTrust, limit };
-
-      ws.on('message', handler);
-      ws.send(encodeCBOR(discoverMessage as RelayMessage));
-    });
+    return filterVerifiedDiscoveredAgents(response.agents);
   }
 
   async function maintainRelaySet(): Promise<void> {
@@ -497,9 +707,16 @@ export function createRelayClient(config: RelayClientConfig): RelayClient {
       );
       lastDiscoveryAt = Date.now();
       let plannedConnections = listConnectedRelays().length;
+      const connectedIds = getConnectedRelayIds();
 
       for (const agent of discovered) {
         if (!isRelayProvider(agent)) {
+          continue;
+        }
+
+        // Skip relay agents whose DID is already connected via another URL
+        if (connectedIds.has(agent.did)) {
+          logger.debug('Skipping already-connected relay', { did: agent.did });
           continue;
         }
 
@@ -597,6 +814,9 @@ export function createRelayClient(config: RelayClientConfig): RelayClient {
           clearInterval(conn.pingTimer);
           conn.pingTimer = null;
         }
+        rejectPendingRequest(conn, new TransportError('Relay client stopped before response', {
+          relayUrl: conn.url,
+        }), true);
         if (conn.ws) {
           conn.ws.close();
           conn.ws = null;
@@ -626,64 +846,88 @@ export function createRelayClient(config: RelayClientConfig): RelayClient {
     async fetchCard(didToFetch: string): Promise<AgentCard | null> {
       return withSerializedRequest(async () => {
         const conn = getConnectedConnection();
-        const ws = conn?.ws;
-        if (!conn || !ws) {
+        if (!conn) {
           throw new TransportError('No connected relay');
         }
 
-        return new Promise((resolve, reject) => {
-          const timeout = setTimeout(() => {
-            reject(new TransportError('Fetch card timeout'));
-          }, 5000);
+        const response = await awaitControlResponse(
+          conn,
+          { type: 'FETCH_CARD', did: didToFetch } as RelayMessage,
+          5000,
+          'Fetch card timeout',
+          (msg): msg is Extract<RelayMessage, { type: 'CARD' }> => msg.type === 'CARD' && msg.did === didToFetch,
+        );
 
-          const handler = (data: Buffer) => {
-            try {
-              const msg: RelayMessage = decodeCBOR(data);
-              if (msg.type === 'CARD' && msg.did === didToFetch) {
-                clearTimeout(timeout);
-                ws.off('message', handler);
-                resolve(msg.card);
-              }
-            } catch {
-              // Ignore parse errors
-            }
-          };
+        if (!response.card) {
+          return null;
+        }
 
-          ws.on('message', handler);
-          ws.send(encodeCBOR({ type: 'FETCH_CARD', did: didToFetch } as RelayMessage));
-        });
+        const verification = await verifyCardBinding(response.card, didToFetch);
+        if (!verification.valid) {
+          logger.warn('Discarded fetched agent card with invalid signature', {
+            did: didToFetch,
+            reason: verification.reason,
+          });
+          return null;
+        }
+
+        return response.card;
       });
     },
 
     async queryTrust(target: string, domain?: string, since?: number, cursor?: string): Promise<TrustResultMessage> {
       return withSerializedRequest(async () => {
         const conn = getConnectedConnection();
-        const ws = conn?.ws;
-        if (!conn || !ws) {
+        if (!conn) {
           throw new TransportError('No connected relay');
         }
 
-        return new Promise((resolve, reject) => {
-          const timeout = setTimeout(() => {
-            reject(new TransportError('Trust query timeout'));
-          }, 10000);
+        return await awaitControlResponse(
+          conn,
+          { type: 'TRUST_QUERY', target, domain, since, cursor } as RelayMessage,
+          10000,
+          'Trust query timeout',
+          (msg): msg is Extract<RelayMessage, { type: 'TRUST_RESULT' }> => msg.type === 'TRUST_RESULT' && msg.target === target,
+        );
+      });
+    },
 
-          const handler = (data: Buffer) => {
-            try {
-              const msg: RelayMessage = decodeCBOR(data);
-              if (msg.type === 'TRUST_RESULT' && msg.target === target) {
-                clearTimeout(timeout);
-                ws.off('message', handler);
-                resolve(msg);
-              }
-            } catch {
-              // Ignore parse errors
-            }
-          };
+    async publishPreKeyBundles(bundles: PublishedPreKeyBundle[]): Promise<void> {
+      await withSerializedRequest(async () => {
+        const conn = getConnectedConnection();
+        if (!conn) {
+          throw new TransportError('No connected relay');
+        }
 
-          ws.on('message', handler);
-          ws.send(encodeCBOR({ type: 'TRUST_QUERY', target, domain, since, cursor } as RelayMessage));
-        });
+        await awaitControlResponse(
+          conn,
+          { type: 'PUBLISH_PREKEYS', bundles } as RelayMessage,
+          5000,
+          'Publish pre-key bundles timeout',
+          (msg): msg is Extract<RelayMessage, { type: 'PREKEYS_PUBLISHED' }> => msg.type === 'PREKEYS_PUBLISHED',
+        );
+      });
+      logger.debug('Published pre-key bundles', { deviceCount: bundles.length });
+    },
+
+    async fetchPreKeyBundle(didToFetch: string, deviceId: string): Promise<ClaimedPreKeyBundle | null> {
+      return withSerializedRequest(async () => {
+        const conn = getConnectedConnection();
+        if (!conn) {
+          throw new TransportError('No connected relay');
+        }
+
+        const response = await awaitControlResponse(
+          conn,
+          { type: 'FETCH_PREKEY_BUNDLE', did: didToFetch, deviceId } as RelayMessage,
+          5000,
+          'Fetch pre-key bundle timeout',
+          (msg): msg is Extract<RelayMessage, { type: 'PREKEY_BUNDLE' }> => (
+            msg.type === 'PREKEY_BUNDLE' && msg.did === didToFetch && msg.deviceId === deviceId
+          ),
+        );
+
+        return response.bundle ?? null;
       });
     },
 

@@ -5,10 +5,15 @@ import { buildDiscoveryResponse, resolveVisibleAgentCard } from './relay-agent-d
 import type {
   AckMessage,
   CardMessage,
+  DeliveryReportMessage,
   DiscoverMessage,
   EndorseAckMessage,
   EndorseMessage,
   PingMessage,
+  PreKeyBundleMessage,
+  PreKeysPublishedMessage,
+  PublishPreKeysMessage,
+  FetchPreKeyBundleMessage,
   PongMessage,
   PublishCardMessage,
   SubscribeAckMessage,
@@ -127,8 +132,25 @@ export async function handleAck(runtime: RelayAgentRuntime, did: string, msg: Ac
     return;
   }
 
-  await runtime.queue.markAcked(msg.messageId, did);
+  const acknowledged = await runtime.queue.markAcked(msg.messageId, did);
   console.log(`Received ACK from ${did} for message ${msg.messageId}`);
+
+  if (!acknowledged) {
+    return;
+  }
+
+  const sender = runtime.registry.get(acknowledged.fromDid);
+  if (!sender?.online || sender.ws.readyState !== 1) {
+    return;
+  }
+
+  const report: DeliveryReportMessage = {
+    type: 'DELIVERY_REPORT',
+    messageId: acknowledged.messageId,
+    status: 'delivered',
+    timestamp: Date.now(),
+  };
+  sender.ws.send(encodeCBOR(report));
 }
 
 export async function handleSubscribe(
@@ -343,4 +365,50 @@ export async function handleUnpublishCard(runtime: RelayAgentRuntime, did: strin
   runtime.registry.unpublish(did);
   runtime.subscriptions.dispatch('unpublish', did, agent.card, agent.realm);
   console.log(`Agent unpublished: ${did}`);
+}
+
+
+export async function handlePublishPreKeys(
+  runtime: RelayAgentRuntime,
+  ws: WebSocket,
+  did: string,
+  msg: PublishPreKeysMessage,
+): Promise<void> {
+  const agent = runtime.registry.get(did);
+  if (!agent || !runtime.preKeyStore) {
+    return;
+  }
+
+  await runtime.preKeyStore.publishBundles(did, agent.realm, msg.bundles ?? []);
+  const response: PreKeysPublishedMessage = {
+    type: 'PREKEYS_PUBLISHED',
+    did,
+    deviceCount: msg.bundles?.length ?? 0,
+  };
+  ws.send(encodeCBOR(response));
+}
+
+export async function handleFetchPreKeyBundle(
+  runtime: RelayAgentRuntime,
+  ws: WebSocket,
+  requesterDid: string,
+  msg: FetchPreKeyBundleMessage,
+): Promise<void> {
+  const requesterRealm = runtime.registry.get(requesterDid)?.realm ?? 'public';
+  let bundle = runtime.preKeyStore
+    ? await runtime.preKeyStore.claimBundle(msg.did, msg.deviceId, requesterRealm)
+    : null;
+
+  if (!bundle && runtime.federationManager) {
+    bundle = await runtime.federationManager.fetchRemotePreKeyBundle(msg.did, msg.deviceId, requesterRealm);
+  }
+
+  const response: PreKeyBundleMessage = {
+    type: 'PREKEY_BUNDLE',
+    did: msg.did,
+    deviceId: msg.deviceId,
+    bundle,
+    ...(msg.requestId ? { requestId: msg.requestId } : {}),
+  };
+  ws.send(encodeCBOR(response));
 }

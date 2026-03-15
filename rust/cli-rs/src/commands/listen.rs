@@ -4,8 +4,9 @@ use std::process::{Command, Stdio};
 use tokio::time::{sleep, Duration};
 
 use crate::config::{load_config, save_config, AgentCardConfig, IdentityConfig};
-use crate::daemon::{daemon_socket_path, DaemonClient, DaemonServer};
+use crate::daemon::{daemon_server_socket_path, DaemonClient, DaemonServer};
 use crate::identity::{derive_did, generate_anonymous_identity, KeyPair};
+use quadra_a_core::e2e::ensure_local_e2e_config;
 
 fn parse_capabilities(capabilities: Option<&str>) -> Vec<String> {
     capabilities
@@ -27,7 +28,7 @@ fn normalize_token(token: Option<&str>) -> Option<String> {
 }
 
 async fn stop_existing_daemon(daemon: &DaemonClient) -> Result<()> {
-    daemon.send_command("stop", json!({})).await?;
+    daemon.stop_listener().await?;
 
     for _ in 0..20 {
         if !daemon.is_running().await {
@@ -147,6 +148,10 @@ pub async fn run(opts: ListenOptions) -> Result<()> {
         }
     }
 
+    if ensure_local_e2e_config(&mut config)? {
+        config_changed = true;
+    }
+
     if opts.discoverable {
         let name = opts
             .name
@@ -200,8 +205,9 @@ pub async fn run(opts: ListenOptions) -> Result<()> {
         config_changed = true;
     }
 
-    let socket_path = daemon_socket_path();
-    let daemon = DaemonClient::new(&socket_path);
+    let client_socket_path = daemon_server_socket_path();
+    let server_socket_path = client_socket_path.clone();
+    let daemon = DaemonClient::new(&client_socket_path);
     let daemon_status = daemon.send_command("status", json!({})).await.ok();
     let daemon_running = daemon_status.is_some();
     let relay_changed = daemon_status
@@ -328,7 +334,22 @@ pub async fn run(opts: ListenOptions) -> Result<()> {
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("No identity found. Run `agent listen` to create one."))?;
     let keypair = KeyPair::from_hex(&identity.private_key)?;
-    let daemon = DaemonServer::new(config, keypair, &socket_path);
+    let daemon = DaemonServer::new(config, keypair, &server_socket_path);
+
+    // Set up panic hook to capture crash diagnostics
+    let crash_file = format!("{}.crash", server_socket_path);
+    std::panic::set_hook(Box::new(move |info| {
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        let msg = format!(
+            "DAEMON PANIC at {}\n{}\n\nBacktrace:\n{:?}",
+            chrono::Utc::now().to_rfc3339(),
+            info,
+            backtrace
+        );
+        let _ = std::fs::write(&crash_file, &msg);
+        eprintln!("DAEMON PANIC: {}", info);
+        eprintln!("Crash details written to: {}", crash_file);
+    }));
 
     if !opts.json {
         if created_identity {

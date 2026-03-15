@@ -4,6 +4,7 @@ use crate::ui::LlmFormatter;
 use anyhow::Result;
 
 pub struct PeersOptions {
+    pub json: bool,
     pub human: bool,
 }
 
@@ -21,6 +22,10 @@ pub async fn run(opts: PeersOptions) -> Result<()> {
 
         match daemon.send_command("peers", params).await {
             Ok(response) => {
+                if opts.json {
+                    println!("{}", serde_json::to_string_pretty(&response)?);
+                    return Ok(());
+                }
                 if let Some(peers) = response.get("peers").and_then(|p| p.as_array()) {
                     if opts.human {
                         println!("Connected peers ({}):", peers.len());

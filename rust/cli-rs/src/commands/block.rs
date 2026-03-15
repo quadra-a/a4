@@ -6,6 +6,7 @@ use anyhow::Result;
 pub struct BlockOptions {
     pub target: String,
     pub reason: Option<String>,
+    pub json: bool,
     pub human: bool,
 }
 
@@ -40,6 +41,15 @@ pub async fn run(opts: BlockOptions) -> Result<()> {
 
     // Inform daemon if it's running (optional, don't fail if daemon unavailable)
     let _ = inform_daemon_of_block(&target_did).await;
+
+    if opts.json {
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "target": target_did,
+            "reason": opts.reason,
+            "status": "blocked_and_stored",
+        }))?);
+        return Ok(());
+    }
 
     if opts.human {
         println!("Blocking agent: {}", target_did);

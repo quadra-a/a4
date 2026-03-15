@@ -17,10 +17,12 @@ import {
   getMessageSortTimestamp,
   MessageQueue,
   DefenseMiddleware,
+  type E2EDeliveryMetadata,
   type RelayClient,
   type MessageRouter,
   type RelayIndexOperations,
   type TrustSystem,
+  type LocalE2EConfig,
   type MessageEnvelope,
   type SemanticQuery,
   type StoredMessage,
@@ -30,6 +32,7 @@ import type {
   DaemonRequest,
   DaemonResponse,
   DaemonSubscriptionEvent,
+  E2EResetNotifyParams,
   ListPeersParams,
   PublishCardParams,
   ReachabilityPolicyResponse,
@@ -44,10 +47,14 @@ import {
   isPublished,
   resetReachabilityPolicy,
   setAgentCard,
+  setE2EConfig,
   updateReachabilityPolicy,
 } from './config.js';
 import { policyToReachabilityStatus, type ReachabilityPolicy } from './reachability.js';
 import { getTrustScore, endorseAgent, queryNetworkEndorsements } from './trust.js';
+import { resolvePublishedDevices, resolvePublishedPreKeyBundles, resolveE2EConfig } from './e2e-config.js';
+import { prepareEncryptedSends } from './e2e-send.js';
+import { prepareEncryptedReceive } from './e2e-receive.js';
 
 const logger = createLogger('daemon');
 
@@ -97,15 +104,20 @@ export class ClawDaemon {
       description: `Capability: ${capability}`,
     }));
 
-    const agentCard = createAgentCard(
+    const devices = await resolvePublishedDevices(this.identity);
+
+    const baseCard = createAgentCard(
       this.identity.did,
       cardConfig?.name ?? 'quadra-a Agent',
       cardConfig?.description ?? '',
       capabilities,
       [],
     );
+    const agentCard = devices.length > 0
+      ? { ...baseCard, devices }
+      : baseCard;
 
-    return signAgentCard(agentCard, (data) => sign(data, keyPair.privateKey));
+    return signAgentCard(agentCard as any, (data) => sign(data, keyPair.privateKey));
   }
 
   private getReachabilityPolicy(): ReachabilityPolicy {
@@ -129,6 +141,81 @@ export class ClawDaemon {
     } : undefined);
   }
 
+  private clearPeerSessions(
+    e2eConfig: LocalE2EConfig,
+    peerDid: string,
+  ): { e2eConfig: LocalE2EConfig; clearedCount: number } {
+    const currentDevice = e2eConfig.devices[e2eConfig.currentDeviceId];
+    if (!currentDevice) {
+      return { e2eConfig, clearedCount: 0 };
+    }
+
+    const nextSessions = Object.fromEntries(
+      Object.entries(currentDevice.sessions ?? {})
+        .filter(([sessionKey]) => !sessionKey.startsWith(`${peerDid}:`)),
+    );
+    const clearedCount = Object.keys(currentDevice.sessions ?? {}).length - Object.keys(nextSessions).length;
+    if (clearedCount === 0) {
+      return { e2eConfig, clearedCount: 0 };
+    }
+
+    return {
+      e2eConfig: {
+        ...e2eConfig,
+        devices: {
+          ...e2eConfig.devices,
+          [e2eConfig.currentDeviceId]: {
+            ...currentDevice,
+            sessions: nextSessions,
+          },
+        },
+      },
+      clearedCount,
+    };
+  }
+
+  private buildLocalDiagnosticEnvelope(
+    from: string,
+    protocol: string,
+    payload: Record<string, unknown>,
+    timestamp = Date.now(),
+  ): MessageEnvelope {
+    const envelope = createEnvelope(
+      from,
+      this.identity.did,
+      'message',
+      protocol,
+      payload,
+    );
+
+    return {
+      ...envelope,
+      timestamp,
+      signature: 'local-diagnostic',
+    };
+  }
+
+  private async sendSessionReset(to: string, reason: string, timestamp = Date.now()): Promise<void> {
+    if (!this.router) {
+      throw new Error('Router not initialized');
+    }
+
+    const resetEnvelope = createEnvelope(
+      this.identity.did,
+      to,
+      'message',
+      'e2e/session-reset',
+      {
+        from: this.identity.did,
+        to,
+        reason,
+        timestamp,
+      },
+    );
+    const signedEnvelope = await signEnvelope(resetEnvelope, (data) => sign(data, this.getKeyPair().privateKey));
+    await this.router.sendMessage(signedEnvelope);
+  }
+
   private async stopRelayStack(): Promise<void> {
     if (this.router) {
       await this.router.stop();
@@ -141,6 +228,19 @@ export class ClawDaemon {
     }
 
     this.relayIndex = null;
+  }
+
+  private async publishDiscoveryState(signedCard: Awaited<ReturnType<ClawDaemon['buildSignedAgentCard']>>): Promise<void> {
+    if (!this.relayClient) {
+      throw new Error('Relay client not initialized');
+    }
+
+    const preKeyBundles = await resolvePublishedPreKeyBundles(this.identity);
+    if (preKeyBundles.length > 0) {
+      await this.relayClient.publishPreKeyBundles(preKeyBundles);
+    }
+
+    await this.relayClient.publishCard(signedCard);
   }
 
   private async startRelayStack(): Promise<void> {
@@ -166,7 +266,7 @@ export class ClawDaemon {
     });
 
     if (isPublished()) {
-      await this.relayClient.publishCard(signedCard);
+      await this.publishDiscoveryState(signedCard);
       logger.info('Agent card published on daemon start', { did: this.identity.did });
     }
 
@@ -314,34 +414,141 @@ export class ClawDaemon {
   private async handleIncomingMessage(envelope: MessageEnvelope): Promise<MessageEnvelope | void> {
     if (!this.defense || !this.queue || !this.trustSystem) return;
 
-    const result = await this.defense.checkMessage(envelope);
+    if (envelope.protocol === 'e2e/session-reset') {
+      const e2eConfig = await resolveE2EConfig(this.identity);
+      const cleared = this.clearPeerSessions(e2eConfig, envelope.from);
+      if (cleared.clearedCount > 0) {
+        setE2EConfig(cleared.e2eConfig);
+        logger.info('E2E session reset by peer', {
+          from: envelope.from,
+          clearedCount: cleared.clearedCount,
+        });
+      }
+      return;
+    }
+
+    // Attempt E2E decryption if this is an encrypted transport envelope
+    let decryptedEnvelope = envelope;
+    let inboundE2EDelivery: E2EDeliveryMetadata | undefined;
+    if (envelope.protocol === '/agent/e2e/1.0.0') {
+      const e2eConfig = await resolveE2EConfig(this.identity);
+      try {
+        const result = await prepareEncryptedReceive({
+          receiverDid: this.identity.did,
+          e2eConfig,
+          transportEnvelope: envelope,
+        });
+        setE2EConfig(result.e2eConfig);
+        decryptedEnvelope = result.applicationEnvelope;
+        inboundE2EDelivery = {
+          transport: result.transport,
+          senderDeviceId: result.senderDeviceId,
+          receiverDeviceId: result.receiverDeviceId,
+          sessionId: result.sessionId,
+          state: 'received',
+          recordedAt: Date.now(),
+          usedSkippedMessageKey: result.usedSkippedMessageKey,
+        };
+        logger.info('E2E decrypted inbound message', {
+          id: decryptedEnvelope.id,
+          from: decryptedEnvelope.from,
+          transport: result.transport,
+        });
+      } catch (error) {
+        const cleared = this.clearPeerSessions(e2eConfig, envelope.from);
+        if (cleared.clearedCount > 0) {
+          setE2EConfig(cleared.e2eConfig);
+        }
+
+        try {
+          await this.sendSessionReset(envelope.from, 'decrypt-failed');
+        } catch (resetError) {
+          logger.warn('Failed to send E2E session reset', {
+            to: envelope.from,
+            reason: 'decrypt-failed',
+            error: (resetError as Error).message,
+          });
+        }
+        await this.queue.enqueueInbound(
+          this.buildLocalDiagnosticEnvelope(
+            envelope.from,
+            'e2e/decrypt-failed',
+            {
+              error: (error as Error).message,
+              hint: 'Session cleared. Next message will auto-renegotiate.',
+            },
+          ),
+        );
+
+        logger.warn('E2E decrypt failed, cleared stale session', {
+          id: envelope.id,
+          from: envelope.from,
+          clearedCount: cleared.clearedCount,
+          error: (error as Error).message,
+        });
+        return;
+      }
+    }
+
+    const result = await this.defense.checkMessage(decryptedEnvelope);
     if (!result.allowed) {
+      if (result.reason === 'duplicate' && inboundE2EDelivery) {
+        const merged = await this.queue.appendE2EDelivery(decryptedEnvelope.id, inboundE2EDelivery);
+        if (merged) {
+          logger.info('Merged duplicate inbound E2E delivery metadata', {
+            id: decryptedEnvelope.id,
+            from: decryptedEnvelope.from,
+            receiverDeviceId: inboundE2EDelivery.receiverDeviceId,
+          });
+          return;
+        }
+
+        await this.queue.enqueueInbound(
+          decryptedEnvelope,
+          result.trustScore,
+          result.trustStatus,
+          inboundE2EDelivery,
+        );
+        logger.info('Queued duplicate inbound E2E message before base record was visible', {
+          id: decryptedEnvelope.id,
+          from: decryptedEnvelope.from,
+          receiverDeviceId: inboundE2EDelivery.receiverDeviceId,
+        });
+        return;
+      }
+
       logger.warn('Message rejected by defense', { id: envelope.id, reason: result.reason });
 
-      // rate_limited = behavior anomaly, record as failure
-      if (result.reason === 'rate_limited') {
+      // Record interaction failures for all meaningful rejection reasons
+      if (result.reason === 'rate_limited' || result.reason === 'blocked' || result.reason === 'trust_too_low') {
         await this.trustSystem.recordInteraction({
           agentDid: envelope.from,
           timestamp: Date.now(),
           type: 'message',
           success: false,
           responseTime: 0,
+          failureReason: result.reason,
         });
       }
       return;
     }
 
-    await this.queue.enqueueInbound(envelope, result.trustScore, result.trustStatus);
+    await this.queue.enqueueInbound(
+      decryptedEnvelope,
+      result.trustScore,
+      result.trustStatus,
+      inboundE2EDelivery,
+    );
 
     await this.trustSystem.recordInteraction({
-      agentDid: envelope.from,
+      agentDid: decryptedEnvelope.from,
       timestamp: Date.now(),
       type: 'message',
       success: true,
       responseTime: 0,
     });
 
-    logger.info('Message queued', { id: envelope.id, from: envelope.from });
+    logger.info('Message queued', { id: decryptedEnvelope.id, from: decryptedEnvelope.from });
   }
 
   private handleConnection(socket: Socket): void {
@@ -403,7 +610,7 @@ export class ClawDaemon {
       switch (req.command) {
         case 'send':       return await this.handleSend(req);
         case 'discover':   return await this.handleDiscover(req);
-        case 'status':     return this.handleStatus(req);
+        case 'status':     return await this.handleStatus(req);
         case 'messages':   return await this.handleMessages(req);
         case 'get_card':   return this.handleGetCard(req);
         case 'query_agent_card': return await this.handleQueryAgentCard(req);
@@ -443,6 +650,9 @@ export class ClawDaemon {
         case 'set_reachability_policy': return await this.handleSetReachabilityPolicy(req);
         case 'reset_reachability_policy': return await this.handleResetReachabilityPolicy(req);
         case 'get_reachability_status': return this.handleGetReachabilityStatus(req);
+        case 'e2e-reset-notify':
+          return await this.handleE2EResetNotify(req as DaemonRequest<E2EResetNotifyParams>);
+        case 'reload-e2e': return await this.handleReloadE2E(req);
 
         default:
           return { id: req.id, success: false, error: 'Unknown command' };
@@ -456,40 +666,136 @@ export class ClawDaemon {
   private async handleSend(req: DaemonRequest): Promise<DaemonResponse> {
     const { to, protocol, payload, type, replyTo, threadId } = req.params;
 
-    if (!this.router) {
-      return { id: req.id, success: false, error: 'Router not initialized' };
+    if (!this.relayClient) {
+      return { id: req.id, success: false, error: 'Relay client not initialized' };
     }
-
-    const envelope = createEnvelope(
-      this.identity.did,
-      to,
-      type || 'message',
-      protocol,
-      payload,
-      replyTo,
-      threadId,
-    );
 
     const keyPair = this.getKeyPair();
 
-    const signedEnvelope = await signEnvelope(envelope, (data) =>
-      sign(data, keyPair.privateKey)
-    );
+    try {
+      const e2eConfig = await resolveE2EConfig(this.identity);
+      const encrypted = await prepareEncryptedSends({
+        identity: this.identity,
+        keyPair,
+        relayClient: this.relayClient,
+        e2eConfig,
+        to,
+        protocol: protocol ?? '/agent/msg/1.0.0',
+        payload,
+        type: type || 'message',
+        replyTo,
+        threadId,
+      });
 
-    if (this.queue) {
-      await this.queue.enqueueOutbound(signedEnvelope);
+      setE2EConfig(encrypted.e2eConfig);
+
+      const applicationEnvelope = encrypted.applicationEnvelope;
+
+      const e2eDeliveries: E2EDeliveryMetadata[] = encrypted.targets.map((target) => ({
+          transport: target.transport,
+          senderDeviceId: target.senderDeviceId,
+          receiverDeviceId: target.recipientDeviceId,
+          sessionId: target.sessionId,
+          state: 'sent',
+          recordedAt: Date.now(),
+      }));
+
+      if (this.queue) {
+        await this.queue.enqueueOutbound(applicationEnvelope, e2eDeliveries);
+      }
+
+      for (const target of encrypted.targets) {
+        await this.relayClient.sendEnvelope(to, target.outerEnvelopeBytes);
+      }
+
+      if (this.queue) {
+        await this.queue.markOutboundDelivered(applicationEnvelope.id);
+      }
+
+      return {
+        id: req.id,
+        success: true,
+        data: { id: applicationEnvelope.id },
+      };
+    } catch (e2eError) {
+      // Fallback: send without E2E if encryption fails (e.g. no card/devices)
+      const envelope = createEnvelope(
+        this.identity.did,
+        to,
+        type || 'message',
+        protocol,
+        payload,
+        replyTo,
+        threadId,
+      );
+
+      const signedEnvelope = await signEnvelope(envelope, (data) =>
+        sign(data, keyPair.privateKey)
+      );
+
+      if (this.queue) {
+        await this.queue.enqueueOutbound(signedEnvelope);
+      }
+
+      if (this.router) {
+        await this.router.sendMessage(signedEnvelope);
+      }
+
+      if (this.queue) {
+        await this.queue.markOutboundDelivered(signedEnvelope.id);
+      }
+
+      return {
+        id: req.id,
+        success: true,
+        data: { id: signedEnvelope.id },
+      };
     }
+  }
 
-    await this.router.sendMessage(signedEnvelope);
+  private async handleReloadE2E(req: DaemonRequest): Promise<DaemonResponse> {
+    const e2eConfig = await resolveE2EConfig(this.identity);
+    setE2EConfig(e2eConfig);
+    const currentDevice = e2eConfig.devices[e2eConfig.currentDeviceId];
 
-    if (this.queue) {
-      await this.queue.markOutboundDelivered(signedEnvelope.id);
+    return {
+      id: req.id,
+      success: true,
+      data: {
+        deviceId: e2eConfig.currentDeviceId,
+        sessionCount: Object.keys(currentDevice?.sessions ?? {}).length,
+      },
+    };
+  }
+
+  private async handleE2EResetNotify(
+    req: DaemonRequest<E2EResetNotifyParams>,
+  ): Promise<DaemonResponse<{ notified: string[]; failed: Array<{ peer: string; error: string }> }>> {
+    const peers = Array.isArray(req.params?.peers)
+      ? [...new Set(req.params.peers.map((peer) => peer.trim()).filter(Boolean))]
+      : [];
+    const notified: string[] = [];
+    const failed: Array<{ peer: string; error: string }> = [];
+
+    for (const peer of peers) {
+      try {
+        await this.sendSessionReset(peer, 'manual-reset');
+        notified.push(peer);
+      } catch (error) {
+        failed.push({
+          peer,
+          error: (error as Error).message,
+        });
+      }
     }
 
     return {
       id: req.id,
       success: true,
-      data: { id: signedEnvelope.id },
+      data: {
+        notified,
+        failed,
+      },
     };
   }
 
@@ -543,7 +849,7 @@ export class ClawDaemon {
     setAgentCard(nextCard);
 
     const signedCard = await this.buildSignedAgentCard(nextCard);
-    await this.relayClient.publishCard(signedCard);
+    await this.publishDiscoveryState(signedCard);
 
     return {
       id: req.id,
@@ -573,18 +879,24 @@ export class ClawDaemon {
     };
   }
 
-  private handleStatus(req: DaemonRequest): DaemonResponse {
+  private async handleStatus(req: DaemonRequest): Promise<DaemonResponse> {
     if (!this.relayClient) return { id: req.id, success: false, error: 'Relay client not initialized' };
     const reachabilityPolicy = this.getReachabilityPolicy();
     const reachabilityStatus = this.buildReachabilityStatus();
+    const connectedRelays = this.relayClient.getConnectedRelays();
+    const stats = this.queue ? await this.queue.getStats() : null;
+
     return {
       id: req.id,
       success: true,
       data: {
         running: true,
-        connectedRelays: this.relayClient.getConnectedRelays(),
+        connected: connectedRelays.length > 0,
+        relay: connectedRelays[0] || null,
+        connectedRelays,
         knownRelays: this.relayClient.getKnownRelays(),
         peerCount: this.relayClient.getPeerCount(),
+        messages: stats?.inboxTotal ?? 0,
         did: this.identity.did,
         reachabilityPolicy,
         reachabilityStatus,
@@ -726,7 +1038,15 @@ export class ClawDaemon {
 
   private async handleUnblock(req: DaemonRequest): Promise<DaemonResponse> {
     if (!this.defense) return { id: req.id, success: false, error: 'Defense not initialized' };
-    await this.defense.unblockAgent(req.params.did);
+    const { did, resetTrust = true } = req.params;
+    await this.defense.unblockAgent(did);
+
+    // Reset interaction history by default to prevent immediate re-blocking
+    if (resetTrust && this.trustSystem) {
+      await this.trustSystem.resetInteractionHistory(did);
+      logger.info('Reset interaction history for unblocked agent', { did });
+    }
+
     return { id: req.id, success: true };
   }
 

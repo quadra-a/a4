@@ -1,9 +1,11 @@
 /**
  * Enhanced Agent Card Types for Phase 2
  *
- * Adds structured capabilities, JSON-LD support, and trust metrics
+ * Adds structured capabilities, JSON-LD support, trust metrics,
+ * and device-directory publication for E2E messaging.
  */
 
+import type { PublishedDeviceDirectoryEntry } from '../e2e/types.js';
 import type { TrustScore } from '../trust/trust-score.js';
 
 /**
@@ -22,9 +24,9 @@ export interface CapabilityParameter {
  * Structured Capability Definition
  */
 export interface Capability {
-  '@type'?: string;  // JSON-LD type (e.g., "TranslationService")
-  id: string;        // Unique capability ID
-  name: string;      // Human-readable name
+  '@type'?: string;
+  id: string;
+  name: string;
   description: string;
   parameters?: CapabilityParameter[];
   metadata?: Record<string, unknown>;
@@ -34,15 +36,16 @@ export interface Capability {
  * Enhanced Agent Card with JSON-LD support
  */
 export interface AgentCard {
-  '@context'?: string[];  // JSON-LD context
+  '@context'?: string[];
   did: string;
   name: string;
   description: string;
   version: string;
-  capabilities: Capability[];  // Changed from string[] to Capability[]
+  capabilities: Capability[];
   endpoints: string[];
+  devices?: PublishedDeviceDirectoryEntry[];
   peerId?: string;
-  trust?: TrustScore;  // Trust metrics
+  trust?: TrustScore;
   metadata?: Record<string, unknown>;
   timestamp: number;
   signature: string;
@@ -56,7 +59,7 @@ export interface LegacyAgentCard {
   name: string;
   description: string;
   version: string;
-  capabilities: string[];  // Flat string array
+  capabilities: string[];
   endpoints: string[];
   peerId?: string;
   metadata?: Record<string, unknown>;
@@ -68,9 +71,9 @@ export interface LegacyAgentCard {
  * Check if card is legacy format
  */
 export function isLegacyCard(card: AgentCard | LegacyAgentCard): card is LegacyAgentCard {
-  return Array.isArray(card.capabilities) &&
-         card.capabilities.length > 0 &&
-         typeof card.capabilities[0] === 'string';
+  return Array.isArray(card.capabilities)
+    && card.capabilities.length > 0
+    && typeof card.capabilities[0] === 'string';
 }
 
 /**
@@ -79,7 +82,7 @@ export function isLegacyCard(card: AgentCard | LegacyAgentCard): card is LegacyA
 export function upgradeLegacyCard(legacy: LegacyAgentCard): AgentCard {
   return {
     ...legacy,
-    capabilities: legacy.capabilities.map(cap => ({
+    capabilities: legacy.capabilities.map((cap) => ({
       id: cap,
       name: cap,
       description: `Capability: ${cap}`,
@@ -91,9 +94,9 @@ export function upgradeLegacyCard(legacy: LegacyAgentCard): AgentCard {
  * Convert new card to legacy format (for backward compatibility)
  */
 export function downgradeToLegacyCard(card: AgentCard): LegacyAgentCard {
-  const { '@context': _, trust: __, ...rest } = card;
+  const { '@context': _, trust: __, devices: ___, ...rest } = card;
   return {
     ...rest,
-    capabilities: card.capabilities.map(cap => cap.id),
+    capabilities: card.capabilities.map((cap) => cap.id),
   };
 }

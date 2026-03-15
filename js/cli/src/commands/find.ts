@@ -48,7 +48,15 @@ function renderAgentCard(agent: DiscoveryAgent, isHuman: boolean): void {
 
 function renderAgentResults(cards: DiscoveryAgent[], isHuman: boolean): void {
   if (cards.length === 0) {
-    console.log(isHuman ? 'No agents found.' : 'NO_RESULTS');
+    if (isHuman) {
+      console.log('No agents found.');
+      console.log('Agents may exist but be offline. Try: a4 find --query <term>');
+    } else {
+      llmSection('Find Results');
+      llmKeyValue('Count', '0');
+      llmKeyValue('Hint', 'Agents may exist but be offline');
+      console.log();
+    }
     return;
   }
 
@@ -99,10 +107,11 @@ export function createFindCommand(config: FindCommandOptions = {}): Command {
     .option('--online', 'Only show currently online agents when the field is available')
     .option('--relay <url>', 'Relay WebSocket URL')
     .option('--human', 'Human-friendly output with colors')
+    .option('--json', 'Output as JSON')
     .option('--alias <name>', 'Auto-alias the top result with this name')
     .action(async (capabilityArg: string | undefined, options) => {
       try {
-        const isHuman = Boolean(options.human);
+        const isHuman = Boolean(options.human) && !options.json;
         const capability = capabilityArg ?? options.capability;
         const limit = parseInt(options.limit, 10);
 
@@ -145,7 +154,20 @@ export function createFindCommand(config: FindCommandOptions = {}): Command {
           ? cards.filter((card) => card.online !== false)
           : cards;
 
-        renderAgentResults(filteredCards, isHuman);
+        if (options.json) {
+          console.log(JSON.stringify({
+            agents: filteredCards.map((card) => ({
+              did: card.did,
+              name: card.name ?? null,
+              description: card.description ?? null,
+              capabilities: capabilityNames(card) || null,
+              trust: card.trust ? card.trust.interactionScore : null,
+            })),
+            count: filteredCards.length,
+          }, null, 2));
+        } else {
+          renderAgentResults(filteredCards, isHuman);
+        }
 
         if (options.alias && filteredCards.length > 0) {
           const validation = validateAliasName(options.alias);

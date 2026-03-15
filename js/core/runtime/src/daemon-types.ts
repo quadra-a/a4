@@ -36,7 +36,10 @@ export type DaemonCommand =
   | 'get_reachability_policy'
   | 'set_reachability_policy'
   | 'reset_reachability_policy'
-  | 'get_reachability_status';
+  | 'get_reachability_status'
+  | 'query-card'
+  | 'e2e-reset-notify'
+  | 'reload-e2e';
 
 export interface DaemonRequest<TParams = Record<string, any>> {
   id: string;
@@ -95,4 +98,8 @@ export interface SetReachabilityPolicyParams {
 export interface ReachabilityPolicyResponse {
   policy: ReachabilityPolicy;
   status: ReachabilityStatus;
+}
+
+export interface E2EResetNotifyParams {
+  peers: string[];
 }

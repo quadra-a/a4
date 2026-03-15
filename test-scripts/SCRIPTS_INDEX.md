@@ -11,6 +11,9 @@ A compact index of the current relay test harness in `repos/a4/test-scripts`.
 # Quick Agent Groups overlay smoke test
 ./test-quick-agent-groups.sh
 
+# Discovery/card signature regression suite
+./test-discovery-card-signatures.sh
+
 # Benchmark CLI wall-clock latency and throughput
 ./benchmark-relay.sh
 
@@ -23,6 +26,7 @@ A compact index of the current relay test harness in `repos/a4/test-scripts`.
 | Script | Purpose |
 | --- | --- |
 | `test-relay-quick.sh` | Fast smoke test for discovery and messaging |
+| `test-discovery-card-signatures.sh` | Runs the JS protocol and Rust runtime regressions for client-side Agent Card verification |
 | `test-quick-agent-groups.sh` | Local public-relay smoke test for Quick Agent Groups overlay discovery and filtering |
 | `test-relay-deployment.sh` | Real local deployment test for startup, federation admission, and quarantine |
 | `lib/relay-deployment.sh` | Reusable shell helpers for deployment startup, teardown, and summaries |
@@ -38,15 +42,19 @@ A compact index of the current relay test harness in `repos/a4/test-scripts`.
 | `validate-test-results.sh` | Scores results against compliance thresholds |
 | `verify-performance.sh` | Verifies the current performance wiring and docs |
 
-## Planned E2E encryption assets
+## E2E encryption assets
 
-These are planning and fixture assets for the upcoming encrypted application-message protocol. They are not finished harness scripts yet.
+These include planning/fixture assets, executable local JS↔Rust harnesses, and a retained-artifact real-machine harness. Real-machine evidence collection is now scripted even though the full retained operator runs are still pending.
 
 | Asset | Purpose |
 | --- | --- |
-| `e2e/README.md` | Overview of the future E2E harness surface and artifact layout |
+| `e2e/README.md` | Overview of the current E2E harness surface and artifact layout |
 | `e2e/TEST_MATRIX.yaml` | Shared scenario catalog for JS, Rust, relay, and real-machine suites |
 | `e2e/REAL_MACHINE_FULL_CHAIN_TEST.md` | Live environment chain validation plan |
+| `e2e/test-e2e-real-machine.sh` | Creates retained real-machine scenario directories, captures artifacts, runs plaintext scans, and enforces completeness checks |
+| `e2e/test-e2e-cross-lang.sh` | Runs executable JS↔Rust cross-language checks for `E2E-CROSS-001`, `E2E-CROSS-002`, `E2E-CROSS-006`, federated delivery `E2E-FED-001`, and relay-backed offline delivery `E2E-CROSS-005` |
+| `e2e/test-e2e-negative.sh` | Runs live local-relay negative-security checks for `E2E-NEG-001` through `E2E-NEG-008` across JS and Rust sender/receiver paths |
+| `e2e/tools/e2e-probe.mjs` | Generates JS artifacts, prepares/tampers raw encrypted envelopes, polls published cards, and scans relay artifacts for forbidden plaintext in the executable harnesses |
 | `e2e/vectors/README.md` | Shared vector directory contract |
 | `e2e/vectors/schema.json` | JSON Schema for future shared vector files |
 

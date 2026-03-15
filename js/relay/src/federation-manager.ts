@@ -12,6 +12,7 @@ import { WebSocket } from 'ws';
 import { encode as encodeCBOR, decode as decodeCBOR } from 'cbor-x';
 import type { RelayIdentity } from './relay-identity.js';
 import type { AgentRegistry, DirectoryAgentEntry } from './registry.js';
+import type { ClaimedPreKeyBundle } from './types.js';
 import type { ConnectionContext } from './relay-agent-types.js';
 import type {
   CardMessage,
@@ -21,6 +22,8 @@ import type {
   AgentJoinedMessage,
   AgentLeftMessage,
   FetchCardMessage,
+  FetchPreKeyBundleMessage,
+  PreKeyBundleMessage,
   RouteRequestMessage,
   RouteResponseMessage,
   FederationHealthCheckMessage,
@@ -69,6 +72,10 @@ const PROBATIONARY_MESSAGE_TYPES = new Set<string>([
   'FETCH_CARD',
   'CARD',
 ]);
+
+interface FederationPreKeyStore {
+  claimBundle(did: string, deviceId: string, requesterRealm: string): Promise<ClaimedPreKeyBundle | null>;
+}
 
 function isWebSocketEndpoint(endpoint: string): boolean {
   return endpoint.startsWith('ws://') || endpoint.startsWith('wss://');
@@ -171,6 +178,11 @@ export class FederationManager {
   private discoveryTimer: NodeJS.Timeout | null = null;
   private pendingHealthChecks = new Map<string, PendingPeerProbe<void>>();
   private pendingCardFetches = new Map<string, PendingPeerProbe<CardMessage> & { did: string }>();
+  private pendingPreKeyFetches = new Map<string, PendingPeerProbe<PreKeyBundleMessage> & {
+    relayDid: string;
+    did: string;
+    deviceId: string;
+  }>();
   private inboundHandshakeAttemptsByIp = new Map<string, SlidingWindowCounter>();
   private inboundHandshakeAttemptsByDid = new Map<string, SlidingWindowCounter>();
   private inboundHandshakeFailuresByIp = new Map<string, SlidingWindowCounter>();
@@ -181,7 +193,8 @@ export class FederationManager {
   constructor(
     relayIdentity: RelayIdentity,
     registry: AgentRegistry,
-    config: Partial<FederationConfig> = {}
+    config: Partial<FederationConfig> = {},
+    private preKeyStore: FederationPreKeyStore | null = null,
   ) {
     this.relayIdentity = relayIdentity;
     this.registry = registry;
@@ -248,6 +261,12 @@ export class FederationManager {
       pending.reject(new Error('Federation manager stopped'));
     }
     this.pendingCardFetches.clear();
+
+    for (const pending of this.pendingPreKeyFetches.values()) {
+      clearTimeout(pending.timeout);
+      pending.reject(new Error('Federation manager stopped'));
+    }
+    this.pendingPreKeyFetches.clear();
     this.inboundHandshakeAttemptsByIp.clear();
     this.inboundHandshakeAttemptsByDid.clear();
     this.inboundHandshakeFailuresByIp.clear();
@@ -452,6 +471,18 @@ export class FederationManager {
         cardProbe.reject(new Error(errorMessage));
       }
     }
+
+    for (const [requestId, pending] of this.pendingPreKeyFetches.entries()) {
+      if (pending.relayDid !== relayDid) {
+        continue;
+      }
+
+      clearTimeout(pending.timeout);
+      this.pendingPreKeyFetches.delete(requestId);
+      if (errorMessage) {
+        pending.reject(new Error(errorMessage));
+      }
+    }
   }
 
   private clearProbationTimer(relay: FederatedRelay | undefined): void {
@@ -654,6 +685,52 @@ export class FederationManager {
 
       relay.ws!.send(encodeCBOR(fetchCard));
     });
+  }
+
+  async fetchRemotePreKeyBundle(
+    did: string,
+    deviceId: string,
+    requesterRealm = 'public',
+  ): Promise<ClaimedPreKeyBundle | null> {
+    const route = this.remoteAgentRoutes.get(did);
+    if (!route || route.realm !== requesterRealm) {
+      return null;
+    }
+
+    const relay = this.getConnectedRelay(route.relayDid);
+    if (!relay?.ws || relay.ws.readyState !== WebSocket.OPEN) {
+      this.remoteAgentRoutes.delete(did);
+      return null;
+    }
+
+    const requestId = `${route.relayDid}:${did}:${deviceId}:${Math.random().toString(36).slice(2)}`;
+    const request: FetchPreKeyBundleMessage = {
+      type: 'FETCH_PREKEY_BUNDLE',
+      did,
+      deviceId,
+      requestId,
+      requesterRealm,
+    };
+
+    const response = await new Promise<PreKeyBundleMessage>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.pendingPreKeyFetches.delete(requestId);
+        reject(new Error('Federated pre-key fetch timed out'));
+      }, this.config.connectionTimeout);
+
+      this.pendingPreKeyFetches.set(requestId, {
+        relayDid: route.relayDid,
+        did,
+        deviceId,
+        resolve,
+        reject,
+        timeout,
+      });
+
+      relay.ws!.send(encodeCBOR(request));
+    });
+
+    return response.bundle ?? null;
   }
 
   private isMessageAllowedDuringProbation(msg: RelayMessage): boolean {
@@ -996,6 +1073,13 @@ export class FederationManager {
           const relayCard = welcome.relayCard ?? expectedRelayCard;
           const relayEndpoints = welcome.endpoints?.length ? welcome.endpoints : relayCard?.endpoints ?? [endpoint];
 
+          // Guard against self-connection (e.g. seed relay pointing to ourselves)
+          if (relayDid === this.relayIdentity.getIdentity().did) {
+            ws.close(1000, 'Self-connection detected');
+            finish(false);
+            return;
+          }
+
           if (!relayCard) {
             console.warn(`Seed relay ${relayDid} did not return a relay card`);
             ws.close(1008, 'Missing relay card in federation welcome');
@@ -1263,6 +1347,14 @@ export class FederationManager {
         await this.handleFederationCard(relayDid, msg as CardMessage);
         break;
 
+      case 'FETCH_PREKEY_BUNDLE':
+        await this.handleFederationFetchPreKeyBundle(ws, relayDid, msg as FetchPreKeyBundleMessage);
+        break;
+
+      case 'PREKEY_BUNDLE':
+        await this.handleFederationPreKeyBundle(relayDid, msg as PreKeyBundleMessage);
+        break;
+
       default:
         console.warn(`Unknown federation message type: ${msg.type}`);
     }
@@ -1427,6 +1519,29 @@ export class FederationManager {
     ws.send(encodeCBOR(response));
   }
 
+  private async handleFederationFetchPreKeyBundle(
+    ws: WebSocket,
+    _relayDid: string,
+    msg: FetchPreKeyBundleMessage,
+  ): Promise<void> {
+    const requesterRealm = typeof msg.requesterRealm === 'string' && msg.requesterRealm.length > 0
+      ? msg.requesterRealm
+      : 'public';
+    const bundle = this.preKeyStore
+      ? await this.preKeyStore.claimBundle(msg.did, msg.deviceId, requesterRealm)
+      : null;
+
+    const response: PreKeyBundleMessage = {
+      type: 'PREKEY_BUNDLE',
+      did: msg.did,
+      deviceId: msg.deviceId,
+      bundle,
+      ...(msg.requestId ? { requestId: msg.requestId } : {}),
+    };
+
+    ws.send(encodeCBOR(response));
+  }
+
   private async handleFederationCard(relayDid: string, msg: CardMessage): Promise<void> {
     const pending = this.pendingCardFetches.get(relayDid);
     if (!pending || pending.did !== msg.did) {
@@ -1436,6 +1551,30 @@ export class FederationManager {
     clearTimeout(pending.timeout);
     this.pendingCardFetches.delete(relayDid);
     pending.resolve(msg);
+  }
+
+  private async handleFederationPreKeyBundle(relayDid: string, msg: PreKeyBundleMessage): Promise<void> {
+    const requestId = typeof msg.requestId === 'string' ? msg.requestId : null;
+    if (requestId) {
+      const pending = this.pendingPreKeyFetches.get(requestId);
+      if (!pending || pending.relayDid !== relayDid) {
+        return;
+      }
+
+      clearTimeout(pending.timeout);
+      this.pendingPreKeyFetches.delete(requestId);
+      pending.resolve(msg);
+      return;
+    }
+
+    for (const [pendingId, pending] of this.pendingPreKeyFetches.entries()) {
+      if (pending.relayDid === relayDid && pending.did === msg.did && pending.deviceId === msg.deviceId) {
+        clearTimeout(pending.timeout);
+        this.pendingPreKeyFetches.delete(pendingId);
+        pending.resolve(msg);
+        return;
+      }
+    }
   }
 
   /**

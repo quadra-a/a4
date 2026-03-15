@@ -52,3 +52,7 @@ pub fn save_config(config: &Config) -> Result<()> {
 
     Ok(())
 }
+
+pub fn build_card(config: &Config, identity: &IdentityConfig) -> Result<crate::protocol::AgentCard> {
+    quadra_a_runtime::card::build_agent_card_from_config(config, identity)
+}

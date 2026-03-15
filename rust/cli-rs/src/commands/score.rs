@@ -9,6 +9,7 @@ use anyhow::Result;
 pub struct ScoreOptions {
     pub target: String,
     pub detailed: bool,
+    pub json: bool,
     pub human: bool,
 }
 
@@ -38,28 +39,36 @@ pub async fn run(opts: ScoreOptions) -> Result<()> {
         Ok(score) => score,
         Err(e) => {
             if opts.human {
-                eprintln!("Warning: Could not compute trust score from network: {}", e);
-                eprintln!("Falling back to placeholder data...");
+                eprintln!("Could not compute trust score: {}", e);
+                eprintln!("Ensure daemon is running (a4 listen) or relay is reachable.");
             }
-
-            // Return placeholder trust score
-            crate::trust::TrustScore {
-                score: 0.75,
-                local_trust: 0.6,
-                network_trust: 0.8,
-                alpha: 0.3,
-                endorsement_count: 12,
-                interaction_count: 45,
-                breakdown: crate::trust::TrustBreakdown {
-                    capability_endorsements: 8,
-                    reliability_endorsements: 4,
-                    general_endorsements: 0,
-                    recent_activity: ActivityLevel::High,
-                    network_position: NetworkPosition::WellConnected,
-                },
-            }
+            anyhow::bail!("Trust score unavailable: {}", e);
         }
     };
+
+    if opts.json {
+        let mut result = serde_json::json!({
+            "target": target_did,
+            "score": trust_score.score,
+            "scorePercent": format!("{:.1}%", trust_score.score * 100.0),
+            "endorsementCount": trust_score.endorsement_count,
+            "interactionCount": trust_score.interaction_count,
+        });
+        if opts.detailed {
+            result["localTrust"] = serde_json::json!(trust_score.local_trust);
+            result["networkTrust"] = serde_json::json!(trust_score.network_trust);
+            result["alpha"] = serde_json::json!(trust_score.alpha);
+            result["breakdown"] = serde_json::json!({
+                "capabilityEndorsements": trust_score.breakdown.capability_endorsements,
+                "reliabilityEndorsements": trust_score.breakdown.reliability_endorsements,
+                "generalEndorsements": trust_score.breakdown.general_endorsements,
+                "recentActivity": format!("{:?}", trust_score.breakdown.recent_activity),
+                "networkPosition": format!("{:?}", trust_score.breakdown.network_position),
+            });
+        }
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
 
     if opts.human {
         println!("Trust Score: {:.1}%", trust_score.score * 100.0);
@@ -255,7 +264,7 @@ async fn compute_trust_score_via_relay(
         .ok_or_else(|| anyhow::anyhow!("No identity found"))?;
     let keypair = KeyPair::from_hex(&identity.private_key)?;
 
-    let card = crate::commands::discover::build_card(config, identity)?;
+    let card = crate::config::build_card(config, identity)?;
 
     // Query endorsements from relay
     let (mut session, _relay_url) =

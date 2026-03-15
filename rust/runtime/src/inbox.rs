@@ -12,6 +12,38 @@ pub enum MessageDirection {
     Outbound,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum E2EDeliveryState {
+    Pending,
+    Sent,
+    Received,
+    Failed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct E2EDeliveryMetadata {
+    pub transport: String,
+    #[serde(rename = "senderDeviceId")]
+    pub sender_device_id: String,
+    #[serde(rename = "receiverDeviceId")]
+    pub receiver_device_id: String,
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    pub state: E2EDeliveryState,
+    #[serde(rename = "recordedAt")]
+    pub recorded_at: u64,
+    #[serde(default, rename = "usedSkippedMessageKey", skip_serializing_if = "Option::is_none")]
+    pub used_skipped_message_key: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredMessageE2EMetadata {
+    pub deliveries: Vec<E2EDeliveryMetadata>,
+}
+
 impl MessageDirection {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -33,6 +65,8 @@ pub struct StoredMessage {
     #[serde(default)]
     pub read: bool,
     pub direction: MessageDirection,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub e2e: Option<StoredMessageE2EMetadata>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -94,6 +128,61 @@ fn session_title(message: &StoredMessage) -> String {
         .unwrap_or_else(|| format!("Conversation with {}", peer_did(message)))
 }
 
+fn build_e2e_delivery_key(delivery: &E2EDeliveryMetadata) -> String {
+    format!(
+        "{}:{}:{}",
+        delivery.sender_device_id, delivery.receiver_device_id, delivery.session_id
+    )
+}
+
+fn merge_e2e_deliveries(
+    existing: &[E2EDeliveryMetadata],
+    incoming: &[E2EDeliveryMetadata],
+) -> Vec<E2EDeliveryMetadata> {
+    let mut merged = std::collections::BTreeMap::<String, E2EDeliveryMetadata>::new();
+
+    for delivery in existing {
+        merged.insert(build_e2e_delivery_key(delivery), delivery.clone());
+    }
+
+    for delivery in incoming {
+        let key = build_e2e_delivery_key(delivery);
+        if let Some(current) = merged.get_mut(&key) {
+            current.transport = delivery.transport.clone();
+            current.state = delivery.state.clone();
+            current.recorded_at = delivery.recorded_at;
+            if delivery.used_skipped_message_key.is_some() {
+                current.used_skipped_message_key = delivery.used_skipped_message_key;
+            }
+            current.error = match (&delivery.error, &delivery.state) {
+                (Some(error), _) => Some(error.clone()),
+                (None, E2EDeliveryState::Failed) => current.error.clone(),
+                (None, _) => None,
+            };
+        } else {
+            merged.insert(key, delivery.clone());
+        }
+    }
+
+    merged.into_values().collect()
+}
+
+fn merge_message_e2e(existing: &mut StoredMessage, incoming: Option<&StoredMessageE2EMetadata>) {
+    let Some(incoming) = incoming else {
+        return;
+    };
+
+    let merged = merge_e2e_deliveries(
+        existing
+            .e2e
+            .as_ref()
+            .map(|metadata| metadata.deliveries.as_slice())
+            .unwrap_or(&[]),
+        &incoming.deliveries,
+    );
+    existing.e2e = Some(StoredMessageE2EMetadata { deliveries: merged });
+}
+
 #[derive(Clone, Debug)]
 pub struct MessageStore {
     messages: Vec<StoredMessage>,
@@ -123,6 +212,15 @@ impl MessageStore {
     }
 
     pub fn store(&mut self, message: StoredMessage) {
+        if let Some(existing) = self
+            .messages
+            .iter_mut()
+            .find(|existing| existing.id == message.id && existing.direction == message.direction)
+        {
+            merge_message_e2e(existing, message.e2e.as_ref());
+            return;
+        }
+
         self.messages.push(message);
         let msg_len = self.messages.len();
         if msg_len > self.max_messages {
@@ -204,6 +302,14 @@ impl MessageStore {
         sessions
     }
 
+    pub fn peer_count(&self) -> usize {
+        let mut peers = std::collections::HashSet::new();
+        for message in &self.messages {
+            peers.insert(peer_did(message));
+        }
+        peers.len()
+    }
+
     pub fn session_messages(&self, thread_id: &str, limit: usize) -> (Vec<StoredMessage>, usize) {
         let mut messages = self
             .messages
@@ -218,12 +324,36 @@ impl MessageStore {
         let page = messages.into_iter().skip(start).collect::<Vec<_>>();
         (page, total)
     }
+
+    pub fn upsert_e2e_delivery(
+        &mut self,
+        message_id: &str,
+        direction: MessageDirection,
+        delivery: E2EDeliveryMetadata,
+    ) -> bool {
+        let Some(message) = self
+            .messages
+            .iter_mut()
+            .find(|message| message.id == message_id && message.direction == direction)
+        else {
+            return false;
+        };
+
+        merge_message_e2e(
+            message,
+            Some(&StoredMessageE2EMetadata {
+                deliveries: vec![delivery],
+            }),
+        );
+        true
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        effective_thread_id, parse_envelope_value, MessageDirection, MessageStore, StoredMessage,
+        effective_thread_id, parse_envelope_value, E2EDeliveryMetadata, E2EDeliveryState,
+        MessageDirection, MessageStore, StoredMessage, StoredMessageE2EMetadata,
     };
     use serde_json::json;
 
@@ -239,6 +369,7 @@ mod tests {
             thread_id: None,
             read: false,
             direction: MessageDirection::Inbound,
+            e2e: None,
         });
         store.store(StoredMessage {
             id: "msg-2".to_string(),
@@ -249,6 +380,7 @@ mod tests {
             thread_id: None,
             read: true,
             direction: MessageDirection::Outbound,
+            e2e: None,
         });
 
         let first = store
@@ -276,6 +408,7 @@ mod tests {
             thread_id: None,
             read: false,
             direction: MessageDirection::Inbound,
+            e2e: None,
         });
 
         let (page, total) = store.inbox_page(10, true, None);
@@ -286,6 +419,103 @@ mod tests {
         let (unread_page, unread_total) = store.inbox_page(10, true, None);
         assert_eq!(unread_total, 0);
         assert!(unread_page.is_empty());
+    }
+
+    #[test]
+    fn store_dedupes_duplicate_ids_per_direction() {
+        let mut store = MessageStore::new(10);
+        store.store(StoredMessage {
+            id: "msg-1".to_string(),
+            from: "did:agent:alice".to_string(),
+            to: "did:agent:me".to_string(),
+            envelope: json!({"payload": {"text": "hello"}}),
+            timestamp: 10,
+            thread_id: None,
+            read: false,
+            direction: MessageDirection::Inbound,
+            e2e: None,
+        });
+        store.store(StoredMessage {
+            id: "msg-1".to_string(),
+            from: "did:agent:alice".to_string(),
+            to: "did:agent:me".to_string(),
+            envelope: json!({"payload": {"text": "hello duplicate"}}),
+            timestamp: 11,
+            thread_id: None,
+            read: false,
+            direction: MessageDirection::Inbound,
+            e2e: None,
+        });
+        store.store(StoredMessage {
+            id: "msg-1".to_string(),
+            from: "did:agent:me".to_string(),
+            to: "did:agent:alice".to_string(),
+            envelope: json!({"payload": {"text": "same id outbound is separate"}}),
+            timestamp: 12,
+            thread_id: None,
+            read: true,
+            direction: MessageDirection::Outbound,
+            e2e: None,
+        });
+
+        assert_eq!(store.len(), 2);
+        let (messages, total) = store.inbox_page(10, false, None);
+        assert_eq!(total, 2);
+        assert_eq!(messages.len(), 2);
+    }
+
+    #[test]
+    fn store_merges_duplicate_e2e_deliveries_per_direction() {
+        let mut store = MessageStore::new(10);
+        store.store(StoredMessage {
+            id: "msg-1".to_string(),
+            from: "did:agent:alice".to_string(),
+            to: "did:agent:me".to_string(),
+            envelope: json!({"payload": {"text": "hello"}}),
+            timestamp: 10,
+            thread_id: None,
+            read: false,
+            direction: MessageDirection::Inbound,
+            e2e: Some(StoredMessageE2EMetadata {
+                deliveries: vec![E2EDeliveryMetadata {
+                    transport: "prekey".to_string(),
+                    sender_device_id: "device-alice".to_string(),
+                    receiver_device_id: "device-me-primary".to_string(),
+                    session_id: "session-a".to_string(),
+                    state: E2EDeliveryState::Received,
+                    recorded_at: 10,
+                    used_skipped_message_key: Some(false),
+                    error: None,
+                }],
+            }),
+        });
+        store.store(StoredMessage {
+            id: "msg-1".to_string(),
+            from: "did:agent:alice".to_string(),
+            to: "did:agent:me".to_string(),
+            envelope: json!({"payload": {"text": "hello duplicate"}}),
+            timestamp: 11,
+            thread_id: None,
+            read: false,
+            direction: MessageDirection::Inbound,
+            e2e: Some(StoredMessageE2EMetadata {
+                deliveries: vec![E2EDeliveryMetadata {
+                    transport: "session".to_string(),
+                    sender_device_id: "device-alice".to_string(),
+                    receiver_device_id: "device-me-secondary".to_string(),
+                    session_id: "session-b".to_string(),
+                    state: E2EDeliveryState::Received,
+                    recorded_at: 11,
+                    used_skipped_message_key: Some(true),
+                    error: None,
+                }],
+            }),
+        });
+
+        assert_eq!(store.len(), 1);
+        let (messages, total) = store.inbox_page(10, false, None);
+        assert_eq!(total, 1);
+        assert_eq!(messages[0].e2e.as_ref().expect("e2e metadata").deliveries.len(), 2);
     }
 
     #[test]

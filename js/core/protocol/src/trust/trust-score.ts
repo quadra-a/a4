@@ -37,6 +37,7 @@ export interface Interaction {
   responseTime: number;
   rating?: number;              // 1-5 stars (optional user rating)
   feedback?: string;
+  failureReason?: string;       // Reason for failure: blocked, rate_limited, trust_too_low
 }
 
 /**

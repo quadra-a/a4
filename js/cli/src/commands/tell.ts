@@ -7,6 +7,7 @@ import {
   redactPayloadForDisplay,
   resolveTargetDid,
   resolveThreadId,
+  type DiscoveryCapability,
 } from '../services/messaging.js';
 import {
   buildMessageTrace,
@@ -15,6 +16,7 @@ import {
   resolveQueuedMessageId,
   waitForMessageOutcome,
 } from '../services/inbox.js';
+import { DaemonClient } from '../services/messaging.js';
 import { error, info, printHeader, success, warn } from '../ui.js';
 
 function serializeStoredMessage(message: StoredMessage | null) {
@@ -30,6 +32,19 @@ function serializeStoredMessage(message: StoredMessage | null) {
     replyTo: message.envelope.replyTo ?? null,
     payload: message.envelope.payload,
   };
+}
+
+function extractPrimaryProtocol(capabilities?: DiscoveryCapability[]): string | null {
+  if (!capabilities) return null;
+
+  for (const cap of capabilities) {
+    const capId = typeof cap === 'string' ? cap : cap.id;
+    if (capId === 'shell/exec' || capId === 'gpu/compute') {
+      return '/shell/exec/1.0.0';
+    }
+  }
+
+  return null;
 }
 
 export function registerTellCommand(program: Command): void {
@@ -63,15 +78,43 @@ export function registerTellCommand(program: Command): void {
         }
 
         const resolved = await resolveTargetDid(target, options.relay);
-        const payload = await buildMessagePayload({
+
+        // Auto-detect protocol from agent card if not explicitly set
+        let effectiveProtocol = options.protocol;
+        if (effectiveProtocol === '/agent/msg/1.0.0') {
+          let detectedProtocol = resolved.agent ? extractPrimaryProtocol(resolved.agent.capabilities) : null;
+
+          if (!detectedProtocol) {
+            try {
+              const client = new DaemonClient();
+              if (await client.isDaemonRunning()) {
+                const response = await client.send<{ card?: { capabilities?: DiscoveryCapability[] } }>('query_agent_card', { did: resolved.did });
+                if (response.card?.capabilities) {
+                  detectedProtocol = extractPrimaryProtocol(response.card.capabilities);
+                }
+              }
+            } catch {
+              // Ignore daemon query errors, fall back to default protocol
+            }
+          }
+
+          if (detectedProtocol) {
+            effectiveProtocol = detectedProtocol;
+          }
+        }
+
+        let payload = await buildMessagePayload({
           message,
           payload: options.payload,
           file: options.file,
         });
+        if (effectiveProtocol === '/shell/exec/1.0.0' && message && !options.payload && !options.file) {
+          payload = { command: message };
+        }
         const threadId = resolveThreadId(options);
         const result = await dispatchMessage({
           to: resolved.did,
-          protocol: options.protocol,
+          protocol: effectiveProtocol,
           payload,
           type: 'message',
           replyTo,

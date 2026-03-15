@@ -72,6 +72,9 @@ enum Commands {
         /// Relay URL
         #[arg(long, env = "QUADRA_A_RELAY")]
         relay: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
         /// Human-friendly output with colors
         #[arg(long)]
         human: bool,
@@ -87,7 +90,7 @@ enum Commands {
         #[arg(long)]
         payload: Option<String>,
         /// Protocol identifier
-        #[arg(long, default_value = "highway1/chat/1.0")]
+        #[arg(long, default_value = "/agent/msg/1.0.0")]
         protocol: String,
         /// Reply to an earlier message ID
         #[arg(long)]
@@ -104,6 +107,9 @@ enum Commands {
         /// Relay URL
         #[arg(long, env = "QUADRA_A_RELAY")]
         relay: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
         /// Human-friendly output with colors
         #[arg(long)]
         human: bool,
@@ -116,6 +122,9 @@ enum Commands {
         /// Show detailed trust breakdown
         #[arg(long)]
         detailed: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
         /// Human-friendly output with colors
         #[arg(long)]
         human: bool,
@@ -146,6 +155,9 @@ enum Commands {
         /// Optional comment
         #[arg(long)]
         comment: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
         /// Human-friendly output with colors
         #[arg(long)]
         human: bool,
@@ -164,15 +176,12 @@ enum Commands {
         /// Maximum endorsements to show
         #[arg(long, default_value = "20")]
         limit: u32,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
         /// Human-friendly output with colors
         #[arg(long)]
         human: bool,
-    },
-
-    /// Legacy-style trust command group
-    Trust {
-        #[command(subcommand)]
-        action: TrustAction,
     },
 
     /// Block an agent
@@ -182,6 +191,9 @@ enum Commands {
         /// Reason for blocking
         #[arg(long)]
         reason: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
         /// Human-friendly output with colors
         #[arg(long)]
         human: bool,
@@ -191,6 +203,27 @@ enum Commands {
     Unblock {
         /// Agent DID or alias to unblock
         target: String,
+        /// Preserve interaction history (by default, history is reset to prevent auto-re-blocking)
+        #[arg(long)]
+        keep_history: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+        /// Human-friendly output with colors
+        #[arg(long)]
+        human: bool,
+    },
+
+    /// Allowlist an agent (bypass all defense checks)
+    Allow {
+        /// Agent DID or alias to allowlist
+        target: String,
+        /// Note about this agent
+        #[arg(long)]
+        note: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
         /// Human-friendly output with colors
         #[arg(long)]
         human: bool,
@@ -224,7 +257,7 @@ enum Commands {
         capabilities: Option<String>,
     },
 
-    /// Stop daemon and leave the network
+    /// Disconnect from relays and stop the local listener
     Leave,
 
     /// Publish agent card to relay index
@@ -232,6 +265,9 @@ enum Commands {
         /// Relay URL
         #[arg(long, env = "QUADRA_A_RELAY")]
         relay: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
         /// Human-friendly output with colors
         #[arg(long)]
         human: bool,
@@ -242,6 +278,9 @@ enum Commands {
         /// Relay URL
         #[arg(long, env = "QUADRA_A_RELAY")]
         relay: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
         /// Human-friendly output with colors
         #[arg(long)]
         human: bool,
@@ -276,14 +315,10 @@ enum Commands {
         action: AliasAction,
     },
 
-    /// Show agent card and identity
+    /// Manage agent card details
     Card {
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-        /// Human-friendly output with colors
-        #[arg(long)]
-        human: bool,
+        #[command(subcommand)]
+        action: CardAction,
     },
 
     /// Manage conversation threads
@@ -292,18 +327,17 @@ enum Commands {
         action: SessionsAction,
     },
 
-    /// Show identity information
+    /// Manage identity information
     Identity {
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-        /// Human-friendly output with colors
-        #[arg(long)]
-        human: bool,
+        #[command(subcommand)]
+        action: IdentityAction,
     },
 
     /// Show connected peers
     Peers {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
         /// Human-friendly output with colors
         #[arg(long)]
         human: bool,
@@ -319,7 +353,7 @@ enum Commands {
         host: String,
     },
 
-    /// Stop daemon
+    /// Stop the local daemon
     Stop,
 
     /// Manage network reachability policy
@@ -338,98 +372,11 @@ enum Commands {
         human: bool,
     },
 
-    // ── Legacy Commands (Hidden) ──────────────────────────────────────────────────
-    /// Initialize a new agent identity
-    #[command(hide = true)]
-    Init {
-        /// Agent name
-        #[arg(long, default_value = "My Agent")]
-        name: String,
-        /// Agent description
-        #[arg(long, default_value = "")]
-        description: String,
-        /// Overwrite existing identity
-        #[arg(long)]
-        force: bool,
-    },
-
-    /// Discover agents on the relay (legacy)
-    #[command(hide = true)]
-    Discover {
-        /// Search query (capability name, keyword, or empty for all)
-        #[arg(long, default_value = "")]
-        query: String,
-        /// Maximum number of results
-        #[arg(long)]
-        limit: Option<u32>,
-        /// Relay URL
-        #[arg(long, env = "QUADRA_A_RELAY")]
-        relay: Option<String>,
-        /// Human-friendly output with colors
-        #[arg(long)]
-        human: bool,
-    },
-
-    /// Send a message to an agent (legacy)
-    #[command(hide = true)]
-    Send {
-        /// Recipient DID, alias, or search text
-        #[arg(long)]
-        to: String,
-        /// Message text (shorthand for --payload '{"text":"..."}')
-        #[arg(long)]
-        message: Option<String>,
-        /// Raw JSON payload
-        #[arg(long)]
-        payload: Option<String>,
-        /// Message type: notification, request, response
-        #[arg(long, default_value = "notification")]
-        r#type: String,
-        /// Protocol identifier
-        #[arg(long, default_value = "highway1/chat/1.0")]
-        protocol: String,
-        /// Relay URL
-        #[arg(long, env = "QUADRA_A_RELAY")]
-        relay: Option<String>,
-        /// Human-friendly output with colors
-        #[arg(long)]
-        human: bool,
-        /// Continue conversation in existing thread (CVP-0014)
-        #[arg(long)]
-        thread: Option<String>,
-        /// Start a new conversation thread (CVP-0014)
-        #[arg(long)]
-        new_thread: bool,
-    },
-    /// Daemon management (legacy)
-    #[command(hide = true)]
-    Daemon {
+    /// Manage E2E encryption sessions
+    E2e {
         #[command(subcommand)]
-        action: DaemonAction,
+        action: E2eAction,
     },
-
-    // ── Removal Stubs ─────────────────────────────────────────────────────────────
-    /// Removed command - use 'tell --wait' instead
-    #[command(hide = true)]
-    Ask {
-        target: Option<String>,
-        message: Option<String>,
-    },
-
-    /// Removed command - use 'find' then 'tell' instead
-    #[command(hide = true)]
-    Route {
-        capability: Option<String>,
-        message: Option<String>,
-    },
-}
-
-#[derive(Subcommand)]
-enum DaemonAction {
-    /// Show daemon status
-    Status,
-    /// Stop the daemon
-    Stop,
 }
 
 #[derive(Subcommand)]
@@ -466,6 +413,9 @@ enum AliasAction {
         name: String,
         /// DID to alias
         did: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// List all aliases
     List {
@@ -513,81 +463,43 @@ enum SessionsAction {
 }
 
 #[derive(Subcommand)]
-enum TrustAction {
-    /// Show trust score for an agent
+enum CardAction {
+    /// Show the current agent card
     Show {
-        target: String,
+        /// Output as JSON
         #[arg(long)]
-        detailed: bool,
-        #[arg(long)]
-        human: bool,
-    },
-    /// Create a general endorsement for an agent
-    Endorse {
-        target: String,
-        #[arg(long, default_value = "0.8")]
-        score: f64,
-        #[arg(long, default_value = "Good collaboration")]
-        reason: String,
-        #[arg(long)]
-        domain: Option<String>,
+        json: bool,
+        /// Human-friendly output with colors
         #[arg(long)]
         human: bool,
     },
-    /// Show endorsement history for an agent
-    History {
-        target: String,
-        #[arg(long, default_value = "10")]
-        limit: u32,
+}
+
+#[derive(Subcommand)]
+enum IdentityAction {
+    /// Show the current identity
+    Show {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+        /// Human-friendly output with colors
         #[arg(long)]
         human: bool,
     },
-    /// Show local trust statistics
-    Stats {
+}
+
+#[derive(Subcommand)]
+enum E2eAction {
+    /// Show E2E session status
+    Status {
+        /// Output as JSON
         #[arg(long)]
-        human: bool,
+        json: bool,
     },
-    /// Query endorsements for an agent
-    Query {
-        target: String,
-        #[arg(long)]
-        domain: Option<String>,
-        #[arg(long, default_value = "20")]
-        limit: u32,
-        #[arg(long)]
-        human: bool,
-    },
-    /// Block an agent
-    Block {
-        target: String,
-        #[arg(long)]
-        reason: Option<String>,
-        #[arg(long)]
-        human: bool,
-    },
-    /// Unblock an agent
-    Unblock {
-        target: String,
-        #[arg(long)]
-        human: bool,
-    },
-    /// List blocked agents
-    ListBlocked {
-        #[arg(long)]
-        human: bool,
-    },
-    /// Add an agent to the local allowlist
-    Allow {
-        target: String,
-        #[arg(long)]
-        note: Option<String>,
-        #[arg(long)]
-        human: bool,
-    },
-    /// List allowlisted agents
-    ListAllowed {
-        #[arg(long)]
-        human: bool,
+    /// Clear E2E sessions (for a specific peer or all)
+    Reset {
+        /// Peer DID to clear sessions for (omit to clear all)
+        peer: Option<String>,
     },
 }
 
@@ -606,6 +518,7 @@ async fn main() -> Result<()> {
             min_trust,
             alias,
             relay,
+            json,
             human,
         } => {
             commands::find::run(commands::find::FindOptions {
@@ -616,6 +529,7 @@ async fn main() -> Result<()> {
                 min_trust,
                 alias,
                 relay,
+                json,
                 human,
             })
             .await?;
@@ -631,18 +545,24 @@ async fn main() -> Result<()> {
             new_thread,
             wait,
             relay,
+            json,
             human,
         } => {
+            // Detect if --protocol was explicitly set by the user
+            let protocol_explicit = std::env::args().any(|arg| arg == "--protocol");
+
             commands::tell::run(commands::tell::TellOptions {
                 target,
                 message,
                 payload,
                 protocol,
+                protocol_explicit,
                 reply_to,
                 thread,
                 new_thread,
                 wait,
                 relay,
+                json,
                 human,
             })
             .await?;
@@ -651,11 +571,13 @@ async fn main() -> Result<()> {
         Commands::Score {
             target,
             detailed,
+            json,
             human,
         } => {
             commands::score::run(commands::score::ScoreOptions {
                 target,
                 detailed,
+                json,
                 human,
             })
             .await?;
@@ -679,6 +601,7 @@ async fn main() -> Result<()> {
             r#type,
             strength,
             comment,
+            json,
             human,
         } => {
             commands::vouch::run(commands::vouch::VouchOptions {
@@ -687,6 +610,7 @@ async fn main() -> Result<()> {
                 strength,
                 comment,
                 domain: None, // TODO: Add domain support to CLI args
+                json,
                 human,
             })
             .await?;
@@ -697,6 +621,7 @@ async fn main() -> Result<()> {
             created_by,
             domain,
             limit,
+            json,
             human,
         } => {
             commands::endorsements::run(commands::endorsements::EndorsementsOptions {
@@ -704,117 +629,44 @@ async fn main() -> Result<()> {
                 created_by,
                 domain,
                 limit,
+                json,
                 human,
             })
             .await?;
         }
 
-        Commands::Trust { action } => match action {
-            TrustAction::Show {
-                target,
-                detailed,
-                human,
-            } => {
-                commands::trust_cli::show(commands::trust_cli::TrustShowOptions {
-                    target,
-                    detailed,
-                    human,
-                })
-                .await?;
-            }
-            TrustAction::Endorse {
-                target,
-                score,
-                reason,
-                domain,
-                human,
-            } => {
-                commands::trust_cli::endorse(commands::trust_cli::TrustEndorseOptions {
-                    target,
-                    score,
-                    reason,
-                    domain,
-                    human,
-                })
-                .await?;
-            }
-            TrustAction::History {
-                target,
-                limit,
-                human,
-            } => {
-                commands::trust_cli::history(commands::trust_cli::TrustHistoryOptions {
-                    target,
-                    limit,
-                    human,
-                })
-                .await?;
-            }
-            TrustAction::Stats { human } => {
-                commands::trust_cli::stats(commands::trust_cli::TrustStatsOptions { human })
-                    .await?;
-            }
-            TrustAction::Query {
-                target,
-                domain,
-                limit,
-                human,
-            } => {
-                commands::trust_cli::query(commands::trust_cli::TrustQueryOptions {
-                    target,
-                    domain,
-                    limit,
-                    human,
-                })
-                .await?;
-            }
-            TrustAction::Block {
-                target,
-                reason,
-                human,
-            } => {
-                commands::trust_cli::block(target, reason, human).await?;
-            }
-            TrustAction::Unblock { target, human } => {
-                commands::trust_cli::unblock(target, human).await?;
-            }
-            TrustAction::ListBlocked { human } => {
-                commands::trust_cli::list_blocked(commands::trust_cli::TrustListOptions { human })
-                    .await?;
-            }
-            TrustAction::Allow {
-                target,
-                note,
-                human,
-            } => {
-                commands::trust_cli::allow(commands::trust_cli::TrustAllowOptions {
-                    target,
-                    note,
-                    human,
-                })
-                .await?;
-            }
-            TrustAction::ListAllowed { human } => {
-                commands::trust_cli::list_allowed(commands::trust_cli::TrustListOptions { human })
-                    .await?;
-            }
-        },
-
         Commands::Block {
             target,
             reason,
+            json,
             human,
         } => {
             commands::block::run(commands::block::BlockOptions {
                 target,
                 reason,
+                json,
                 human,
             })
             .await?;
         }
 
-        Commands::Unblock { target, human } => {
-            commands::unblock::run(commands::unblock::UnblockOptions { target, human }).await?;
+        Commands::Unblock { target, keep_history, json, human } => {
+            commands::unblock::run(commands::unblock::UnblockOptions { target, keep_history, json, human }).await?;
+        }
+
+        Commands::Allow {
+            target,
+            note,
+            json,
+            human,
+        } => {
+            commands::allow::run(commands::allow::AllowOptions {
+                target,
+                note,
+                json,
+                human,
+            })
+            .await?;
         }
 
         Commands::Listen {
@@ -844,12 +696,12 @@ async fn main() -> Result<()> {
             commands::leave::run(commands::leave::LeaveOptions {}).await?;
         }
 
-        Commands::Publish { relay, human } => {
-            commands::publish::run(commands::publish::PublishOptions { relay, human }).await?;
+        Commands::Publish { relay, json, human } => {
+            commands::publish::run(commands::publish::PublishOptions { relay, json, human }).await?;
         }
 
-        Commands::Unpublish { relay, human } => {
-            commands::unpublish::run(commands::unpublish::UnpublishOptions { relay, human })
+        Commands::Unpublish { relay, json, human } => {
+            commands::unpublish::run(commands::unpublish::UnpublishOptions { relay, json, human })
                 .await?;
         }
 
@@ -874,8 +726,8 @@ async fn main() -> Result<()> {
         }
 
         Commands::Alias { action } => match action {
-            AliasAction::Set { name, did } => {
-                commands::alias::set(commands::alias::AliasSetOptions { name, did })?;
+            AliasAction::Set { name, did, json } => {
+                commands::alias::set(commands::alias::AliasSetOptions { name, did, json })?;
             }
             AliasAction::List { human } => {
                 commands::alias::list(commands::alias::AliasListOptions { human })?;
@@ -888,9 +740,11 @@ async fn main() -> Result<()> {
             }
         },
 
-        Commands::Card { json, human } => {
-            commands::status::run(commands::status::StatusOptions { json, human }).await?;
-        }
+        Commands::Card { action } => match action {
+            CardAction::Show { json, human } => {
+                commands::card::show(commands::card::CardShowOptions { json, human }).await?;
+            }
+        },
 
         Commands::Sessions { action } => match action {
             SessionsAction::List { with, limit, human } => {
@@ -915,12 +769,15 @@ async fn main() -> Result<()> {
             }
         },
 
-        Commands::Identity { json, human } => {
-            commands::status::run(commands::status::StatusOptions { json, human }).await?;
-        }
+        Commands::Identity { action } => match action {
+            IdentityAction::Show { json, human } => {
+                commands::identity::show(commands::identity::IdentityShowOptions { json, human })
+                    .await?;
+            }
+        },
 
-        Commands::Peers { human } => {
-            commands::peers::run(commands::peers::PeersOptions { human }).await?;
+        Commands::Peers { json, human } => {
+            commands::peers::run(commands::peers::PeersOptions { json, human }).await?;
         }
 
         Commands::Serve { port, host } => {
@@ -974,92 +831,15 @@ async fn main() -> Result<()> {
             commands::status::run(commands::status::StatusOptions { json, human }).await?;
         }
 
-        // ── Legacy Commands ────────────────────────────────────────────────────────
-        Commands::Init {
-            name,
-            description,
-            force,
-        } => {
-            eprintln!("Warning: 'init' is deprecated. Use 'a4 listen' instead for automatic identity creation.");
-            eprintln!(
-                "Example: a4 listen --discoverable --name \"{}\" --description \"{}\"",
-                name, description
-            );
-            commands::init::run(commands::init::InitOptions {
-                name,
-                description,
-                force,
-            })?;
-        }
-
-        Commands::Discover {
-            query,
-            limit,
-            relay,
-            human,
-        } => {
-            eprintln!("Warning: 'discover' is deprecated. Use 'find' instead.");
-            eprintln!("Example: a4 find {}", query);
-            commands::discover::run(commands::discover::DiscoverOptions {
-                query,
-                limit,
-                relay,
-                human,
-            })
-            .await?;
-        }
-
-        Commands::Send {
-            to,
-            message,
-            payload,
-            r#type,
-            protocol,
-            relay,
-            human,
-            thread,
-            new_thread,
-        } => {
-            eprintln!("Warning: 'send' is deprecated. Use 'tell' instead.");
-            eprintln!(
-                "Example: a4 tell {} \"{}\"",
-                to,
-                message.as_deref().unwrap_or("message")
-            );
-            commands::send::run(commands::send::SendOptions {
-                to,
-                message,
-                payload,
-                msg_type: r#type,
-                relay,
-                protocol,
-                human,
-                thread,
-                new_thread,
-            })
-            .await?;
-        }
-        Commands::Daemon { action } => match action {
-            DaemonAction::Status => {
-                eprintln!("Warning: 'daemon status' is deprecated. Use 'status' instead.");
-                commands::daemon::status(commands::daemon::DaemonStatusOptions {}).await?;
+        Commands::E2e { action } => match action {
+            E2eAction::Status { json } => {
+                commands::e2e::e2e_status(commands::e2e::E2eStatusOptions { json }).await?;
             }
-            DaemonAction::Stop => {
-                eprintln!("Warning: 'daemon stop' is deprecated. Use 'stop' instead.");
-                commands::daemon::stop(commands::daemon::DaemonStopOptions {}).await?;
+            E2eAction::Reset { peer } => {
+                commands::e2e::e2e_reset(commands::e2e::E2eResetOptions { peer_did: peer })
+                    .await?;
             }
         },
-
-        // ── Removal Stubs ──────────────────────────────────────────────────────────
-        Commands::Ask { .. } => {
-            eprintln!("Error: 'ask' has been removed. Use: a4 tell <target> <message> --wait");
-            std::process::exit(1);
-        }
-
-        Commands::Route { .. } => {
-            eprintln!("Error: 'route' has been removed. Use: a4 find <capability>, then a4 tell <target> <message>");
-            std::process::exit(1);
-        }
     }
 
     Ok(())

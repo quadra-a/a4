@@ -3,6 +3,30 @@ import type { RelayAgentRuntime, RelayMessageRoutingHandlers } from './relay-age
 import { normalizeEnvelopeBytes, randomMessageId } from './relay-agent-shared.js';
 import type { DeliverMessage, DeliveryReportMessage, SendMessage } from './types.js';
 
+function sendDeliveryReport(
+  sender: {
+    online?: boolean;
+    ws: {
+      readyState: number;
+      send(data: Uint8Array): void;
+    };
+  } | undefined,
+  messageId: string,
+  status: DeliveryReportMessage['status'],
+): void {
+  if (!sender || sender.online === false || sender.ws.readyState !== 1) {
+    return;
+  }
+
+  const report: DeliveryReportMessage = {
+    type: 'DELIVERY_REPORT',
+    messageId,
+    status,
+    timestamp: Date.now(),
+  };
+  sender.ws.send(encodeCBOR(report));
+}
+
 export async function routeMessage(
   runtime: RelayAgentRuntime,
   _handlers: RelayMessageRoutingHandlers,
@@ -11,16 +35,7 @@ export async function routeMessage(
 ): Promise<void> {
   const identity = runtime.relayIdentity.getIdentity();
   if (msg.to === identity.did) {
-    const sender = runtime.registry.get(fromDid);
-    if (sender) {
-      const report: DeliveryReportMessage = {
-        type: 'DELIVERY_REPORT',
-        messageId: randomMessageId(),
-        status: 'unknown_recipient',
-        timestamp: Date.now(),
-      };
-      sender.ws.send(encodeCBOR(report));
-    }
+    sendDeliveryReport(runtime.registry.get(fromDid), randomMessageId(), 'unknown_recipient');
     return;
   }
 
@@ -37,16 +52,7 @@ export async function routeMessage(
       fromDid,
     );
     if (routed) {
-      const sender = runtime.registry.get(fromDid);
-      if (sender) {
-        const report: DeliveryReportMessage = {
-          type: 'DELIVERY_REPORT',
-          messageId: randomMessageId(),
-          status: 'delivered',
-          timestamp: Date.now(),
-        };
-        sender.ws.send(encodeCBOR(report));
-      }
+      sendDeliveryReport(runtime.registry.get(fromDid), randomMessageId(), 'delivered');
       return;
     }
   }
@@ -59,159 +65,54 @@ export async function handleSend(runtime: RelayAgentRuntime, fromDid: string, ms
   const target = runtime.registry.get(msg.to);
 
   if (sender && target && sender.realm !== target.realm) {
-    const report: DeliveryReportMessage = {
-      type: 'DELIVERY_REPORT',
-      messageId: randomMessageId(),
-      status: 'unknown_recipient',
-      timestamp: Date.now(),
-    };
-    sender.ws.send(encodeCBOR(report));
+    sendDeliveryReport(sender, randomMessageId(), 'unknown_recipient');
     return;
   }
 
+  if (!runtime.queue) {
+    sendDeliveryReport(sender, randomMessageId(), 'queue_full');
+    return;
+  }
+
+  const normalizedEnvelope = normalizeEnvelopeBytes(msg.envelope as Uint8Array | number[] | Record<string, unknown>);
+  let messageId: string;
+  try {
+    messageId = await runtime.queue.enqueue(msg.to, fromDid, normalizedEnvelope);
+    runtime.statusManager?.recordMessageQueued();
+  } catch (err) {
+    sendDeliveryReport(sender, randomMessageId(), 'queue_full');
+    console.error('Failed to queue message:', (err as Error).message);
+    return;
+  }
+
+  sendDeliveryReport(sender, messageId, 'accepted');
+
   if (!target || !target.online) {
-    if (runtime.queue) {
-      try {
-        const messageId = await runtime.queue.enqueue(
-          msg.to,
-          fromDid,
-          normalizeEnvelopeBytes(msg.envelope as Uint8Array | number[] | Record<string, unknown>),
-        );
+    console.log(`Message queued for offline agent ${msg.to}`);
+    return;
+  }
 
-        runtime.statusManager?.recordMessageQueued();
-
-        if (sender) {
-          const report: DeliveryReportMessage = {
-            type: 'DELIVERY_REPORT',
-            messageId,
-            status: 'delivered',
-            timestamp: Date.now(),
-          };
-          sender.ws.send(encodeCBOR(report));
-        }
-
-        console.log(`Message queued for offline agent ${msg.to}`);
-        return;
-      } catch (err) {
-        if (sender) {
-          const report: DeliveryReportMessage = {
-            type: 'DELIVERY_REPORT',
-            messageId: randomMessageId(),
-            status: 'queue_full',
-            timestamp: Date.now(),
-          };
-          sender.ws.send(encodeCBOR(report));
-        }
-        console.error('Failed to queue message:', (err as Error).message);
-        return;
-      }
-    }
-
-    if (sender) {
-      const report: DeliveryReportMessage = {
-        type: 'DELIVERY_REPORT',
-        messageId: randomMessageId(),
-        status: 'unknown_recipient',
-        timestamp: Date.now(),
-      };
-      sender.ws.send(encodeCBOR(report));
-    }
+  // Check WebSocket state before sending to prevent silent failures
+  if (target.ws.readyState !== 1 /* WebSocket.OPEN */) {
+    console.warn(`Target ${msg.to} WebSocket not open (readyState=${target.ws.readyState}), queueing message`);
+    target.online = false;
     return;
   }
 
   const deliver: DeliverMessage = {
     type: 'DELIVER',
-    messageId: randomMessageId(),
+    messageId,
     from: fromDid,
-    envelope: normalizeEnvelopeBytes(msg.envelope as Uint8Array | number[] | Record<string, unknown>),
+    envelope: normalizedEnvelope,
   };
-
-  // Check WebSocket state before sending to prevent silent failures
-  if (target.ws.readyState !== 1 /* WebSocket.OPEN */) {
-    console.warn(`Target ${msg.to} WebSocket not open (readyState=${target.ws.readyState}), queueing message`);
-    // Mark as offline and queue the message
-    target.online = false;
-    if (runtime.queue) {
-      try {
-        const messageId = await runtime.queue.enqueue(
-          msg.to,
-          fromDid,
-          normalizeEnvelopeBytes(msg.envelope as Uint8Array | number[] | Record<string, unknown>),
-        );
-        runtime.statusManager?.recordMessageQueued();
-        if (sender) {
-          const report: DeliveryReportMessage = {
-            type: 'DELIVERY_REPORT',
-            messageId,
-            status: 'delivered',
-            timestamp: Date.now(),
-          };
-          sender.ws.send(encodeCBOR(report));
-        }
-        return;
-      } catch (err) {
-        console.error('Failed to queue message after WebSocket check:', (err as Error).message);
-      }
-    }
-    // Fall through to unknown_recipient if queueing fails
-    if (sender) {
-      const report: DeliveryReportMessage = {
-        type: 'DELIVERY_REPORT',
-        messageId: randomMessageId(),
-        status: 'unknown_recipient',
-        timestamp: Date.now(),
-      };
-      sender.ws.send(encodeCBOR(report));
-    }
-    return;
-  }
 
   try {
     target.ws.send(encodeCBOR(deliver));
+    await runtime.queue.markInflight(messageId, msg.to);
     runtime.statusManager?.recordMessageRouted();
-
-    if (sender) {
-      const report: DeliveryReportMessage = {
-        type: 'DELIVERY_REPORT',
-        messageId: deliver.messageId,
-        status: 'delivered',
-        timestamp: Date.now(),
-      };
-      sender.ws.send(encodeCBOR(report));
-    }
   } catch (err) {
     console.error(`Failed to send message to ${msg.to}:`, (err as Error).message);
-    // Queue the message if send fails
-    if (runtime.queue) {
-      try {
-        const messageId = await runtime.queue.enqueue(
-          msg.to,
-          fromDid,
-          normalizeEnvelopeBytes(msg.envelope as Uint8Array | number[] | Record<string, unknown>),
-        );
-        runtime.statusManager?.recordMessageQueued();
-        if (sender) {
-          const report: DeliveryReportMessage = {
-            type: 'DELIVERY_REPORT',
-            messageId,
-            status: 'delivered',
-            timestamp: Date.now(),
-          };
-          sender.ws.send(encodeCBOR(report));
-        }
-      } catch (queueErr) {
-        console.error('Failed to queue message after send error:', (queueErr as Error).message);
-        if (sender) {
-          const report: DeliveryReportMessage = {
-            type: 'DELIVERY_REPORT',
-            messageId: randomMessageId(),
-            status: 'queue_full',
-            timestamp: Date.now(),
-          };
-          sender.ws.send(encodeCBOR(report));
-        }
-      }
-    }
+    target.online = false;
   }
 }
 
@@ -234,7 +135,7 @@ export async function retryUnackedMessages(runtime: RelayAgentRuntime): Promise<
 
       try {
         agent.ws.send(encodeCBOR(deliver));
-        await runtime.queue.markDelivered(msg.messageId, msg.toDid);
+        await runtime.queue.markInflight(msg.messageId, msg.toDid);
         console.log(`Retrying message ${msg.messageId} to ${msg.toDid} (attempt ${msg.deliveryAttempts + 1})`);
       } catch (err) {
         console.error(`Failed to retry message ${msg.messageId} to ${msg.toDid}:`, (err as Error).message);

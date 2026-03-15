@@ -1,0 +1,60 @@
+{
+  "suite": "double-ratchet",
+  "version": 1,
+  "encoding": "hex",
+  "notes": "Deterministic Double Ratchet bootstrap/reply fixture anchored to the shared X3DH basic secret.",
+  "cases": [
+    {
+      "id": "E2E-DR-001",
+      "description": "Bootstrap sessions derive the same root, first initiator message decrypts, then responder advances DH ratchet and replies.",
+      "inputs": {
+        "sessionId": "session-dr-basic",
+        "initiatorDid": "did:agent:alice",
+        "responderDid": "did:agent:bob",
+        "initiatorDeviceId": "device-alice-1",
+        "responderDeviceId": "device-bob-1",
+        "sharedSecret": "737917b2e0a6d84cfd2c9392f8c580bbe88e853c9f00051611134b349ed45b2a",
+        "initiatorIdentityPublic": "23b7bb8c91ae008711fb12846780bcdf1e065f821bdfec49f57e7c7dcd4c4823",
+        "responderIdentityPublic": "34e42d4af5ef94a07a3a84201b889d4cd1a743cb27b11b6a10438a8feb8e5847",
+        "initiatorRatchetPrivate": "505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f",
+        "responderRatchetPrivate": "909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
+        "responderSignedPreKeyId": 7,
+        "responderOneTimePreKeyId": 9,
+        "createdAt": 100,
+        "initiatorFirstPlaintext": "68656c6c6f2d626f62",
+        "initiatorFirstMessageId": "msg-dr-1",
+        "initiatorFirstNonce": "010101010101010101010101010101010101010101010101",
+        "responderReplyRatchetPrivate": "d0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeef",
+        "responderReplyPlaintext": "68656c6c6f2d616c696365",
+        "responderReplyMessageId": "msg-dr-2",
+        "responderReplyNonce": "020202020202020202020202020202020202020202020202"
+      },
+      "expected": {
+        "initiatorRatchetPublic": "392d174a38b3b1beafaf1fe824870841c5fa531bc6eafdb6402c124664488c1c",
+        "responderRatchetPublic": "9fd7ad6dcff4298dd3f96d5b1b2af910a0535b1488d7f8fabb349a982880b615",
+        "responderReplyRatchetPublic": "6b3ee67463583cbe3dc08fe9d0765c2666ff5210dd527c9d8705e44927c80d55",
+        "initiatorInitialRootKey": "12ad157c94aa97beea9c0e21bc2714c697b74c82d83868e13e2dbd35f9c370ac",
+        "initiatorInitialSendingChainKey": "f40535fe0532ffc24089d37ed1ec5c90a0a31017c3c8028dc12b33e74e66acf3",
+        "responderInitialRootKey": "12ad157c94aa97beea9c0e21bc2714c697b74c82d83868e13e2dbd35f9c370ac",
+        "responderInitialReceivingChainKey": "f40535fe0532ffc24089d37ed1ec5c90a0a31017c3c8028dc12b33e74e66acf3",
+        "initiatorFirstMessageKey": "a64eb5090fd527138ef6d420af755568a471f3b237fffd68c0ec850212b05643",
+        "initiatorFirstCiphertext": "5f5f62c857a5dcc235e18da88ef82154c29f66e9f9d7685633",
+        "initiatorFirstMessageNumber": 0,
+        "initiatorFirstPreviousChainLength": 0,
+        "initiatorAfterFirstSendingChainKey": "215ce3ec4234713bd2b79ffedb30d34a79fca146bf85622a6097fd601dd94537",
+        "responderAfterFirstReceivingChainKey": "215ce3ec4234713bd2b79ffedb30d34a79fca146bf85622a6097fd601dd94537",
+        "responderAfterFirstNextReceiveMessageNumber": 1,
+        "responderReplyRootKey": "bc21ffd10f0a62b374e6b8acf60f11f8657c22c47420f1c81117a3836c5f41bb",
+        "responderReplySendingChainKeyAfter": "021bc8b7bce9d5f9a4aafdd5244d21f7613ea67658f5cd604cf79a7ca0b80c22",
+        "responderReplyMessageKey": "80b34d1801019d337bff7f5d8631270756e7d92ffee224fdc2bf062d39c326e8",
+        "responderReplyCiphertext": "2c1f1ce45eb59b54fade8dc660f12a71e1e68321f4dd858ece71fc",
+        "responderReplyMessageNumber": 0,
+        "responderReplyPreviousChainLength": 0,
+        "initiatorAfterReplyRootKey": "bc21ffd10f0a62b374e6b8acf60f11f8657c22c47420f1c81117a3836c5f41bb",
+        "initiatorAfterReplyReceivingChainKey": "021bc8b7bce9d5f9a4aafdd5244d21f7613ea67658f5cd604cf79a7ca0b80c22",
+        "initiatorAfterReplyNextReceiveMessageNumber": 1,
+        "initiatorAfterReplyRemoteRatchetPublicKey": "6b3ee67463583cbe3dc08fe9d0765c2666ff5210dd527c9d8705e44927c80d55"
+      }
+    }
+  ]
+}

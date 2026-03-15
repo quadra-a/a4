@@ -6,6 +6,7 @@ import type { HeartbeatTracker } from './heartbeat.js';
 import type { MessageQueue } from './queue.js';
 import type { AgentRegistry } from './registry.js';
 import type { RelayIdentity } from './relay-identity.js';
+import type { PreKeyStore } from './prekey-store.js';
 import type { RelayStatusManager } from './relay-status-manager.js';
 import type { RevocationList } from './revocation.js';
 import type { SubscriptionManager } from './subscription-manager.js';
@@ -22,6 +23,7 @@ export interface RelayAgentRuntime {
   registry: AgentRegistry;
   heartbeat: HeartbeatTracker;
   queue: MessageQueue | null;
+  preKeyStore: PreKeyStore | null;
   wsToDidMap: Map<WebSocket, string>;
   subscriptions: SubscriptionManager;
   endorsements: EndorsementIndex;

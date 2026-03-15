@@ -6,7 +6,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { generateThreadId } from './envelope.js';
 import { MessageStorage } from './storage.js';
 import type { MessageEnvelope } from './envelope.js';
-import type { StoredMessage } from './types.js';
+import type { E2EDeliveryMetadata, StoredMessage } from './types.js';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { mkdtempSync, rmSync } from 'fs';
@@ -117,6 +117,133 @@ describe('MessageStorage - Thread Operations', () => {
       const retrieved = await storage.getMessage('msg1');
       expect(retrieved).toBeDefined();
       expect(retrieved?.envelope.threadId).toBeUndefined();
+    });
+
+    it('should merge duplicate E2E deliveries onto one stored message', async () => {
+      const threadId = generateThreadId();
+      const initialDelivery: E2EDeliveryMetadata = {
+        transport: 'prekey',
+        senderDeviceId: 'device-alice',
+        receiverDeviceId: 'device-bob-primary',
+        sessionId: 'session-a',
+        state: 'received',
+        recordedAt: 100,
+        usedSkippedMessageKey: false,
+      };
+      const message = createTestMessage('msg1', 'did:agent:alice', 'did:agent:bob', threadId, 'Hello once');
+      message.e2e = { deliveries: [initialDelivery] };
+
+      await storage.putMessage(message);
+
+      const merged = await storage.upsertE2EDeliveries('msg1', [
+        {
+          transport: 'session',
+          senderDeviceId: 'device-alice',
+          receiverDeviceId: 'device-bob-secondary',
+          sessionId: 'session-b',
+          state: 'received',
+          recordedAt: 200,
+          usedSkippedMessageKey: true,
+        },
+        {
+          transport: 'session',
+          senderDeviceId: 'device-alice',
+          receiverDeviceId: 'device-bob-primary',
+          sessionId: 'session-a',
+          state: 'received',
+          recordedAt: 150,
+          usedSkippedMessageKey: false,
+        },
+      ]);
+
+      expect(merged?.e2e?.deliveries).toEqual([
+        {
+          transport: 'session',
+          senderDeviceId: 'device-alice',
+          receiverDeviceId: 'device-bob-primary',
+          sessionId: 'session-a',
+          state: 'received',
+          recordedAt: 150,
+          usedSkippedMessageKey: false,
+        },
+        {
+          transport: 'session',
+          senderDeviceId: 'device-alice',
+          receiverDeviceId: 'device-bob-secondary',
+          sessionId: 'session-b',
+          state: 'received',
+          recordedAt: 200,
+          usedSkippedMessageKey: true,
+        },
+      ]);
+
+      const stored = await storage.getMessage('msg1');
+      expect(stored?.e2e?.deliveries).toEqual(merged?.e2e?.deliveries);
+    });
+
+    it('should upsert duplicate message ids without duplicating inbox rows or session counts', async () => {
+      const threadId = generateThreadId();
+      const message = createTestMessage('msg1', 'did:agent:alice', 'did:agent:bob', threadId, 'Hello once', {
+        envelopeTimestamp: 1000,
+        receivedAt: 1100,
+      });
+      message.e2e = {
+        deliveries: [{
+          transport: 'prekey',
+          senderDeviceId: 'device-alice',
+          receiverDeviceId: 'device-bob-primary',
+          sessionId: 'session-a',
+          state: 'received',
+          recordedAt: 1100,
+          usedSkippedMessageKey: false,
+        }],
+      };
+
+      await storage.putMessage(message);
+      await storage.putMessage({
+        ...message,
+        receivedAt: 1200,
+        e2e: {
+          deliveries: [{
+            transport: 'session',
+            senderDeviceId: 'device-alice',
+            receiverDeviceId: 'device-bob-secondary',
+            sessionId: 'session-b',
+            state: 'received',
+            recordedAt: 1200,
+            usedSkippedMessageKey: true,
+          }],
+        },
+      });
+
+      const stored = await storage.getMessage('msg1');
+      expect(stored?.receivedAt).toBe(1100);
+      expect(stored?.e2e?.deliveries).toEqual([
+        {
+          transport: 'prekey',
+          senderDeviceId: 'device-alice',
+          receiverDeviceId: 'device-bob-primary',
+          sessionId: 'session-a',
+          state: 'received',
+          recordedAt: 1100,
+          usedSkippedMessageKey: false,
+        },
+        {
+          transport: 'session',
+          senderDeviceId: 'device-alice',
+          receiverDeviceId: 'device-bob-secondary',
+          sessionId: 'session-b',
+          state: 'received',
+          recordedAt: 1200,
+          usedSkippedMessageKey: true,
+        },
+      ]);
+
+      const page = await storage.queryMessages('inbound');
+      expect(page.total).toBe(1);
+
+      const session = await storage.getSession(threadId);
+      expect(session?.messageCount).toBe(1);
     });
 
     it('should normalize legacy envelope types when storing messages', async () => {

@@ -4,15 +4,19 @@ This directory contains comprehensive testing scripts for the quadra-a relay imp
 
 ## Test Scripts Overview
 
-### 🔐 Planned E2E Encryption Assets
-- **`e2e/README.md`** - Contract for the future E2E harness surface and artifacts
+### 🔐 E2E Encryption Assets
+- **`e2e/README.md`** - Current E2E harness surface, artifact layout, and remaining gaps
 - **`e2e/TEST_MATRIX.yaml`** - Shared JS/Rust/relay/real-machine scenario catalog
+- **`e2e/test-e2e-cross-lang.sh`** - Executable JS↔Rust artifact interoperability harness for `E2E-CROSS-001`, `E2E-CROSS-002`, `E2E-CROSS-006`, federated delivery `E2E-FED-001`, and relay-backed offline delivery `E2E-CROSS-005`
+- **`e2e/test-e2e-negative.sh`** - Live local-relay negative-security harness for `E2E-NEG-001` through `E2E-NEG-008`, covering forged sender-device binding rejection, sender-side invalid signed-prekey rejection, replay/tamper/plaintext rejection, and stale signed-prekey bootstrap rejection across JS and Rust paths
 - **`e2e/REAL_MACHINE_FULL_CHAIN_TEST.md`** - Full live-environment chain validation plan
+- **`e2e/test-e2e-real-machine.sh`** - Real-machine artifact harness for retained run directories, version capture, plaintext scans, and completeness checks
 - **`e2e/vectors/README.md`** - Shared vector fixture contract
 - **`e2e/vectors/schema.json`** - Schema for fixture manifests
 
 ### 🚀 Quick Tests
 - **`test-relay-quick.sh`** - Essential functionality validation (5 tests per CLI, ~30 seconds)
+- **`test-discovery-card-signatures.sh`** - Regression suite for client-side `DISCOVERED` / `CARD` signature verification
 - **`test-quick-agent-groups.sh`** - Overlay smoke test for Quick Agent Groups on a local public relay
 - **`test-relay-deployment.sh`** - Real local deployment validation for startup, federation admission, and quarantine behavior
 - **`run-core-tests.sh`** - Core test suite (quick, comprehensive, benchmark, load tests)
@@ -55,6 +59,9 @@ All test scripts now support both implementations:
 
 # Validate Quick Agent Groups overlay behavior on a local public relay
 ./test-quick-agent-groups.sh
+
+# Validate client-side discovery card signature verification
+./test-discovery-card-signatures.sh
 
 # With custom relay URL
 ./test-relay-quick.sh ws://your-relay.com:8080
@@ -183,6 +190,7 @@ pnpm build
 - Query-based search (WebSocket, relay, routes messages, etc.)
 - Empty and non-existent queries
 - Discovery with limits
+- Client-side filtering of invalid or tampered Agent Card signatures
 - **NEW**: Cross-CLI result consistency verification
 
 ### 📨 Messaging Tests (25+ tests per CLI)

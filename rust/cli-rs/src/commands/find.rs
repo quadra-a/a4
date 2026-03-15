@@ -25,6 +25,7 @@ pub struct FindOptions {
     pub min_trust: Option<f64>,
     pub alias: Option<String>,
     pub relay: Option<String>,
+    pub json: bool,
     pub human: bool,
 }
 
@@ -36,7 +37,7 @@ pub async fn run(opts: FindOptions) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("No identity found. Run `agent listen` to create one."))?;
 
     let keypair = KeyPair::from_hex(&identity.private_key)?;
-    let card = crate::commands::discover::build_card(&config, identity)?;
+    let card = crate::config::build_card(&config, identity)?;
     if opts.human {
         println!("Finding agents across configured relays...");
     }
@@ -60,6 +61,10 @@ pub async fn run(opts: FindOptions) -> Result<()> {
         session.goodbye().await?;
 
         if let Some(card) = agent_card {
+            if opts.json {
+                println!("{}", serde_json::to_string_pretty(&agent_card_to_json(&card))?);
+                return Ok(());
+            }
             render_agent_card(&card, opts.human);
 
             // Auto-alias if requested
@@ -67,6 +72,7 @@ pub async fn run(opts: FindOptions) -> Result<()> {
                 crate::commands::alias::set(crate::commands::alias::AliasSetOptions {
                     name: alias_name.clone(),
                     did: target_did.clone(),
+                    json: false,
                 })?;
                 if opts.human {
                     println!("Aliased as '{}'", alias_name);
@@ -74,6 +80,11 @@ pub async fn run(opts: FindOptions) -> Result<()> {
                     LlmFormatter::key_value("Aliased As", alias_name);
                 }
             }
+        } else if opts.json {
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                "status": "not_found",
+                "did": target_did,
+            }))?);
         } else if opts.human {
             println!("Agent not found: {}", target_did);
         } else {
@@ -122,6 +133,30 @@ pub async fn run(opts: FindOptions) -> Result<()> {
         })
         .collect();
 
+    // JSON output
+    if opts.json {
+        let agents_json: Vec<serde_json::Value> = filtered_agents
+            .iter()
+            .map(|a| agent_card_to_json(a))
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "agents": agents_json,
+            "count": filtered_agents.len(),
+        }))?);
+
+        // Auto-alias top result if requested
+        if let Some(alias_name) = &opts.alias {
+            if let Some(top_agent) = filtered_agents.first() {
+                crate::commands::alias::set(crate::commands::alias::AliasSetOptions {
+                    name: alias_name.clone(),
+                    did: top_agent.did.clone(),
+                    json: false,
+                })?;
+            }
+        }
+        return Ok(());
+    }
+
     // Render results
     render_agent_results(&filtered_agents, opts.human);
 
@@ -131,6 +166,7 @@ pub async fn run(opts: FindOptions) -> Result<()> {
             crate::commands::alias::set(crate::commands::alias::AliasSetOptions {
                 name: alias_name.clone(),
                 did: top_agent.did.clone(),
+                json: false,
             })?;
             if opts.human {
                 println!("Aliased top result as '{}'", alias_name);
@@ -164,6 +200,23 @@ pub(crate) async fn discover_agents(
         .into_iter()
         .filter_map(parse_discovered_agent_card)
         .collect())
+}
+
+fn agent_card_to_json(agent: &AgentCard) -> serde_json::Value {
+    let caps: Vec<serde_json::Value> = agent
+        .capabilities
+        .iter()
+        .map(|c| serde_json::json!({ "id": c.id, "name": c.name, "description": c.description }))
+        .collect();
+    serde_json::json!({
+        "did": agent.did,
+        "name": agent.name,
+        "description": agent.description,
+        "version": agent.version,
+        "capabilities": caps,
+        "trust": trust_score(agent),
+        "timestamp": agent.timestamp,
+    })
 }
 
 fn trust_score(agent: &AgentCard) -> Option<f64> {
@@ -240,9 +293,11 @@ fn render_agent_results(agents: &[AgentCard], human: bool) {
     if agents.is_empty() {
         if human {
             println!("No agents found.");
+            println!("Agents may exist but be offline. Try: a4 find --query <term>");
         } else {
             LlmFormatter::section("Find Results");
             LlmFormatter::key_value("Count", "0");
+            LlmFormatter::key_value("Hint", "Agents may exist but be offline");
             println!();
         }
         return;

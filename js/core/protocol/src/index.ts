@@ -31,6 +31,9 @@ export * from './messaging/timestamp.js';
 export * from './messaging/defense.js';
 export * from './messaging/rate-limiter.js';
 
+// E2E
+export * from './e2e/index.js';
+
 // Quick Agent Groups
 export * from './groups/index.js';
 

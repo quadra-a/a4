@@ -1,5 +1,4 @@
 import {
-  createAgentCard,
   createRelayClient,
   createRelayIndexOperations,
   generateAnonymousIdentity,
@@ -16,6 +15,7 @@ import {
   getRelayInviteToken,
   setAgentCard,
 } from './config.js';
+import { resolvePublishedDevices, resolvePublishedPreKeyBundles } from './e2e-config.js';
 import { DaemonClient } from './daemon-client.js';
 import { DEFAULT_BOOTSTRAP_PROVIDERS } from './reachability.js';
 
@@ -116,6 +116,11 @@ export function requireIdentity(binName: string = 'agent'): RuntimeIdentity {
   return identity;
 }
 
+function isPersistedRuntimeIdentity(identity: RuntimeIdentity): boolean {
+  const persistedIdentity = getIdentity();
+  return persistedIdentity?.did === identity.did && persistedIdentity.privateKey === identity.privateKey;
+}
+
 /**
  * Merge persisted Agent Card fields with one publish/update request.
  */
@@ -150,13 +155,17 @@ export async function buildSignedAgentCard(
     description: `Capability: ${capability}`,
   }));
 
-  const agentCard = createAgentCard(
-    identity.did,
-    cardConfig.name,
-    cardConfig.description,
+  const devices = await resolvePublishedDevices(identity);
+  const agentCard = {
+    did: identity.did,
+    name: cardConfig.name,
+    description: cardConfig.description,
+    version: '1.0.0',
     capabilities,
-    [],
-  );
+    endpoints: [],
+    ...(devices.length > 0 ? { devices } : {}),
+    timestamp: Date.now(),
+  };
 
   const signedCard = await signAgentCard(agentCard, (data) => sign(data, keyPair.privateKey));
 
@@ -198,6 +207,13 @@ export async function withRelaySession<T>(
   });
 
   await relayClient.start();
+
+  if (isPersistedRuntimeIdentity(identity)) {
+    const preKeyBundles = await resolvePublishedPreKeyBundles(identity);
+    if (preKeyBundles.length > 0) {
+      await relayClient.publishPreKeyBundles(preKeyBundles);
+    }
+  }
 
   try {
     const relayIndex = createRelayIndexOperations(relayClient);

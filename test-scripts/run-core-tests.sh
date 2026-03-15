@@ -64,6 +64,57 @@ run_test_script() {
     fi
 }
 
+run_discovery_signature_test() {
+    local cli_mode="$1"
+    local script_name="test-discovery-card-signatures.sh"
+    local description="Discovery Card Signature Regression Test"
+    local script_path="$SCRIPT_DIR/$script_name"
+    local cli_arg=""
+
+    case "$cli_mode" in
+        rust)
+            cli_arg="--rust-only"
+            ;;
+        node)
+            cli_arg="--js-only"
+            ;;
+        both|"")
+            cli_arg=""
+            ;;
+        *)
+            log_error "Unsupported discovery signature CLI mode: $cli_mode"
+            return 1
+            ;;
+    esac
+
+    log_info "Running: $description (CLI Mode: $cli_mode)"
+
+    if [[ ! -f "$script_path" ]]; then
+        log_error "Script not found: $script_path"
+        return 1
+    fi
+
+    local log_file="$RESULTS_DIR/${script_name%.sh}_${cli_mode}_$TIMESTAMP.log"
+
+    if [[ -n "$cli_arg" ]]; then
+        if "$script_path" "$cli_arg" > "$log_file" 2>&1; then
+            log_success "$description ($cli_mode) completed successfully"
+            echo "Log: $log_file"
+            return 0
+        fi
+    else
+        if "$script_path" > "$log_file" 2>&1; then
+            log_success "$description ($cli_mode) completed successfully"
+            echo "Log: $log_file"
+            return 0
+        fi
+    fi
+
+    log_error "$description ($cli_mode) failed"
+    echo "Error log: $log_file"
+    return 1
+}
+
 # Main test execution
 main() {
     echo "=================================================="
@@ -150,7 +201,16 @@ main() {
             log_warning "Quick test failed for $cli_mode - continuing with other tests"
         fi
 
-        # Test 2: Comprehensive functionality test
+        # Test 2: Discovery card signature regression test
+        ((total_tests++))
+        if run_discovery_signature_test "$cli_mode"; then
+            ((passed_tests++))
+        else
+            ((failed_tests++))
+            log_warning "Discovery card signature test failed for $cli_mode - continuing with other tests"
+        fi
+
+        # Test 3: Comprehensive functionality test
         ((total_tests++))
         if run_test_script "test-relay-comprehensive.sh" "Comprehensive Functionality Test" "$cli_mode"; then
             ((passed_tests++))

@@ -5,6 +5,8 @@ use anyhow::Result;
 
 pub struct UnblockOptions {
     pub target: String,
+    pub keep_history: bool,
+    pub json: bool,
     pub human: bool,
 }
 
@@ -34,25 +36,41 @@ pub async fn run(opts: UnblockOptions) -> Result<()> {
 
     save_config(&config)?;
 
-    let _ = inform_daemon_of_unblock(&target_did).await;
+    let reset_trust = !opts.keep_history;
+    let _ = inform_daemon_of_unblock(&target_did, reset_trust).await;
+
+    if opts.json {
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "target": target_did,
+            "status": "unblocked",
+            "resetTrust": reset_trust,
+        }))?);
+        return Ok(());
+    }
 
     if opts.human {
         println!("Unblocking agent: {}", target_did);
         println!();
         println!("Agent unblocked successfully.");
         println!("This agent can now send you messages again.");
+        if reset_trust {
+            println!("Interaction history reset (use --keep-history to preserve).");
+        }
     } else {
         LlmFormatter::section("Unblock Agent");
         LlmFormatter::key_value("Target DID", &target_did);
         LlmFormatter::key_value("Status", "unblocked");
         LlmFormatter::key_value("Effect", "Messages from this agent will be accepted");
+        if reset_trust {
+            LlmFormatter::key_value("Trust Reset", "yes");
+        }
         println!();
     }
 
     Ok(())
 }
 
-async fn inform_daemon_of_unblock(target_did: &str) -> Result<()> {
+async fn inform_daemon_of_unblock(target_did: &str, reset_trust: bool) -> Result<()> {
     let client = DaemonClient::new(&crate::daemon::daemon_socket_path());
 
     if !client.is_running().await {
@@ -62,6 +80,7 @@ async fn inform_daemon_of_unblock(target_did: &str) -> Result<()> {
     let request = serde_json::json!({
         "targetDid": target_did,
         "action": "unblock",
+        "resetTrust": reset_trust,
     });
 
     client.send_command("block_agent", request).await?;

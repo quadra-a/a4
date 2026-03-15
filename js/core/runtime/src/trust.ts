@@ -36,6 +36,11 @@ export async function withTrustSystem<T>(
 }
 
 export async function getTrustScore(did: string) {
+  const client = new DaemonClient();
+  if (await client.isDaemonRunning()) {
+    return await client.send('trust_score', { did });
+  }
+
   return withTrustSystem(async (trustSystem) => {
     const [score, endorsements] = await Promise.all([
       trustSystem.getTrustScore(did),
@@ -47,6 +52,11 @@ export async function getTrustScore(did: string) {
 }
 
 export async function endorseAgent(did: string, score: number, reason: string) {
+  const client = new DaemonClient();
+  if (await client.isDaemonRunning()) {
+    return await client.send('create_endorsement', { did, score, reason });
+  }
+
   return withTrustSystem(async (trustSystem) => {
     const identity = requireIdentity();
     const keyPair = importKeyPair({
@@ -59,6 +69,11 @@ export async function endorseAgent(did: string, score: number, reason: string) {
 }
 
 export async function getTrustHistory(did: string, limit: number) {
+  const client = new DaemonClient();
+  if (await client.isDaemonRunning()) {
+    return await client.send('query_endorsements', { did, limit });
+  }
+
   return withTrustSystem((trustSystem) => trustSystem.getHistory(did, limit));
 }
 
@@ -94,6 +109,11 @@ export async function queryNetworkEndorsements(
   did: string,
   options: { domain?: string; relay?: string } = {},
 ) {
+  const client = new DaemonClient();
+  if (await client.isDaemonRunning()) {
+    return await client.send('query_endorsements', { did, domain: options.domain });
+  }
+
   const identity = requireIdentity();
   const keyPair = importKeyPair({
     publicKey: identity.publicKey,
@@ -113,7 +133,7 @@ export async function queryNetworkEndorsements(
       })
     : getReachabilityPolicy();
 
-  const client = createRelayClient({
+  const relayClient = createRelayClient({
     relayUrls: reachabilityPolicy.bootstrapProviders,
     inviteToken: resolveRelayInviteToken(),
     did: identity.did,
@@ -125,12 +145,12 @@ export async function queryNetworkEndorsements(
       : reachabilityPolicy.bootstrapProviders.length,
   });
 
-  await client.start();
+  await relayClient.start();
 
   try {
-    return await client.queryTrust(did, options.domain);
+    return await relayClient.queryTrust(did, options.domain);
   } finally {
-    await client.stop();
+    await relayClient.stop();
   }
 }
 
@@ -151,10 +171,10 @@ export async function blockAgent(did: string, reason: string) {
   }
 }
 
-export async function unblockAgent(did: string) {
+export async function unblockAgent(did: string, resetTrust = true) {
   const client = new DaemonClient();
   if (await client.isDaemonRunning()) {
-    await client.send('unblock', { did });
+    await client.send('unblock', { did, resetTrust });
     return;
   }
 
@@ -163,6 +183,13 @@ export async function unblockAgent(did: string) {
 
   try {
     await storage.deleteBlock(did);
+
+    // Reset interaction history by default to prevent immediate re-blocking
+    if (resetTrust) {
+      await withTrustSystem(async (trustSystem) => {
+        await trustSystem.resetInteractionHistory(did);
+      });
+    }
   } finally {
     await storage.close();
   }

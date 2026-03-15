@@ -47,7 +47,11 @@ function createFakeWs(onSend?: (message: any) => void) {
   };
 }
 
-function createManager(config: Record<string, unknown> = {}, registryOverrides: Record<string, unknown> = {}) {
+function createManager(
+  config: Record<string, unknown> = {},
+  registryOverrides: Record<string, unknown> = {},
+  preKeyStore: { claimBundle: (did: string, deviceId: string, requesterRealm: string) => Promise<unknown> } | null = null,
+) {
   const relayIdentity = {
     getIdentity: () => ({
       did: 'did:agent:relay-local',
@@ -64,7 +68,7 @@ function createManager(config: Record<string, unknown> = {}, registryOverrides: 
     ...registryOverrides,
   } as any;
 
-  return new FederationManager(relayIdentity, registry, config as any);
+  return new FederationManager(relayIdentity, registry, config as any, preKeyStore as any);
 }
 
 afterEach(() => {
@@ -364,6 +368,7 @@ describe('FederationManager export policy', () => {
     expect(targetWs.sent).toHaveLength(1);
     expect(targetWs.sent[0]).toMatchObject({ type: 'DELIVER', messageId: 'msg-bytes' });
     expect(targetWs.sent[0].envelope).toBeInstanceOf(Uint8Array);
+    expect(Array.from(targetWs.sent[0].envelope)).toEqual([1, 2, 3, 4]);
   });
 
   it('stops auto-reconnecting after the configured retry limit', async () => {
@@ -521,6 +526,70 @@ describe('FederationManager export policy', () => {
     ]));
 
     verifySpy.mockRestore();
+  });
+
+
+  it('fetches remote pre-key bundles from the advertised home relay', async () => {
+    const relayDid = 'did:agent:relay-peer';
+    const targetDid = 'did:agent:remote';
+    const expectedBundle = {
+      deviceId: 'device-remote',
+      identityKeyPublic: 'identity-remote',
+      signedPreKeyPublic: 'signed-remote',
+      signedPreKeyId: 9,
+      signedPreKeySignature: 'signature-remote',
+      oneTimePreKeyCount: 0,
+      remainingOneTimePreKeyCount: 0,
+      lastResupplyAt: 321,
+      oneTimePreKey: { keyId: 4, publicKey: 'otk-remote' },
+    };
+    const manager = createManager({ exportPolicy: 'full' });
+
+    const relayWs = createFakeWs((message) => {
+      if (message.type === 'FETCH_PREKEY_BUNDLE') {
+        queueMicrotask(() => {
+          void manager.handleIncomingMessage(relayWs as any, relayDid, {
+            type: 'PREKEY_BUNDLE',
+            did: message.did,
+            deviceId: message.deviceId,
+            bundle: expectedBundle,
+            requestId: message.requestId,
+          } as any);
+        });
+      }
+    });
+
+    (manager as any).federatedRelays.set(relayDid, {
+      did: relayDid,
+      endpoints: ['ws://relay-peer.test'],
+      card: createRelayCard(relayDid),
+      ws: relayWs,
+      connected: true,
+      admissionState: 'admitted',
+      admittedByPeer: true,
+      lastSeen: Date.now(),
+      agentCount: 1,
+      uptime: 100,
+    });
+    (manager as any).remoteAgentRoutes.set(targetDid, {
+      relayDid,
+      realm: 'public',
+      card: createCard(targetDid),
+      lastSeen: Date.now(),
+    });
+
+    const bundle = await manager.fetchRemotePreKeyBundle(targetDid, 'device-remote', 'public');
+
+    expect(bundle).toEqual(expectedBundle);
+    expect(relayWs.sent).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'FETCH_PREKEY_BUNDLE',
+        did: targetDid,
+        deviceId: 'device-remote',
+        requesterRealm: 'public',
+        requestId: expect.any(String),
+      }),
+    ]));
   });
 
   it('waits for peer admission before broadcasting local federation updates', async () => {

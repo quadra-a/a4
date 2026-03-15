@@ -16,6 +16,7 @@ import type {
   MessageCallback,
   SubscriptionFilter,
   QueueStats,
+  E2EDeliveryMetadata,
 } from './types.js';
 
 const logger = createLogger('message-queue');
@@ -84,7 +85,12 @@ export class MessageQueue {
 
   // ─── Enqueue ──────────────────────────────────────────────────────────────
 
-  async enqueueInbound(envelope: MessageEnvelope, trustScore?: number, trustStatus?: import('./types.js').StoredMessage['trustStatus']): Promise<StoredMessage> {
+  async enqueueInbound(
+    envelope: MessageEnvelope,
+    trustScore?: number,
+    trustStatus?: import('./types.js').StoredMessage['trustStatus'],
+    e2eDelivery?: E2EDeliveryMetadata,
+  ): Promise<StoredMessage> {
     const msg: StoredMessage = {
       envelope,
       direction: 'inbound',
@@ -92,6 +98,7 @@ export class MessageQueue {
       receivedAt: Date.now(),
       trustScore,
       trustStatus,
+      ...(e2eDelivery ? { e2e: { deliveries: [e2eDelivery] } } : {}),
     };
     await this.storage.putMessage(msg);
     logger.debug('Enqueued inbound message', { id: envelope.id, from: envelope.from });
@@ -99,12 +106,13 @@ export class MessageQueue {
     return msg;
   }
 
-  async enqueueOutbound(envelope: MessageEnvelope): Promise<StoredMessage> {
+  async enqueueOutbound(envelope: MessageEnvelope, e2eDeliveries: E2EDeliveryMetadata[] = []): Promise<StoredMessage> {
     const msg: StoredMessage = {
       envelope,
       direction: 'outbound',
       status: 'pending',
       sentAt: Date.now(),
+      ...(e2eDeliveries.length > 0 ? { e2e: { deliveries: e2eDeliveries } } : {}),
     };
     await this.storage.putMessage(msg);
     logger.debug('Enqueued outbound message', { id: envelope.id, to: envelope.to });
@@ -117,6 +125,10 @@ export class MessageQueue {
 
   async markOutboundFailed(id: string, error: string): Promise<void> {
     await this.storage.updateMessage(id, { status: 'failed', error });
+  }
+
+  async appendE2EDelivery(id: string, delivery: E2EDeliveryMetadata): Promise<StoredMessage | null> {
+    return this.storage.upsertE2EDeliveries(id, [delivery]);
   }
 
   // ─── Subscriptions ────────────────────────────────────────────────────────

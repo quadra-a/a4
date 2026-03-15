@@ -246,7 +246,7 @@ export async function handleHello(
         };
 
         ws.send(encodeCBOR(deliver));
-        await runtime.queue.markDelivered(queuedMsg.messageId, msg.did);
+        await runtime.queue.markInflight(queuedMsg.messageId, msg.did);
       }
     }
 

@@ -5,7 +5,7 @@
  * - 24h TTL
  * - Max 1000 messages per DID
  * - Delivery retry with exponential backoff
- * - Message lifecycle: QUEUED → DELIVERED → ACKED
+ * - Message lifecycle: QUEUED → INFLIGHT → ACKED
  */
 
 import { Level } from 'level';
@@ -14,6 +14,8 @@ export type QueuedEnvelope = number[];
 export type QueuedEnvelopeInput = Uint8Array | number[];
 type LegacyQueuedEnvelope = Record<string, unknown>;
 type StoredQueuedEnvelope = QueuedEnvelope | LegacyQueuedEnvelope;
+type QueuedMessageStatus = 'queued' | 'inflight' | 'expired';
+type StoredQueuedMessageStatus = QueuedMessageStatus | 'delivered' | 'acked';
 
 export interface QueuedMessage {
   messageId: string;
@@ -24,11 +26,12 @@ export interface QueuedMessage {
   expiresAt: number;
   deliveryAttempts: number;
   lastAttemptAt?: number;
-  status: 'queued' | 'delivered' | 'acked' | 'expired';
+  status: QueuedMessageStatus;
 }
 
-interface StoredQueuedMessage extends Omit<QueuedMessage, 'envelope'> {
+interface StoredQueuedMessage extends Omit<QueuedMessage, 'envelope' | 'status'> {
   envelope: StoredQueuedEnvelope;
+  status: StoredQueuedMessageStatus;
 }
 
 export interface MessageQueueConfig {
@@ -93,10 +96,23 @@ export function deserializeQueuedEnvelope(envelope: StoredQueuedEnvelope): Queue
   return indexed.map(([, value]) => value);
 }
 
+function normalizeQueuedStatus(status: StoredQueuedMessageStatus): QueuedMessageStatus {
+  if (status === 'delivered') {
+    return 'inflight';
+  }
+
+  if (status === 'acked') {
+    return 'expired';
+  }
+
+  return status;
+}
+
 function normalizeQueuedMessage(message: StoredQueuedMessage): QueuedMessage {
   return {
     ...message,
     envelope: deserializeQueuedEnvelope(message.envelope),
+    status: normalizeQueuedStatus(message.status),
   };
 }
 
@@ -133,7 +149,7 @@ export class MessageQueue {
   }
 
   /**
-   * Queue a message for an offline agent
+   * Queue a message before delivery attempts begin
    */
   async enqueue(toDid: string, fromDid: string, envelope: QueuedEnvelopeInput): Promise<string> {
     const messageId = Math.random().toString(36).slice(2);
@@ -162,14 +178,18 @@ export class MessageQueue {
   }
 
   /**
-   * Get all queued messages for a DID (when agent reconnects)
+   * Get all outstanding messages for a DID (when agent reconnects)
    */
   async getQueuedMessages(did: string): Promise<QueuedMessage[]> {
     const messages: QueuedMessage[] = [];
     const prefix = `${did}:`;
 
     for await (const [key, value] of this.db.iterator()) {
-      if (!key.startsWith(prefix) || value.status !== 'queued') {
+      const normalizedStatus = normalizeQueuedStatus(value.status);
+      if (
+        !key.startsWith(prefix)
+        || (normalizedStatus !== 'queued' && normalizedStatus !== 'inflight')
+      ) {
         continue;
       }
 
@@ -188,38 +208,42 @@ export class MessageQueue {
   }
 
   /**
-   * Mark message as delivered (waiting for ACK)
+   * Mark message as inflight (DELIVER sent, waiting for ACK)
    */
-  async markDelivered(messageId: string, did: string): Promise<void> {
+  async markInflight(messageId: string, did: string): Promise<void> {
     const key = `${did}:${messageId}`;
     try {
       const stored = await this.db.get(key);
       const message = normalizeQueuedMessage(stored);
-      message.status = 'delivered';
+      message.status = 'inflight';
       message.deliveryAttempts++;
       message.lastAttemptAt = Date.now();
       await this.db.put(key, message);
-      console.log('Message marked as delivered', { messageId, did });
+      console.log('Message marked as inflight', { messageId, did });
     } catch (err) {
-      console.warn('Failed to mark message as delivered', { messageId, did, error: (err as Error).message });
+      console.warn('Failed to mark message as inflight', { messageId, did, error: (err as Error).message });
     }
   }
 
   /**
    * Mark message as acknowledged (can be deleted)
    */
-  async markAcked(messageId: string, did: string): Promise<void> {
+  async markAcked(messageId: string, did: string): Promise<QueuedMessage | null> {
     const key = `${did}:${messageId}`;
     try {
+      const stored = await this.db.get(key);
+      const message = normalizeQueuedMessage(stored);
       await this.db.del(key);
       console.log('Message acknowledged and deleted', { messageId, did });
+      return message;
     } catch (err) {
       console.warn('Failed to delete acked message', { messageId, did, error: (err as Error).message });
+      return null;
     }
   }
 
   /**
-   * Get messages that need retry (delivered but not acked within 60s)
+   * Get inflight messages that need retry (not acked within 60s)
    */
   async getMessagesForRetry(): Promise<QueuedMessage[]> {
     const messages: QueuedMessage[] = [];
@@ -228,7 +252,7 @@ export class MessageQueue {
 
     for await (const [key, value] of this.db.iterator()) {
       if (
-        value.status === 'delivered' &&
+        normalizeQueuedStatus(value.status) === 'inflight' &&
         value.lastAttemptAt &&
         now - value.lastAttemptAt > retryThreshold &&
         value.deliveryAttempts < this.config.maxRetries
@@ -287,7 +311,7 @@ export class MessageQueue {
     const toDelete: string[] = [];
 
     for await (const [key, value] of this.db.iterator()) {
-      if (now > value.expiresAt || value.status === 'expired') {
+      if (now > value.expiresAt || normalizeQueuedStatus(value.status) === 'expired') {
         toDelete.push(key);
       }
     }
@@ -304,14 +328,15 @@ export class MessageQueue {
   /**
    * Get queue statistics
    */
-  async getStats(): Promise<{ total: number; queued: number; delivered: number; expired: number }> {
-    const stats = { total: 0, queued: 0, delivered: 0, expired: 0 };
+  async getStats(): Promise<{ total: number; queued: number; inflight: number; expired: number }> {
+    const stats = { total: 0, queued: 0, inflight: 0, expired: 0 };
 
     for await (const [, value] of this.db.iterator()) {
       stats.total++;
-      if (value.status === 'queued') stats.queued++;
-      else if (value.status === 'delivered') stats.delivered++;
-      else if (value.status === 'expired') stats.expired++;
+      const status = normalizeQueuedStatus(value.status);
+      if (status === 'queued') stats.queued++;
+      else if (status === 'inflight') stats.inflight++;
+      else if (status === 'expired') stats.expired++;
     }
 
     return stats;

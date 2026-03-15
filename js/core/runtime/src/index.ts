@@ -1,5 +1,7 @@
 export * from './constants.js';
 export * from './config.js';
+export * from './e2e-config.js';
+export * from './e2e-receive.js';
 export * from './reachability.js';
 export * from './daemon-types.js';
 export * from './daemon-client.js';

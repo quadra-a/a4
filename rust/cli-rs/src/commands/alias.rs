@@ -4,6 +4,7 @@ use anyhow::{bail, Result};
 pub struct AliasSetOptions {
     pub name: String,
     pub did: String,
+    pub json: bool,
 }
 
 pub struct AliasListOptions {
@@ -55,10 +56,20 @@ pub fn set(opts: AliasSetOptions) -> Result<()> {
     config.aliases.insert(opts.name.clone(), opts.did.clone());
     save_config(&config)?;
 
-    println!("ALIAS SET\n");
-    println!("Name: {}", opts.name);
-    println!("DID: {}", opts.did);
-    println!();
+    if opts.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "name": opts.name,
+                "did": opts.did,
+            })
+        );
+    } else {
+        println!("ALIAS SET\n");
+        println!("Name: {}", opts.name);
+        println!("DID: {}", opts.did);
+        println!();
+    }
 
     Ok(())
 }

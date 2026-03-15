@@ -10,6 +10,7 @@ pub struct EndorsementsOptions {
     pub created_by: Option<String>,
     pub domain: Option<String>,
     pub limit: u32,
+    pub json: bool,
     pub human: bool,
 }
 
@@ -72,43 +73,10 @@ pub async fn run(opts: EndorsementsOptions) -> Result<()> {
         Ok(endorsements) => endorsements,
         Err(e) => {
             if opts.human {
-                eprintln!("Warning: Could not query endorsements from network: {}", e);
-                eprintln!("Falling back to placeholder data...");
+                eprintln!("Could not query endorsements: {}", e);
+                eprintln!("Ensure daemon is running (a4 listen) or relay is reachable.");
             }
-
-            // Return placeholder data as fallback
-            vec![
-                serde_json::json!({
-                    "endorser": "did:agent:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK",
-                    "endorsee": target_did.as_deref().unwrap_or("did:agent:z6MkrJVnaZjNXrk5jgJFN9QnBpXuP4gFeHkJv1P2QRKxdoK"),
-                    "type": "capability",
-                    "strength": 0.9,
-                    "comment": "Excellent translation work",
-                    "timestamp": 1709740800000u64,
-                    "version": "2.0",
-                    "signature": "a1b2c3d4e5f6..."
-                }),
-                serde_json::json!({
-                    "endorser": "did:agent:z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH",
-                    "endorsee": target_did.as_deref().unwrap_or("did:agent:z6MkrJVnaZjNXrk5jgJFN9QnBpXuP4gFeHkJv1P2QRKxdoK"),
-                    "type": "reliability",
-                    "strength": 0.8,
-                    "comment": "Always responds quickly",
-                    "timestamp": 1709654400000u64,
-                    "version": "2.0",
-                    "signature": "f6e5d4c3b2a1..."
-                }),
-                serde_json::json!({
-                    "endorser": "did:agent:z6MkqRYqQiSgvZQdnBytw86Qbs2ZWUkGv22od935YF4s8M7V",
-                    "endorsee": target_did.as_deref().unwrap_or("did:agent:z6MkrJVnaZjNXrk5jgJFN9QnBpXuP4gFeHkJv1P2QRKxdoK"),
-                    "type": "general",
-                    "strength": 0.75,
-                    "comment": null,
-                    "timestamp": 1709568000000u64,
-                    "version": "2.0",
-                    "signature": "1a2b3c4d5e6f..."
-                }),
-            ]
+            anyhow::bail!("Endorsements unavailable: {}", e);
         }
     };
 
@@ -124,6 +92,17 @@ pub async fn run(opts: EndorsementsOptions) -> Result<()> {
     } else {
         endorsements
     };
+
+    if opts.json {
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "target": target_did,
+            "createdBy": created_by_did,
+            "domain": opts.domain,
+            "count": endorsements.len(),
+            "endorsements": endorsements,
+        }))?);
+        return Ok(());
+    }
 
     if opts.human {
         println!("Found {} endorsement(s):", endorsements.len());
@@ -273,7 +252,7 @@ async fn query_from_relay(
         .ok_or_else(|| anyhow::anyhow!("No identity found"))?;
     let keypair = KeyPair::from_hex(&identity.private_key)?;
 
-    let card = crate::commands::discover::build_card(config, identity)?;
+    let card = crate::config::build_card(config, identity)?;
 
     let (mut session, _relay_url) =
         connect_first_available(None, Some(config), &identity.did, &card, &keypair).await?;

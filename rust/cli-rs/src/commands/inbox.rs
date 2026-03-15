@@ -102,11 +102,10 @@ fn render_wait_timeout(timeout_secs: u64, opts: &InboxOptions) {
 
 fn render_messages(messages: &[serde_json::Value], opts: &InboxOptions) {
     if opts.json {
-        for msg in messages {
-            let envelope = msg.get("envelope").unwrap_or(msg);
+        for message in messages {
             println!(
                 "{}",
-                serde_json::to_string(envelope).unwrap_or_else(|_| "{}".to_string())
+                serde_json::to_string(message).unwrap_or_else(|_| "{}".to_string())
             );
         }
         return;

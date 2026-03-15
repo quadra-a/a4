@@ -1,14 +1,52 @@
+use crate::e2e::PublishedDeviceDirectoryEntry;
 /// CVP-0011 wire protocol types and CBOR serialization helpers.
 ///
 /// Key invariants (must match TypeScript relay server exactly):
 /// - HELLO signature: sign CBOR({ did, card, timestamp[, inviteToken] }) with keys in that insertion order
-/// - Envelope signature: sign JSON.stringify(envelope) with fields in order:
-///   id, from, to, type, protocol, payload, timestamp, replyTo
-/// - Agent card signature: sign JSON.stringify(card_without_signature)
+/// - Envelope signature: sign canonical JSON for the unsigned envelope
+/// - Agent card signature: sign canonical JSON for the unsigned card
 /// - All signatures are hex-encoded strings in JSON, raw bytes in CBOR relay messages
 use anyhow::Result;
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+
+fn canonicalize_json_value(value: Value) -> Value {
+    match value {
+        Value::Array(entries) => {
+            Value::Array(entries.into_iter().map(canonicalize_json_value).collect())
+        }
+        Value::Object(entries) => {
+            let mut sorted_entries = entries.into_iter().collect::<Vec<_>>();
+            sorted_entries.sort_by(|left, right| left.0.cmp(&right.0));
+            let mut canonical = serde_json::Map::new();
+            for (key, entry) in sorted_entries {
+                canonical.insert(key, canonicalize_json_value(entry));
+            }
+            Value::Object(canonical)
+        }
+        other => other,
+    }
+}
+
+fn canonical_json_string<T: Serialize>(value: &T) -> Result<String> {
+    let json = serde_json::to_value(value)?;
+    Ok(serde_json::to_string(&canonicalize_json_value(json))?)
+}
+
+fn legacy_json_string<T: Serialize>(value: &T) -> Result<String> {
+    Ok(serde_json::to_string(value)?)
+}
+
+fn json_signature_payloads<T: Serialize>(value: &T) -> Result<Vec<String>> {
+    let canonical = canonical_json_string(value)?;
+    let legacy = legacy_json_string(value)?;
+    if canonical == legacy {
+        Ok(vec![canonical])
+    } else {
+        Ok(vec![canonical, legacy])
+    }
+}
 
 // ── Agent Card ────────────────────────────────────────────────────────────────
 
@@ -35,6 +73,8 @@ pub struct AgentCard {
     pub capabilities: Vec<Capability>,
     pub endpoints: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub devices: Option<Vec<PublishedDeviceDirectoryEntry>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "peerId")]
     pub peer_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -46,14 +86,58 @@ pub struct AgentCard {
 }
 
 impl AgentCard {
-    /// Sign the card: JSON.stringify(card_without_signature), then hex-encode.
+    /// Sign the card using canonical JSON, then hex-encode.
     pub fn sign(
         card_without_sig: &AgentCardUnsigned,
         keypair: &crate::identity::KeyPair,
     ) -> String {
-        let json = serde_json::to_string(card_without_sig).expect("serialize card");
+        let json = canonical_json_string(card_without_sig).expect("serialize card");
         let sig_bytes = keypair.sign(json.as_bytes());
         hex::encode(sig_bytes)
+    }
+
+    /// Verify the card signature against the DID-derived Ed25519 public key.
+    pub fn verify_signature(&self) -> Result<bool> {
+        let public_key = crate::identity::extract_public_key(&self.did)?;
+        if public_key.len() != 32 {
+            return Ok(false);
+        }
+
+        let verifying_key = VerifyingKey::from_bytes(
+            &public_key
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("Invalid Ed25519 public key length"))?,
+        )
+        .map_err(|_| anyhow::anyhow!("Invalid Ed25519 public key"))?;
+
+        let signature_bytes = hex::decode(&self.signature)?;
+        if signature_bytes.len() != 64 {
+            return Ok(false);
+        }
+
+        let signature = Signature::from_slice(&signature_bytes)
+            .map_err(|_| anyhow::anyhow!("Invalid Ed25519 signature"))?;
+        let payloads = json_signature_payloads(&self.unsigned())?;
+        Ok(payloads
+            .iter()
+            .any(|payload| verifying_key.verify(payload.as_bytes(), &signature).is_ok()))
+    }
+
+    pub fn unsigned(&self) -> AgentCardUnsigned {
+        AgentCardUnsigned {
+            did: self.did.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+            version: self.version.clone(),
+            capabilities: self.capabilities.clone(),
+            endpoints: self.endpoints.clone(),
+            devices: self.devices.clone(),
+            peer_id: self.peer_id.clone(),
+            trust: self.trust.clone(),
+            metadata: self.metadata.clone(),
+            timestamp: self.timestamp,
+        }
     }
 }
 
@@ -67,6 +151,8 @@ pub struct AgentCardUnsigned {
     pub capabilities: Vec<Capability>,
     pub endpoints: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub devices: Option<Vec<PublishedDeviceDirectoryEntry>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "peerId")]
     pub peer_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -78,8 +164,7 @@ pub struct AgentCardUnsigned {
 
 // ── Message Envelope ──────────────────────────────────────────────────────────
 
-/// Envelope fields in the exact order required for signing.
-/// JSON.stringify preserves insertion order in V8, so we must match it.
+/// Envelope fields used to build canonical JSON signature payloads.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Envelope {
     pub id: String,
@@ -96,6 +181,9 @@ pub struct Envelope {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "threadId")]
     pub thread_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "groupId")]
+    pub group_id: Option<String>,
     pub signature: String,
 }
 
@@ -116,11 +204,58 @@ pub struct EnvelopeUnsigned {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "threadId")]
     pub thread_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "groupId")]
+    pub group_id: Option<String>,
+}
+
+impl Envelope {
+    pub fn unsigned(&self) -> EnvelopeUnsigned {
+        EnvelopeUnsigned {
+            id: self.id.clone(),
+            from: self.from.clone(),
+            to: self.to.clone(),
+            msg_type: self.msg_type.clone(),
+            protocol: self.protocol.clone(),
+            payload: self.payload.clone(),
+            timestamp: self.timestamp,
+            reply_to: self.reply_to.clone(),
+            thread_id: self.thread_id.clone(),
+            group_id: self.group_id.clone(),
+        }
+    }
+
+    pub fn verify_signature(&self) -> Result<bool> {
+        let public_key = crate::identity::extract_public_key(&self.from)?;
+        if public_key.len() != 32 {
+            return Ok(false);
+        }
+
+        let verifying_key = VerifyingKey::from_bytes(
+            &public_key
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("Invalid Ed25519 public key length"))?,
+        )
+        .map_err(|_| anyhow::anyhow!("Invalid Ed25519 public key"))?;
+
+        let signature_bytes = hex::decode(&self.signature)?;
+        if signature_bytes.len() != 64 {
+            return Ok(false);
+        }
+
+        let signature = Signature::from_slice(&signature_bytes)
+            .map_err(|_| anyhow::anyhow!("Invalid Ed25519 signature"))?;
+        let payloads = json_signature_payloads(&self.unsigned())?;
+        Ok(payloads
+            .iter()
+            .any(|payload| verifying_key.verify(payload.as_bytes(), &signature).is_ok()))
+    }
 }
 
 impl EnvelopeUnsigned {
     pub fn sign(self, keypair: &crate::identity::KeyPair) -> Envelope {
-        let json = serde_json::to_string(&self).expect("serialize envelope");
+        let json = canonical_json_string(&self).expect("serialize envelope");
         let sig_bytes = keypair.sign(json.as_bytes());
         let signature = hex::encode(sig_bytes);
         Envelope {
@@ -133,6 +268,7 @@ impl EnvelopeUnsigned {
             timestamp: self.timestamp,
             reply_to: self.reply_to,
             thread_id: self.thread_id,
+            group_id: self.group_id,
             signature,
         }
     }
@@ -561,9 +697,11 @@ pub fn build_trust_query_message(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_hello_message, build_hello_signature_payload, cbor_decode_value, cbor_value_to_json,
-        AgentCard, Capability,
+        build_hello_message, build_hello_signature_payload, canonical_json_string,
+        cbor_decode_value, cbor_value_to_json, legacy_json_string, AgentCard, AgentCardUnsigned,
+        Capability, Envelope, EnvelopeUnsigned,
     };
+    use crate::identity::{derive_did, KeyPair};
     use ciborium::Value as CborValue;
     use serde_json::json;
 
@@ -581,6 +719,7 @@ mod tests {
                 metadata: Some(json!({ "protocol": "/echo/1.0.0" })),
             }],
             endpoints: vec![],
+            devices: None,
             peer_id: None,
             trust: None,
             metadata: None,
@@ -636,5 +775,96 @@ mod tests {
             decoded.get("type").and_then(|value| value.as_str()),
             Some("HELLO")
         );
+    }
+
+    #[test]
+    fn canonical_json_sorts_nested_object_keys() {
+        let value = json!({
+            "zeta": true,
+            "alpha": {
+                "gamma": 2,
+                "beta": 1,
+            }
+        });
+
+        let canonical = canonical_json_string(&value).expect("canonical JSON builds");
+        assert_eq!(canonical, r#"{"alpha":{"beta":1,"gamma":2},"zeta":true}"#);
+    }
+
+    #[test]
+    fn envelope_verify_signature_accepts_legacy_payload_with_group_id() {
+        let keypair = KeyPair::generate();
+        let did = derive_did(keypair.verifying_key.as_bytes());
+        let unsigned = EnvelopeUnsigned {
+            id: "msg-legacy-group".to_string(),
+            from: did.clone(),
+            to: did.clone(),
+            msg_type: "message".to_string(),
+            protocol: "/agent/msg/1.0.0".to_string(),
+            payload: json!({"text": "legacy payload"}),
+            timestamp: 42,
+            reply_to: Some("msg-origin".to_string()),
+            thread_id: Some("thread-group".to_string()),
+            group_id: Some("grp_overlay".to_string()),
+        };
+        let legacy_payload = legacy_json_string(&unsigned).expect("legacy payload builds");
+        let signature = hex::encode(keypair.sign(legacy_payload.as_bytes()));
+        let envelope = Envelope {
+            id: unsigned.id,
+            from: unsigned.from,
+            to: unsigned.to,
+            msg_type: unsigned.msg_type,
+            protocol: unsigned.protocol,
+            payload: unsigned.payload,
+            timestamp: unsigned.timestamp,
+            reply_to: unsigned.reply_to,
+            thread_id: unsigned.thread_id,
+            group_id: unsigned.group_id,
+            signature,
+        };
+
+        assert!(envelope.verify_signature().expect("legacy signature verifies"));
+    }
+
+    #[test]
+    fn agent_card_verify_signature_accepts_legacy_payload() {
+        let keypair = KeyPair::generate();
+        let did = derive_did(keypair.verifying_key.as_bytes());
+        let unsigned = AgentCardUnsigned {
+            did: did.clone(),
+            name: "Legacy Card".to_string(),
+            description: "Legacy ordering compatibility".to_string(),
+            version: "1.0.0".to_string(),
+            capabilities: vec![Capability {
+                id: "echo".to_string(),
+                name: "Echo".to_string(),
+                description: "Echo replies".to_string(),
+                parameters: None,
+                metadata: None,
+            }],
+            endpoints: vec![],
+            devices: None,
+            peer_id: None,
+            trust: None,
+            metadata: Some(json!({ "zeta": true, "alpha": { "gamma": 2, "beta": 1 } })),
+            timestamp: 7,
+        };
+        let legacy_payload = legacy_json_string(&unsigned).expect("legacy payload builds");
+        let card = AgentCard {
+            did,
+            name: unsigned.name,
+            description: unsigned.description,
+            version: unsigned.version,
+            capabilities: unsigned.capabilities,
+            endpoints: unsigned.endpoints,
+            devices: unsigned.devices,
+            peer_id: unsigned.peer_id,
+            trust: unsigned.trust,
+            metadata: unsigned.metadata,
+            timestamp: unsigned.timestamp,
+            signature: hex::encode(keypair.sign(legacy_payload.as_bytes())),
+        };
+
+        assert!(card.verify_signature().expect("legacy card signature verifies"));
     }
 }

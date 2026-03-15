@@ -3,6 +3,7 @@
  */
 
 import type { AgentCard } from '../discovery/agent-card-types.js';
+import type { ClaimedPreKeyBundle, PublishedPreKeyBundle } from '../e2e/types.js';
 
 export const RELAY_PROTOCOL_VERSION = 1;
 
@@ -32,7 +33,11 @@ export type RelayMessageType =
   | 'TRUST_QUERY'
   | 'TRUST_RESULT'
   | 'PUBLISH_CARD'
-  | 'UNPUBLISH_CARD';
+  | 'UNPUBLISH_CARD'
+  | 'PUBLISH_PREKEYS'
+  | 'PREKEYS_PUBLISHED'
+  | 'FETCH_PREKEY_BUNDLE'
+  | 'PREKEY_BUNDLE';
 
 export interface HelloMessage {
   type: 'HELLO';
@@ -96,7 +101,7 @@ export interface AckMessage {
 export interface DeliveryReportMessage {
   type: 'DELIVERY_REPORT';
   messageId: string;
-  status: 'delivered' | 'expired' | 'queue_full' | 'unknown_recipient';
+  status: 'accepted' | 'delivered' | 'expired' | 'queue_full' | 'unknown_recipient';
   timestamp: number;
 }
 
@@ -222,6 +227,33 @@ export interface UnpublishCardMessage {
   type: 'UNPUBLISH_CARD';
 }
 
+export interface PublishPreKeysMessage {
+  type: 'PUBLISH_PREKEYS';
+  bundles: PublishedPreKeyBundle[];
+}
+
+export interface PreKeysPublishedMessage {
+  type: 'PREKEYS_PUBLISHED';
+  did: string;
+  deviceCount: number;
+}
+
+export interface FetchPreKeyBundleMessage {
+  type: 'FETCH_PREKEY_BUNDLE';
+  did: string;
+  deviceId: string;
+  requestId?: string;
+  requesterRealm?: string;
+}
+
+export interface PreKeyBundleMessage {
+  type: 'PREKEY_BUNDLE';
+  did: string;
+  deviceId: string;
+  bundle: ClaimedPreKeyBundle | null;
+  requestId?: string;
+}
+
 export type RelayMessage =
   | HelloMessage
   | WelcomeMessage
@@ -246,4 +278,8 @@ export type RelayMessage =
   | TrustQueryMessage
   | TrustResultMessage
   | PublishCardMessage
-  | UnpublishCardMessage;
+  | UnpublishCardMessage
+  | PublishPreKeysMessage
+  | PreKeysPublishedMessage
+  | FetchPreKeyBundleMessage
+  | PreKeyBundleMessage;

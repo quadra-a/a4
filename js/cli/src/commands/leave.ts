@@ -5,7 +5,7 @@ import { error, info, success } from '../ui.js';
 export function registerLeaveCommand(program: Command): void {
   program
     .command('leave')
-    .description('Disconnect the background listener from the network')
+    .description('Disconnect from the network and stop the local daemon')
     .action(async () => {
       try {
         const stopped = await stopDaemon();

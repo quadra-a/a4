@@ -15,10 +15,7 @@ if (!Promise.withResolvers) {
 import { basename } from 'node:path';
 import { Command } from 'commander';
 import { createRequire } from 'module';
-import { registerInitCommand } from './commands/init.js';
 import { registerFindCommand } from './commands/find.js';
-import { registerDiscoverCommand } from './commands/discover.js';
-import { registerSendCommand } from './commands/send.js';
 import { registerAskCommand } from './commands/ask.js';
 import { registerTellCommand } from './commands/tell.js';
 import { registerRouteCommand } from './commands/route.js';
@@ -44,6 +41,7 @@ import { registerPublishCommand } from './commands/publish.js';
 import { registerUnpublishCommand } from './commands/unpublish.js';
 import { registerTraceCommand } from './commands/trace.js';
 import { registerReachabilityCommand } from './commands/reachability.js';
+import { registerE2ECommand } from './commands/e2e.js';
 
 const require = createRequire(import.meta.url);
 const { version } = require('../package.json');
@@ -58,7 +56,6 @@ program
   .version(version)
   .showHelpAfterError();
 
-registerInitCommand(program);
 registerFindCommand(program);
 registerAskCommand(program);
 registerTellCommand(program);
@@ -74,6 +71,7 @@ registerPublishCommand(program);
 registerUnpublishCommand(program);
 registerTraceCommand(program);
 registerReachabilityCommand(program);
+registerE2ECommand(program);
 registerStopCommand(program);
 registerServeCommand(program);
 registerPeersCommand(program);
@@ -84,9 +82,7 @@ program.addCommand(createInboxCommand());
 program.addCommand(createAliasCommand());
 program.addCommand(createSessionsCommand());
 
-registerDiscoverCommand(program);
-registerSendCommand(program);
 registerDaemonCommand(program);
-program.addCommand(createTrustCommand());
+program.addCommand(createTrustCommand(), { hidden: true });
 
 program.parse();

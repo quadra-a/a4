@@ -1,4 +1,4 @@
-import { decode as decodeCBOR, encode as encodeCBOR } from 'cbor-x';
+import { encode as encodeCBOR } from 'cbor-x';
 import type { WebSocket } from 'ws';
 import type { RelayAgentRuntime } from './relay-agent-internals.js';
 import {
@@ -7,16 +7,16 @@ import {
   consumeTrustQueryBudget,
 } from './relay-agent-client-handlers.js';
 import { buildDiscoveryResponse, resolveVisibleAgentCard } from './relay-agent-discovery.js';
-import { createRelayDeliverMessage, normalizeEnvelopeBytes } from './relay-agent-shared.js';
+import { createRelayDeliverMessage } from './relay-agent-shared.js';
 import type {
   CardMessage,
+  DeliveryReportMessage,
   DiscoverMessage,
   FederationHealthCheckMessage,
   FederationHealthResponseMessage,
   FetchCardMessage,
   PingMessage,
   PongMessage,
-  RelayMessage,
   SendMessage,
   TrustQueryMessage,
   TrustResultMessage,
@@ -46,51 +46,22 @@ async function sendRelayResponse(runtime: RelayAgentRuntime, ws: WebSocket | und
 export async function handleRelayMessage(
   runtime: RelayAgentRuntime,
   fromDid: string,
-  msg: SendMessage,
-  handlers: RelayProtocolHandlers,
-  fallbackHandleSend: (fromDid: string, msg: SendMessage) => Promise<void>,
+  _msg: SendMessage,
+  _handlers: RelayProtocolHandlers,
+  _fallbackHandleSend: (fromDid: string, msg: SendMessage) => Promise<void>,
 ): Promise<void> {
-  try {
-    let decodedMessage: RelayMessage | { type?: string };
-    try {
-      decodedMessage = decodeCBOR(normalizeEnvelopeBytes(msg.envelope as Uint8Array | number[] | Record<string, unknown>));
-    } catch {
-      console.warn('Failed to decode relay message as CBOR, treating as regular message envelope');
-      await fallbackHandleSend(fromDid, msg);
-      return;
-    }
-
-    if (decodedMessage.type === 'message' || decodedMessage.type === 'reply') {
-      await fallbackHandleSend(fromDid, msg);
-      return;
-    }
-
-    const sender = runtime.registry.get(fromDid);
-
-    switch (decodedMessage.type) {
-      case 'FEDERATION_HEALTH_CHECK':
-        await handlers.handleRelayHealthCheck(sender?.ws, fromDid, decodedMessage as FederationHealthCheckMessage);
-        return;
-      case 'PING':
-        await handlers.handleRelayPing(sender?.ws, fromDid, decodedMessage as PingMessage);
-        return;
-      case 'DISCOVER':
-        await handlers.handleFederatedDiscover(sender?.ws, fromDid, decodedMessage as DiscoverMessage);
-        return;
-      case 'TRUST_QUERY':
-        await handlers.handleRelayTrustQuery(sender?.ws, fromDid, decodedMessage as TrustQueryMessage);
-        return;
-      case 'FETCH_CARD':
-        await handlers.handleRelayFetchCard(sender?.ws, fromDid, decodedMessage as FetchCardMessage);
-        return;
-      default:
-        console.warn(`Relay received unknown relay protocol message type: ${decodedMessage.type}`);
-        await fallbackHandleSend(fromDid, msg);
-    }
-  } catch (err) {
-    console.error('Error handling relay message:', err);
-    await fallbackHandleSend(fromDid, msg);
+  const sender = runtime.registry.get(fromDid);
+  if (!sender?.ws) {
+    return;
   }
+
+  const report: DeliveryReportMessage = {
+    type: 'DELIVERY_REPORT',
+    messageId: Math.random().toString(36).slice(2),
+    status: 'unknown_recipient',
+    timestamp: Date.now(),
+  };
+  sender.ws.send(encodeCBOR(report));
 }
 
 export async function handleRelayHealthCheck(

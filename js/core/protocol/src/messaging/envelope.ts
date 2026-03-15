@@ -1,4 +1,5 @@
 import { MessagingError } from '../utils/errors.js';
+import { encodeCanonicalJson, encodeJsonSignaturePayloads } from '../utils/canonical-json.js';
 
 export type LegacyMessageEnvelopeType = 'request' | 'response' | 'notification';
 export type MessageEnvelopeType = 'message' | 'reply';
@@ -111,9 +112,7 @@ export async function signEnvelope(
   signFn: (data: Uint8Array) => Promise<Uint8Array>,
 ): Promise<MessageEnvelope> {
   try {
-    const envelopeJson = JSON.stringify(envelope);
-    const envelopeBytes = new TextEncoder().encode(envelopeJson);
-    const signature = await signFn(envelopeBytes);
+    const signature = await signFn(encodeCanonicalJson(envelope));
 
     return {
       ...envelope,
@@ -135,14 +134,24 @@ export async function verifyEnvelope(
     }
 
     const { signature, ...envelopeWithoutSig } = normalized;
-    const envelopeJson = JSON.stringify(envelopeWithoutSig);
-    const envelopeBytes = new TextEncoder().encode(envelopeJson);
     const signatureBytes = Buffer.from(signature, 'hex');
 
-    return await verifyFn(signatureBytes, envelopeBytes);
+    for (const payloadBytes of encodeJsonSignaturePayloads(envelopeWithoutSig)) {
+      if (await verifyFn(signatureBytes, payloadBytes)) {
+        return true;
+      }
+    }
+
+    return false;
   } catch (error) {
     throw new MessagingError('Failed to verify envelope', error);
   }
+}
+
+export function getEnvelopeSignaturePayloads(
+  envelope: Omit<MessageEnvelope, 'signature'>,
+): Uint8Array[] {
+  return encodeJsonSignaturePayloads(envelope);
 }
 
 export function validateEnvelope(msg: unknown): msg is MessageEnvelope {

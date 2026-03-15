@@ -59,10 +59,16 @@ export function createTrustCommand(): Command {
     .description('Show interaction history with an agent')
     .option('-l, --limit <limit>', 'Number of interactions to show', '10')
     .option('--relay <url>', 'Relay WebSocket URL for resolving non-alias targets')
+    .option('--json', 'Output as JSON')
     .action(async (target: string, options) => {
       try {
         const resolved = await resolveTargetDid(target, options.relay);
         const history = await getTrustHistory(resolved.did, parseInt(options.limit, 10));
+
+        if (options.json) {
+          console.log(JSON.stringify(history, null, 2));
+          return;
+        }
 
         if (history.length === 0) {
           console.log('No interactions recorded');
@@ -71,7 +77,8 @@ export function createTrustCommand(): Command {
 
         for (const interaction of history) {
           const status = interaction.success ? '✅' : '❌';
-          console.log(`${status} ${interaction.type} - ${new Date(interaction.timestamp).toLocaleString()}`);
+          const failureInfo = interaction.failureReason ? ` (${interaction.failureReason})` : '';
+          console.log(`${status} ${interaction.type} - ${new Date(interaction.timestamp).toLocaleString()}${failureInfo}`);
           console.log(`   Response time: ${interaction.responseTime}ms`);
           if (interaction.rating) {
             console.log(`   Rating: ${'⭐'.repeat(interaction.rating)}`);

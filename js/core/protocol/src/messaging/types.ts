@@ -17,6 +17,23 @@ export type MessageDirection = 'inbound' | 'outbound';
  */
 export type MessageStatus = 'pending' | 'delivered' | 'failed' | 'archived';
 
+export type E2EDeliveryState = 'pending' | 'sent' | 'received' | 'failed';
+
+export interface E2EDeliveryMetadata {
+  transport: 'prekey' | 'session';
+  senderDeviceId: string;
+  receiverDeviceId: string;
+  sessionId: string;
+  state: E2EDeliveryState;
+  recordedAt: number;
+  usedSkippedMessageKey?: boolean;
+  error?: string;
+}
+
+export interface StoredMessageE2EMetadata {
+  deliveries: E2EDeliveryMetadata[];
+}
+
 /**
  * Stored message with metadata
  */
@@ -30,6 +47,7 @@ export interface StoredMessage {
   trustScore?: number;
   trustStatus?: TrustStatus;
   error?: string;
+  e2e?: StoredMessageE2EMetadata;
 }
 
 /**

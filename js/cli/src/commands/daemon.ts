@@ -9,13 +9,39 @@ import {
   startDaemonInBackground,
   stopDaemon,
 } from '../services/daemon-control.js';
-import { error, info, success } from '../ui.js';
+import { error, info, success, warn } from '../ui.js';
 
 export function registerDaemonCommand(program: Command): void {
   const daemon = program
-    .command('daemon')
+    .command('daemon', { hidden: true })
     .description('Legacy daemon management commands')
+    .addHelpText('after', `
+Deprecated legacy group. Prefer:
+  a4 listen --background
+  a4 status
+  a4 stop
+`)
     .configureHelp({ visibleCommands: () => [] });
+
+  daemon.hook('preAction', (_, actionCommand) => {
+    if (actionCommand.name() === 'run') {
+      return;
+    }
+
+    const replacement = {
+      start: 'a4 listen --background',
+      status: 'a4 status',
+      stop: 'a4 stop',
+      restart: 'a4 stop && a4 listen --background',
+    }[actionCommand.name()];
+
+    if (replacement) {
+      warn(`The "daemon ${actionCommand.name()}" command is deprecated. Prefer "${replacement}".`);
+      return;
+    }
+
+    warn(`The "daemon" command group is hidden legacy surface and may be removed in a future release.`);
+  });
 
   daemon
     .command('start')

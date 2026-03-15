@@ -8,9 +8,11 @@ export function registerStatusCommand(program: Command): void {
     .command('status')
     .description('Show current status')
     .option('--format <fmt>', 'Output format: text|json', 'text')
+    .option('--json', 'Output as JSON (alias for --format json)')
     .option('--human', 'Human-friendly output with colors')
     .action(async (options) => {
       try {
+        if (options.json) options.format = 'json';
         const identity = getIdentity();
         const card = getAgentCard();
         const published = isPublished();

@@ -213,6 +213,63 @@ run_special_test() {
     fi
 }
 
+run_discovery_signature_test() {
+    local cli_mode="$1"
+    local script_name="test-discovery-card-signatures.sh"
+    local description="Discovery Card Signature Regression Test"
+    local script_path="$SCRIPT_DIR/$script_name"
+    local cli_arg=""
+
+    case "$cli_mode" in
+        rust)
+            cli_arg="--rust-only"
+            ;;
+        node)
+            cli_arg="--js-only"
+            ;;
+        both|"")
+            cli_arg=""
+            ;;
+        *)
+            log_error "Unsupported discovery signature CLI mode: $cli_mode"
+            return 1
+            ;;
+    esac
+
+    echo ""
+    echo "=================================================="
+    log_info "Starting: $description (CLI Mode: $cli_mode)"
+    echo "=================================================="
+
+    if [[ ! -f "$script_path" ]]; then
+        log_warning "Script not found: $script_path - skipping"
+        return 2
+    fi
+
+    local log_file="$RESULTS_DIR/${script_name%.sh}_${cli_mode}_$TIMESTAMP.log"
+
+    if [[ -n "$cli_arg" ]]; then
+        if "$script_path" "$cli_arg" 2>&1 | tee "$log_file"; then
+            echo ""
+            log_success "$description ($cli_mode) completed successfully"
+            echo "Detailed log saved to: $log_file"
+            return 0
+        fi
+    else
+        if "$script_path" 2>&1 | tee "$log_file"; then
+            echo ""
+            log_success "$description ($cli_mode) completed successfully"
+            echo "Detailed log saved to: $log_file"
+            return 0
+        fi
+    fi
+
+    echo ""
+    log_error "$description ($cli_mode) failed"
+    echo "Error log saved to: $log_file"
+    return 1
+}
+
 record_test_result() {
     local exit_code="$1"
     local pass_message="$2"
@@ -332,63 +389,70 @@ main() {
         # Test 1: Quick validation test
         ((total_tests++))
         echo ""
-        log_info "Test 1/9: Quick Validation Test"
+        log_info "Test 1/10: Quick Validation Test"
         capture_test_status run_test_script "test-relay-quick.sh" "Quick Validation Test" "$cli_mode"
         record_test_result "$TEST_STATUS" "Quick validation passed" "Quick test failed for $cli_mode - continuing with other tests" "Quick test skipped"
+
+        # Test 2: Discovery card signature regression test
+        ((total_tests++))
+        echo ""
+        log_info "Test 2/10: Discovery Card Signature Regression Test"
+        capture_test_status run_discovery_signature_test "$cli_mode"
+        record_test_result "$TEST_STATUS" "Discovery card signature regression passed" "Discovery card signature regression failed for $cli_mode - continuing with other tests" "Discovery card signature regression skipped"
 
         # Test 2: Comprehensive functionality test
         ((total_tests++))
         echo ""
-        log_info "Test 2/9: Comprehensive Functionality Test"
+        log_info "Test 3/10: Comprehensive Functionality Test"
         capture_test_status run_test_script "test-relay-comprehensive.sh" "Comprehensive Functionality Test" "$cli_mode"
         record_test_result "$TEST_STATUS" "Comprehensive test passed" "Comprehensive test failed for $cli_mode - continuing with other tests" "Comprehensive test skipped"
 
         # Test 3: Performance benchmark
         ((total_tests++))
         echo ""
-        log_info "Test 3/9: Performance Benchmark"
+        log_info "Test 4/10: Performance Benchmark"
         capture_test_status run_test_script "benchmark-relay.sh" "Performance Benchmark" "$cli_mode"
         record_test_result "$TEST_STATUS" "Performance benchmark passed" "Benchmark failed for $cli_mode - continuing with other tests" "Benchmark skipped"
 
         # Test 4: Load test (30 seconds)
         ((total_tests++))
         echo ""
-        log_info "Test 4/9: Load Test (30s)"
+        log_info "Test 5/10: Load Test (30s)"
         capture_test_status run_test_script "load-test-relay.sh" "Load Test (30s)" "$cli_mode" "30"
         record_test_result "$TEST_STATUS" "Load test passed" "Load test failed for $cli_mode - continuing with other tests" "Load test skipped"
 
         # Test 5: Stress test
         ((total_tests++))
         echo ""
-        log_info "Test 5/9: Stress Test"
+        log_info "Test 6/10: Stress Test"
         capture_test_status run_test_script "stress-test-relay.sh" "Stress Test" "$cli_mode"
         record_test_result "$TEST_STATUS" "Stress test passed" "Stress test failed for $cli_mode - continuing with other tests" "Stress test skipped"
 
         # Test 6: CI/CD test
         ((total_tests++))
         echo ""
-        log_info "Test 6/9: CI/CD Integration Test"
+        log_info "Test 7/10: CI/CD Integration Test"
         capture_test_status run_test_script "ci-test-relay.sh" "CI/CD Integration Test" "$cli_mode"
         record_test_result "$TEST_STATUS" "CI/CD test passed" "CI test failed for $cli_mode - continuing with other tests" "CI test skipped"
 
         # Test 7: Error handling test
         ((total_tests++))
         echo ""
-        log_info "Test 7/9: Error Handling Test"
+        log_info "Test 8/10: Error Handling Test"
         capture_test_status run_test_script "test-error-handling.sh" "Error Handling Test" "$cli_mode"
         record_test_result "$TEST_STATUS" "Error handling test passed" "Error handling test failed for $cli_mode - continuing with other tests" "Error handling test skipped"
 
         # Test 8: Network connectivity test
         ((total_tests++))
         echo ""
-        log_info "Test 8/9: Network Connectivity Test"
+        log_info "Test 9/10: Network Connectivity Test"
         capture_test_status run_test_script "test-network-connectivity.sh" "Network Connectivity Test" "$cli_mode"
         record_test_result "$TEST_STATUS" "Network connectivity test passed" "Network connectivity test failed for $cli_mode - continuing with other tests" "Network connectivity test skipped"
 
         # Test 9: Malformed messages test
         ((total_tests++))
         echo ""
-        log_info "Test 9/9: Malformed Messages Test"
+        log_info "Test 10/10: Malformed Messages Test"
         capture_test_status run_test_script "test-malformed-messages.sh" "Malformed Messages Test" "$cli_mode"
         record_test_result "$TEST_STATUS" "Malformed messages test passed" "Malformed messages test failed for $cli_mode - continuing with other tests" "Malformed messages test skipped"
 
@@ -399,7 +463,7 @@ main() {
 
         echo ""
         echo "CLI Mode '$cli_mode' Summary:"
-        echo "Tests completed: $cli_completed / 9"
+        echo "Tests completed: $cli_completed / 10"
         if [[ $((cli_completed - cli_skipped)) -gt 0 ]]; then
             echo "Success rate: $(( (cli_passed * 100) / (cli_completed - cli_skipped) ))%"
         else
@@ -468,6 +532,7 @@ Success Rate: $(echo "scale=1; $passed_tests * 100 / ($total_tests - $skipped_te
 Test Categories Covered:
 =======================
 ✓ Quick Validation Tests
+✓ Discovery Card Signature Regression Tests
 ✓ Comprehensive Functionality Tests
 ✓ Performance Benchmarks
 ✓ Load Testing (30s duration)

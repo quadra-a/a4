@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { createMessageRouter } from '../src/messaging/router.js';
 import { createEnvelope, signEnvelope } from '../src/messaging/envelope.js';
-import { generateKeyPair, sign } from '../src/identity/keys.js';
+import { generateKeyPair, sign, verify } from '../src/identity/keys.js';
 import { deriveDID } from '../src/identity/did.js';
 import { encodeMessage } from '../src/messaging/codec.js';
 import type { RelayClient } from '../src/transport/relay-client.js';
@@ -105,6 +105,54 @@ describe('Message Router', () => {
 
       expect(handler).toHaveBeenCalledOnce();
       expect(handler).toHaveBeenCalledWith(expect.objectContaining({ type: 'message' }));
+    });
+
+    it('accepts legacy-signed envelopes through both verifier layers', async () => {
+      const keyPair = await generateKeyPair();
+      const did = deriveDID(keyPair.publicKey);
+
+      const legacyEnvelope = createEnvelope(
+        did,
+        did,
+        'message',
+        '/agent/msg/1.0.0',
+        {
+          nested: {
+            zeta: true,
+            alpha: 1,
+          },
+        },
+        undefined,
+        undefined,
+        'grp_legacy',
+      );
+      const legacyBytes = new TextEncoder().encode(JSON.stringify(legacyEnvelope));
+      const signature = Buffer.from(await sign(legacyBytes, keyPair.privateKey)).toString('hex');
+      const encoded = encodeMessage({
+        ...legacyEnvelope,
+        signature,
+      });
+
+      const relayClient = makeMockRelayClient();
+      const router = createMessageRouter(
+        relayClient,
+        async (incomingSignature, data) => verify(incomingSignature, data, keyPair.publicKey),
+      );
+      await router.start();
+
+      const handler = vi.fn(async () => undefined);
+      router.registerHandler('/agent/msg/1.0.0', handler);
+
+      await relayClient._triggerDeliver({
+        type: 'DELIVER',
+        messageId: 'test-msg-legacy-router',
+        from: did,
+        envelope: encoded,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      expect(handler).toHaveBeenCalledOnce();
+      expect(handler).toHaveBeenCalledWith(expect.objectContaining({ groupId: 'grp_legacy' }));
     });
 
     it('drops envelopes rejected by the acceptance hook', async () => {

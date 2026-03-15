@@ -233,6 +233,15 @@ export class TrustSystem {
   }
 
   /**
+   * Reset interaction history for an agent (used when unblocking to prevent auto-re-block)
+   */
+  async resetInteractionHistory(agentDid: string): Promise<void> {
+    await this.history.deleteAgent(agentDid);
+    this.trustCache.delete(agentDid);
+    logger.info('Reset interaction history', { agentDid });
+  }
+
+  /**
    * Clean up old data
    */
   async cleanup(): Promise<void> {

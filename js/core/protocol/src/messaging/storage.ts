@@ -22,11 +22,76 @@ import type {
   MessageFilter,
   PaginationOptions,
   MessagePage,
+  E2EDeliveryMetadata,
 } from './types.js';
 import { normalizeEnvelope } from './envelope.js';
 import { compareMessagesBySortTimestamp, getMessageSortTimestamp } from './timestamp.js';
 
 const logger = createLogger('message-storage');
+
+function buildE2EDeliveryKey(delivery: E2EDeliveryMetadata): string {
+  return `${delivery.senderDeviceId}:${delivery.receiverDeviceId}:${delivery.sessionId}`;
+}
+
+function mergeE2EDeliveries(
+  existing: E2EDeliveryMetadata[] = [],
+  incoming: E2EDeliveryMetadata[] = [],
+): E2EDeliveryMetadata[] {
+  const merged = new Map<string, E2EDeliveryMetadata>();
+
+  for (const delivery of existing) {
+    merged.set(buildE2EDeliveryKey(delivery), { ...delivery });
+  }
+
+  for (const delivery of incoming) {
+    const key = buildE2EDeliveryKey(delivery);
+    const previous = merged.get(key);
+    merged.set(key, previous ? { ...previous, ...delivery } : { ...delivery });
+  }
+
+  return [...merged.values()].sort((left, right) => (
+    left.receiverDeviceId.localeCompare(right.receiverDeviceId)
+    || left.senderDeviceId.localeCompare(right.senderDeviceId)
+    || left.sessionId.localeCompare(right.sessionId)
+  ));
+}
+
+function mergeStoredMessageE2EDeliveries(
+  message: StoredMessage,
+  deliveries: E2EDeliveryMetadata[],
+): StoredMessage {
+  if (deliveries.length === 0) {
+    return message;
+  }
+
+  return {
+    ...message,
+    e2e: {
+      deliveries: mergeE2EDeliveries(message.e2e?.deliveries ?? [], deliveries),
+    },
+  };
+}
+
+function mergeStoredMessages(existing: StoredMessage, incoming: StoredMessage): StoredMessage {
+  const merged: StoredMessage = {
+    ...existing,
+    ...incoming,
+    envelope: {
+      ...existing.envelope,
+      ...incoming.envelope,
+    },
+    status: existing.status,
+    receivedAt: existing.receivedAt ?? incoming.receivedAt,
+    sentAt: existing.sentAt ?? incoming.sentAt,
+    readAt: existing.readAt ?? incoming.readAt,
+    trustScore: incoming.trustScore ?? existing.trustScore,
+    trustStatus: incoming.trustStatus ?? existing.trustStatus,
+    error: incoming.error ?? existing.error,
+    e2e: existing.e2e,
+  };
+
+  return mergeStoredMessageE2EDeliveries(merged, incoming.e2e?.deliveries ?? []);
+}
 
 export class MessageStorage {
   private db: Level<string, unknown>;
@@ -65,6 +130,12 @@ export class MessageStorage {
 
   async putMessage(msg: StoredMessage): Promise<void> {
     const normalized = this.requireStoredMessage(msg);
+    const existing = await this.findStoredMessageRecord(normalized.envelope.id);
+    if (existing) {
+      await this.db.put(existing.key, mergeStoredMessages(existing.message, normalized));
+      return;
+    }
+
     const ts = String(getMessageSortTimestamp(normalized)).padStart(16, '0');
     const key = `msg:${normalized.direction}:${ts}:${normalized.envelope.id}`;
     await this.db.put(key, normalized);
@@ -92,6 +163,19 @@ export class MessageStorage {
     const match = await this.findStoredMessageRecord(id);
     if (!match) return;
     await this.db.put(match.key, { ...match.message, ...updates });
+  }
+
+  async upsertE2EDeliveries(id: string, deliveries: E2EDeliveryMetadata[]): Promise<StoredMessage | null> {
+    if (deliveries.length === 0) {
+      return this.getMessage(id);
+    }
+
+    const match = await this.findStoredMessageRecord(id);
+    if (!match) return null;
+
+    const merged = mergeStoredMessageE2EDeliveries(match.message, deliveries);
+    await this.db.put(match.key, merged);
+    return merged;
   }
 
   async deleteMessage(id: string): Promise<void> {

@@ -1,18 +1,14 @@
 import {
-  createEnvelope,
-  createMessageRouter,
-  extractPublicKey,
   generateThreadId,
   resolveDid,
-  sign,
-  signEnvelope,
   type MessageEnvelopeType,
-  verify,
 } from '@quadra-a/protocol';
 import { readFile } from 'node:fs/promises';
 import { basename } from 'node:path';
-import { getAliases } from './config.js';
+import { getAliases, setE2EConfig } from './config.js';
 import { DaemonClient } from './daemon-client.js';
+import { resolveE2EConfig } from './e2e-config.js';
+import { prepareEncryptedSends } from './e2e-send.js';
 import {
   requireIdentity,
   searchAgents,
@@ -188,41 +184,28 @@ export async function dispatchMessage(input: DispatchMessageInput): Promise<Disp
       identity,
     },
     async ({ keyPair, relayClient }) => {
-      const verifyFn = async (signature: Uint8Array, data: Uint8Array): Promise<boolean> => {
-        try {
-          const decoded = JSON.parse(new TextDecoder().decode(data)) as { from?: string };
-          if (!decoded.from || typeof decoded.from !== 'string') return false;
-          const senderPublicKey = extractPublicKey(decoded.from);
-          return verify(signature, data, senderPublicKey);
-        } catch {
-          return false;
-        }
-      };
+      const encrypted = await prepareEncryptedSends({
+        identity,
+        keyPair,
+        relayClient,
+        e2eConfig: await resolveE2EConfig(identity),
+        to: input.to,
+        protocol,
+        payload: input.payload,
+        type,
+        replyTo: input.replyTo,
+        threadId: input.threadId,
+      });
 
-      const router = createMessageRouter(relayClient, verifyFn);
-      await router.start();
-
-      try {
-        const envelope = createEnvelope(
-          identity.did,
-          input.to,
-          type,
-          protocol,
-          input.payload,
-          input.replyTo,
-          input.threadId,
-        );
-
-        const signedEnvelope = await signEnvelope(envelope, (data) => sign(data, keyPair.privateKey));
-        await router.sendMessage(signedEnvelope);
-
-        return {
-          id: signedEnvelope.id,
-          usedDaemon: false,
-        };
-      } finally {
-        await router.stop();
+      setE2EConfig(encrypted.e2eConfig);
+      for (const target of encrypted.targets) {
+        await relayClient.sendEnvelope(input.to, target.outerEnvelopeBytes);
       }
+
+      return {
+        id: encrypted.applicationEnvelope.id,
+        usedDaemon: false,
+      };
     },
   );
 }

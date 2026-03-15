@@ -13,6 +13,7 @@ pub struct VouchOptions {
     pub strength: f64,
     pub comment: Option<String>,
     pub domain: Option<String>,
+    pub json: bool,
     pub human: bool,
 }
 
@@ -81,6 +82,22 @@ pub async fn run(opts: VouchOptions) -> Result<()> {
         eprintln!("Warning: Could not publish endorsement to relay: {}", e);
     }
 
+    if opts.json {
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "endorser": identity.did,
+            "endorsee": target_did,
+            "domain": opts.domain,
+            "type": opts.endorsement_type,
+            "strength": opts.strength,
+            "comment": opts.comment,
+            "timestamp": timestamp,
+            "expires": expires,
+            "signature": signature,
+            "status": "signed_and_stored_locally",
+        }))?);
+        return Ok(());
+    }
+
     if opts.human {
         println!("Creating endorsement for: {}", target_did);
         println!("Type: {}", opts.endorsement_type);
@@ -131,7 +148,7 @@ async fn publish_to_relay(
 ) -> Result<()> {
     let keypair = KeyPair::from_hex(&identity.private_key)?;
 
-    let card = crate::commands::discover::build_card(config, identity)?;
+    let card = crate::config::build_card(config, identity)?;
 
     let (mut session, _relay_url) =
         connect_first_available(None, Some(config), &identity.did, &card, &keypair).await?;

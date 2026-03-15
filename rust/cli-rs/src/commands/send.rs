@@ -171,6 +171,13 @@ pub async fn run(opts: SendOptions) -> Result<()> {
             session.goodbye().await?;
             if opts.human {
                 match status.as_str() {
+                    "accepted" => {
+                        println!("Relay accepted message for delivery");
+                        if let Some(tid) = &thread_id {
+                            println!("Thread: {}", tid);
+                        }
+                        println!("Remote delivery and execution are still unknown until an ACK or reply arrives.");
+                    }
                     "delivered" => {
                         println!("Relay handoff reported delivered");
                         if let Some(tid) = &thread_id {
@@ -195,6 +202,14 @@ pub async fn run(opts: SendOptions) -> Result<()> {
                 LlmFormatter::key_value(
                     "Relay Delivered",
                     if status == "delivered" {
+                        "true"
+                    } else {
+                        "false"
+                    },
+                );
+                LlmFormatter::key_value(
+                    "Relay Accepted",
+                    if status == "accepted" || status == "delivered" {
                         "true"
                     } else {
                         "false"
@@ -255,6 +270,7 @@ pub(crate) fn build_envelope(
         timestamp,
         reply_to: threading.reply_to,
         thread_id: threading.thread_id,
+        group_id: None,
     };
 
     Ok(unsigned.sign(keypair))

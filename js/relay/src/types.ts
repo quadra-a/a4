@@ -36,6 +36,10 @@ export type RelayMessageType =
   | 'TRUST_RESULT'
   | 'PUBLISH_CARD'
   | 'UNPUBLISH_CARD'
+  | 'PUBLISH_PREKEYS'
+  | 'PREKEYS_PUBLISHED'
+  | 'FETCH_PREKEY_BUNDLE'
+  | 'PREKEY_BUNDLE'
   | 'FEDERATION_HELLO'
   | 'FEDERATION_WELCOME'
   | 'FEDERATION_ADMITTED'
@@ -54,6 +58,30 @@ export interface AgentCardCapability {
   metadata?: Record<string, unknown>;
 }
 
+export interface AgentCardPublishedDevice {
+  deviceId: string;
+  identityKeyPublic: string;
+  signedPreKeyPublic: string;
+  signedPreKeyId: number;
+  signedPreKeySignature: string;
+  oneTimePreKeyCount: number;
+  lastResupplyAt: number;
+}
+
+export interface PublishedOneTimePreKey {
+  keyId: number;
+  publicKey: string;
+}
+
+export interface PublishedPreKeyBundle extends AgentCardPublishedDevice {
+  oneTimePreKeys: PublishedOneTimePreKey[];
+}
+
+export interface ClaimedPreKeyBundle extends AgentCardPublishedDevice {
+  oneTimePreKey?: PublishedOneTimePreKey;
+  remainingOneTimePreKeyCount: number;
+}
+
 export interface AgentCard {
   did: string;
   name: string;
@@ -61,6 +89,7 @@ export interface AgentCard {
   version: string;
   capabilities: AgentCardCapability[];
   endpoints: string[];
+  devices?: AgentCardPublishedDevice[];
   peerId?: string;
   trust?: unknown;
   metadata?: Record<string, unknown>;
@@ -209,7 +238,7 @@ export interface AckMessage {
 export interface DeliveryReportMessage {
   type: 'DELIVERY_REPORT';
   messageId: string;
-  status: 'delivered' | 'expired' | 'queue_full' | 'unknown_recipient';
+  status: 'accepted' | 'delivered' | 'expired' | 'queue_full' | 'unknown_recipient';
   timestamp: number;
 }
 
@@ -248,12 +277,40 @@ export interface UnpublishCardMessage {
   type: 'UNPUBLISH_CARD';
 }
 
+export interface PublishPreKeysMessage {
+  type: 'PUBLISH_PREKEYS';
+  bundles: PublishedPreKeyBundle[];
+}
+
+export interface PreKeysPublishedMessage {
+  type: 'PREKEYS_PUBLISHED';
+  did: string;
+  deviceCount: number;
+}
+
+export interface FetchPreKeyBundleMessage {
+  type: 'FETCH_PREKEY_BUNDLE';
+  did: string;
+  deviceId: string;
+  requestId?: string;
+  requesterRealm?: string;
+}
+
+export interface PreKeyBundleMessage {
+  type: 'PREKEY_BUNDLE';
+  did: string;
+  deviceId: string;
+  bundle: ClaimedPreKeyBundle | null;
+  requestId?: string;
+}
+
 // Federation message types for relay-to-relay communication
 export interface FederationHelloMessage {
   type: 'FEDERATION_HELLO';
   relayDid: string;
   relayCard: AgentCard;
   endpoints: string[];
+  devices?: AgentCardPublishedDevice[];
   timestamp: number;
   signature: Uint8Array | number[];
 }
@@ -342,6 +399,10 @@ export type RelayMessage =
   | TrustResultMessage
   | PublishCardMessage
   | UnpublishCardMessage
+  | PublishPreKeysMessage
+  | PreKeysPublishedMessage
+  | FetchPreKeyBundleMessage
+  | PreKeyBundleMessage
   | FederationHelloMessage
   | FederationWelcomeMessage
   | FederationAdmittedMessage

@@ -9,9 +9,12 @@ pub mod sessions;
 pub mod status;
 
 // Primary semantic verbs (CVP-0019)
+pub mod allow;
 pub mod block;
+pub mod card;
 pub mod endorsements;
 pub mod find;
+pub mod identity;
 pub mod leave;
 pub mod listen;
 pub mod message_lifecycle;
@@ -25,6 +28,9 @@ pub mod trust_cli;
 pub mod unblock;
 pub mod unpublish;
 pub mod vouch;
+
+// E2E encryption
+pub mod e2e;
 
 // Admin commands
 pub mod peers;

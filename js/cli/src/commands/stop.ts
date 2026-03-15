@@ -5,7 +5,7 @@ import { error, info, success } from '../ui.js';
 export function registerStopCommand(program: Command): void {
   program
     .command('stop')
-    .description('Stop the background listener')
+    .description('Stop the local daemon')
     .action(async () => {
       try {
         const stopped = await stopDaemon();

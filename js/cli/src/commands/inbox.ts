@@ -72,7 +72,54 @@ function renderMessageList(page: MessagePage, options: {
       return;
     }
 
+    // Group messages by jobId for aggregated display
+    const jobGroups = new Map<string, StoredMessage[]>();
+    const ungrouped: StoredMessage[] = [];
+
     for (const message of page.messages) {
+      const payload = message.envelope.payload as Record<string, unknown> | undefined;
+      const jobId = payload?.jobId as string | undefined;
+      if (jobId) {
+        const group = jobGroups.get(jobId) ?? [];
+        group.push(message);
+        jobGroups.set(jobId, group);
+      } else {
+        ungrouped.push(message);
+      }
+    }
+
+    // Render job groups (collapsed when >1 message)
+    for (const [jobId, jobMsgs] of jobGroups) {
+      if (jobMsgs.length > 1) {
+        console.log(`  ▸ Job ${jobId} (${jobMsgs.length} messages)`);
+        const latest = jobMsgs[jobMsgs.length - 1];
+        const p = latest.envelope.payload as Record<string, unknown> | undefined;
+        if (p) {
+          const status = p.status as string | undefined;
+          const exitCode = p.exitCode as number | undefined;
+          if (status) {
+            console.log(`    Status: ${status}${exitCode != null ? `  Exit: ${exitCode}` : ''}`);
+          }
+          const stdout = p.stdout as string | undefined;
+          if (stdout) {
+            for (const line of stdout.split('\n').slice(0, 5)) {
+              console.log(`    ${line}`);
+            }
+          }
+          const stderr = p.stderr as string | undefined;
+          if (stderr) {
+            console.log(`    stderr: ${stderr.split('\n')[0] ?? ''}`);
+          }
+        }
+        console.log();
+        continue;
+      }
+      // Single-message job: render normally
+      ungrouped.push(...jobMsgs);
+    }
+
+    // Render ungrouped messages normally
+    for (const message of ungrouped) {
       const unread = !message.readAt ? '●' : ' ';
       const from = shortDid(message.envelope.from);
       const age = formatAge(getMessageSortTimestamp(message));
@@ -81,6 +128,17 @@ function renderMessageList(page: MessagePage, options: {
       const replyTag = message.envelope.replyTo ? `  ↩ ${message.envelope.replyTo.slice(-8)}` : '';
       const statusTag = message.trustStatus === 'unknown' ? ' [?未知来源]' :
         message.trustStatus === 'suspicious' ? ' [!可疑]' : '';
+
+      // Special rendering for E2E decrypt failures
+      if (protocol === 'e2e/decrypt-failed') {
+        console.log(`${unread} [${id}] ⚠ E2E decrypt failed (session cleared, will auto-recover)`);
+        console.log(`    From: ${message.envelope.from}`);
+        const payload = message.envelope.payload as Record<string, unknown> | undefined;
+        if (payload?.error) {
+          console.log(`    Error: ${payload.error}`);
+        }
+        continue;
+      }
 
       console.log(`${unread} [${id}] ${from}${statusTag}  ${age}  ${protocol}${replyTag}`);
       const preview = payloadPreview(message.envelope.payload);
@@ -164,9 +222,11 @@ export function createInboxCommand(): Command {
     .option('--wait [seconds]', 'Wait for the first matching message (default: 30s)')
     .option('--limit <n>', 'Max messages to show', '50')
     .option('--format <fmt>', 'Output format: text|json', 'text')
+    .option('--json', 'Output as JSON (alias for --format json)')
     .option('--human', 'Human-friendly output with colors')
     .action(async (options) => {
       try {
+        if (options.json) options.format = 'json';
         const filter: MessageFilter = {};
         if (options.unread) filter.unreadOnly = true;
         if (options.from) filter.fromDid = options.from;
@@ -224,8 +284,10 @@ export function createInboxCommand(): Command {
     .command('read <id>')
     .description('Show full message')
     .option('--format <fmt>', 'Output format: text|json', 'text')
+    .option('--json', 'Output as JSON (alias for --format json)')
     .action(async (id: string, options) => {
       try {
+        if (options.json) options.format = 'json';
         const message = await resolveInboxMessage(id);
         if (!message) {
           console.error(`Message not found: ${id}`);
@@ -254,8 +316,10 @@ export function createInboxCommand(): Command {
     .option('--file <path>', 'Attach a file to the reply')
     .option('--protocol <protocol>', 'Protocol to use (defaults to original message protocol)')
     .option('--format <fmt>', 'Output format: text|json', 'text')
+    .option('--json', 'Output as JSON (alias for --format json)')
     .action(async (id: string, message: string | undefined, options) => {
       try {
+        if (options.json) options.format = 'json';
         const original = await resolveInboxMessage(id);
         if (!original) {
           console.error(`Message not found: ${id}`);

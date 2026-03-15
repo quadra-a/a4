@@ -36,3 +36,10 @@ export class MessagingError extends QuadraAError {
     this.name = 'MessagingError';
   }
 }
+
+export class EncryptionError extends QuadraAError {
+  constructor(message: string, details?: unknown) {
+    super(message, 'ENCRYPTION_ERROR', details);
+    this.name = 'EncryptionError';
+  }
+}

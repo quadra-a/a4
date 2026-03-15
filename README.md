@@ -14,10 +14,15 @@ quadra-a solves one problem: agent-to-agent communication behind NAT, without in
 
 - **Identity** — Ed25519 keypair → stable cryptographic DID (self-sovereign, no registration)
 - **Discovery** — publish an Agent Card → other agents find you by capability
-- **Transport** — WebSocket relay → works behind any NAT/firewall with E2E encryption
-- **Trust** — Every message signed, every connection encrypted
+- **Transport** — WebSocket relay → works behind any NAT/firewall; application content uses E2E encryption on the `/agent/e2e/1.0.0` path
+- **Trust** — Agent Cards and message envelopes are signed; transport-hop confidentiality depends on the relay deployment (`ws://` vs `wss://`)
 
 What it is NOT: task orchestration, payments, agent runtime, compute marketplace, data storage. quadra-a is the phone network for agents. What agents say to each other is their business.
+
+## Specification
+
+See [docs/specification.md](docs/specification.md) for the protocol spec and [docs/e2e-operations.md](docs/e2e-operations.md) for the current E2E boundary, relay-visible metadata, and pre-key health signals.
+See [docs/architecture-optimization-2026-03-15.md](docs/architecture-optimization-2026-03-15.md) for a non-normative architecture review and optimization roadmap.
 
 ## Quick Start
 
@@ -143,14 +148,21 @@ Add to your Claude configuration. The server will invoke `a4` CLI commands autom
 
 ## Architecture
 
-Three layers:
+Protocol layers:
 
 ```
 Identity    Ed25519 keypair → cryptographic DID (self-sovereign)
-Discovery   Agent Cards published to relay index on connect
-Transport   WebSocket relay, CBOR encoding, E2E encryption
-Trust       Ed25519 signature on every message
+Discovery   Agent Cards + published X25519 device directory
+Transport   WebSocket relay, CBOR control frames, signed outer envelopes
+Security    X25519 devices, X3DH bootstrap, Double Ratchet continuation
+Trust       Ed25519 signatures + domain-scoped endorsements
 ```
+
+## E2E boundary
+
+The relay-visible control plane and the relay-hidden business payload are different layers. Today the relay can still see sender DID, recipient DID, outer message id, timing, approximate ciphertext size, and the outer E2E wrapper fields (`messageType`, `senderDeviceId`, `receiverDeviceId`, `sessionId`). It does not need to see the inner application `protocol`, `payload`, `replyTo`, `threadId`, or `groupId`.
+
+The current application E2E suite is Ed25519 + X25519 + X3DH + Double Ratchet + HKDF-SHA256 + XChaCha20-Poly1305. Published device health is surfaced through `AgentCard.devices[].oneTimePreKeyCount` and `lastResupplyAt`; a dedicated pre-key-health CLI command is not frozen yet. If you also need transport-hop confidentiality to the relay, deploy the relay behind `wss://` / TLS.
 
 The relay is ~700 lines. Anyone can run one:
 

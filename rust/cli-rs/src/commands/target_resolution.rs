@@ -33,7 +33,7 @@ pub async fn resolve_target(
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("No identity found. Run `agent listen` to create one."))?;
     let keypair = KeyPair::from_hex(&identity.private_key)?;
-    let card = crate::commands::discover::build_card(config, identity)?;
+    let card = crate::config::build_card(config, identity)?;
     let (mut session, _relay_url) =
         connect_first_available(relay, Some(config), &identity.did, &card, &keypair).await?;
     let result = crate::commands::find::discover_agents(&mut session, Some(target), None, None, 1)
