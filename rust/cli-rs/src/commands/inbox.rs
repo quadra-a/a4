@@ -9,6 +9,7 @@ pub struct InboxOptions {
     pub limit: Option<u32>,
     pub unread: bool,
     pub thread: Option<String>,
+    pub include_system: bool,
     pub wait: Option<Option<u64>>,
     pub human: bool,
     pub json: bool,
@@ -41,7 +42,8 @@ pub async fn run(opts: InboxOptions) -> Result<()> {
                 return Ok(());
             }
 
-            let messages = fetch_messages(&daemon, &opts).await?;
+            let messages =
+                filter_messages(fetch_messages(&daemon, &opts).await?, opts.include_system);
             if !messages.is_empty() {
                 render_messages(&messages, &opts);
                 return Ok(());
@@ -50,20 +52,55 @@ pub async fn run(opts: InboxOptions) -> Result<()> {
             tokio::time::sleep(Duration::from_millis(1000)).await;
         }
     } else {
-        let messages = fetch_messages(&daemon, &opts).await?;
+        let messages = filter_messages(fetch_messages(&daemon, &opts).await?, opts.include_system);
         render_messages(&messages, &opts);
     }
 
     Ok(())
 }
 
+fn is_system_message(message: &serde_json::Value) -> bool {
+    message
+        .get("envelope")
+        .and_then(|envelope| envelope.get("protocol"))
+        .and_then(|value| value.as_str())
+        == Some("e2e/decrypt-failed")
+}
+
+fn filter_messages(
+    messages: Vec<serde_json::Value>,
+    include_system: bool,
+) -> Vec<serde_json::Value> {
+    if include_system {
+        messages
+    } else {
+        messages
+            .into_iter()
+            .filter(|message| !is_system_message(message))
+            .collect()
+    }
+}
+
 async fn fetch_messages(
     daemon: &DaemonClient,
     opts: &InboxOptions,
 ) -> Result<Vec<serde_json::Value>> {
+    let limit = opts.limit.unwrap_or(20);
+    let mut filter = json!({
+        "unreadOnly": opts.unread,
+    });
+
+    if let Some(thread_id) = &opts.thread {
+        filter["threadId"] = json!(thread_id);
+    }
+
     let mut params = json!({
-        "limit": opts.limit.unwrap_or(20),
+        "limit": limit,
         "unread": opts.unread,
+        "pagination": {
+            "limit": limit,
+        },
+        "filter": filter,
     });
 
     if let Some(thread_id) = &opts.thread {

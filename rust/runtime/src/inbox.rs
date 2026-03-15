@@ -285,14 +285,14 @@ impl MessageStore {
     }
 
     pub fn inbox_page(
-        &mut self,
+        &self,
         limit: usize,
         unread_only: bool,
         thread_id: Option<&str>,
     ) -> (Vec<StoredMessage>, usize) {
         let mut matching: Vec<_> = self
             .messages
-            .iter_mut()
+            .iter()
             .filter(|message| {
                 if unread_only && message.read {
                     return false;
@@ -311,14 +311,27 @@ impl MessageStore {
 
         matching.sort_by_key(|message| message.timestamp);
         let total = matching.len();
-        let selected = matching.into_iter().rev().take(limit).collect::<Vec<_>>();
-        let mut page = Vec::with_capacity(selected.len());
-        for message in selected {
-            message.read = true;
-            page.push(message.clone());
-        }
+        let page = matching
+            .into_iter()
+            .rev()
+            .take(limit)
+            .cloned()
+            .collect::<Vec<_>>();
 
         (page, total)
+    }
+
+    pub fn mark_read(&mut self, message_id: &str) -> bool {
+        let mut marked = false;
+
+        for message in &mut self.messages {
+            if message.id == message_id {
+                message.read = true;
+                marked = true;
+            }
+        }
+
+        marked
     }
 
     pub fn session_summaries(&self, peer_filter: Option<&str>) -> Vec<SessionSummary> {
@@ -489,7 +502,7 @@ mod tests {
     }
 
     #[test]
-    fn inbox_page_marks_selected_messages_read() {
+    fn inbox_page_does_not_mark_selected_messages_read() {
         let mut store = MessageStore::new(10);
         store.store(StoredMessage {
             id: "msg-1".to_string(),
@@ -506,7 +519,29 @@ mod tests {
         let (page, total) = store.inbox_page(10, true, None);
         assert_eq!(total, 1);
         assert_eq!(page.len(), 1);
-        assert!(page[0].read);
+        assert!(!page[0].read);
+
+        let (unread_page, unread_total) = store.inbox_page(10, true, None);
+        assert_eq!(unread_total, 1);
+        assert_eq!(unread_page.len(), 1);
+    }
+
+    #[test]
+    fn mark_read_updates_selected_message() {
+        let mut store = MessageStore::new(10);
+        store.store(StoredMessage {
+            id: "msg-1".to_string(),
+            from: "did:agent:alice".to_string(),
+            to: "did:agent:me".to_string(),
+            envelope: json!({"payload": {"text": "hello"}}),
+            timestamp: 10,
+            thread_id: None,
+            read: false,
+            direction: MessageDirection::Inbound,
+            e2e: None,
+        });
+
+        assert!(store.mark_read("msg-1"));
 
         let (unread_page, unread_total) = store.inbox_page(10, true, None);
         assert_eq!(unread_total, 0);

@@ -295,12 +295,12 @@ test_basic_messaging() {
         "$cli_name"
 
     run_test "Empty JSON Payload" \
-        "$a4_binary tell '$TEST_DID' --payload '{}' --relay $RELAY_URL" \
+        "$a4_binary tell '$TEST_DID' --body '{}' --body-format json --relay $RELAY_URL" \
         "Delivered: true" \
         "$cli_name"
 
     run_test "Complex JSON Payload" \
-        "$a4_binary tell '$TEST_DID' --payload '{\"array\":[1,2,3,\"test\",true,null],\"nested\":{\"deep\":{\"value\":\"test\"},\"boolean\":false},\"null_value\":null,\"number\":42.5,\"cli\":\"$cli_name\"}' --protocol 'test/complex/1.0' --relay $RELAY_URL" \
+        "$a4_binary tell '$TEST_DID' --body '{\"array\":[1,2,3,\"test\",true,null],\"nested\":{\"deep\":{\"value\":\"test\"},\"boolean\":false},\"null_value\":null,\"number\":42.5,\"cli\":\"$cli_name\"}' --body-format json --protocol 'test/complex/1.0' --relay $RELAY_URL" \
         "Delivered: true" \
         "$cli_name"
 }
@@ -322,7 +322,7 @@ test_unicode_and_special_chars() {
         "$cli_name"
 
     run_test "Control Characters" \
-        "$a4_binary tell '$TEST_DID' --payload '{\"control_chars\":\"\u0000\u0001\u0002\u0003\u0004\u0005\u0006\u0007\u0008\u0009\u000A\u000B\u000C\u000D\u000E\u000F\",\"test\":\"control_character_handling\",\"cli\":\"$cli_name\"}' --protocol 'test/control-chars/1.0' --relay $RELAY_URL" \
+        "$a4_binary tell '$TEST_DID' --body '{\"control_chars\":\"\u0000\u0001\u0002\u0003\u0004\u0005\u0006\u0007\u0008\u0009\u000A\u000B\u000C\u000D\u000E\u000F\",\"test\":\"control_character_handling\",\"cli\":\"$cli_name\"}' --body-format json --protocol 'test/control-chars/1.0' --relay $RELAY_URL" \
         "Delivered: true" \
         "$cli_name"
 }
@@ -334,27 +334,27 @@ test_large_payloads() {
     log_info "=== [$cli_name] LARGE PAYLOAD TESTS ==="
 
     run_test "1KB Payload" \
-        "$a4_binary tell '$TEST_DID' --payload '{\"test\":\"large_payload\",\"data\":\"$(python3 -c "print('A' * 1000)")\",\"metadata\":{\"size\":1000,\"type\":\"stress_test\"},\"cli\":\"$cli_name\"}' --protocol 'test/large-payload/1.0' --relay $RELAY_URL" \
+        "$a4_binary tell '$TEST_DID' --body '{\"test\":\"large_payload\",\"data\":\"$(python3 -c "print('A' * 1000)")\",\"metadata\":{\"size\":1000,\"type\":\"stress_test\"},\"cli\":\"$cli_name\"}' --body-format json --protocol 'test/large-payload/1.0' --relay $RELAY_URL" \
         "Delivered: true" \
         "$cli_name"
 
     run_test "10KB Payload" \
-        "$a4_binary tell '$TEST_DID' --payload '{\"test\":\"very_large_payload\",\"data\":\"$(python3 -c "print('X' * 10000)")\",\"metadata\":{\"size\":10000,\"type\":\"stress_test\"},\"cli\":\"$cli_name\"}' --protocol 'test/stress/1.0' --relay $RELAY_URL" \
+        "$a4_binary tell '$TEST_DID' --body '{\"test\":\"very_large_payload\",\"data\":\"$(python3 -c "print('X' * 10000)")\",\"metadata\":{\"size\":10000,\"type\":\"stress_test\"},\"cli\":\"$cli_name\"}' --body-format json --protocol 'test/stress/1.0' --relay $RELAY_URL" \
         "Delivered: true" \
         "$cli_name"
 
     run_test "50KB Payload" \
-        "$a4_binary tell '$TEST_DID' --payload '{\"test\":\"extremely_large_payload\",\"data\":\"$(python3 -c "print('Z' * 50000)")\",\"metadata\":{\"size\":50000,\"type\":\"stress_test\"},\"cli\":\"$cli_name\"}' --protocol 'test/mega-payload/1.0' --relay $RELAY_URL" \
+        "$a4_binary tell '$TEST_DID' --body '{\"test\":\"extremely_large_payload\",\"data\":\"$(python3 -c "print('Z' * 50000)")\",\"metadata\":{\"size\":50000,\"type\":\"stress_test\"},\"cli\":\"$cli_name\"}' --body-format json --protocol 'test/mega-payload/1.0' --relay $RELAY_URL" \
         "Delivered: true" \
         "$cli_name"
 
     run_test "Large Array (1000 integers)" \
-        "$a4_binary tell '$TEST_DID' --payload '{\"array_test\":[$(python3 -c "print(','.join([str(i) for i in range(1000)]))")],\"cli\":\"$cli_name\"}' --protocol 'test/large-array/1.0' --relay $RELAY_URL" \
+        "$a4_binary tell '$TEST_DID' --body '{\"array_test\":[$(python3 -c "print(','.join([str(i) for i in range(1000)]))")],\"cli\":\"$cli_name\"}' --body-format json --protocol 'test/large-array/1.0' --relay $RELAY_URL" \
         "Delivered: true" \
         "$cli_name"
 
     run_test "Massive Unicode Payload" \
-        "$a4_binary tell '$TEST_DID' --payload '{\"test\":\"超大负载测试\",\"data\":\"$(python3 -c "print('测试数据' * 1000)")\",\"metadata\":{\"size\":\"massive\",\"encoding\":\"utf8\"},\"cli\":\"$cli_name\"}' --protocol 'test/massive-unicode/1.0' --relay $RELAY_URL" \
+        "$a4_binary tell '$TEST_DID' --body '{\"test\":\"超大负载测试\",\"data\":\"$(python3 -c "print('测试数据' * 1000)")\",\"metadata\":{\"size\":\"massive\",\"encoding\":\"utf8\"},\"cli\":\"$cli_name\"}' --body-format json --protocol 'test/massive-unicode/1.0' --relay $RELAY_URL" \
         "Delivered: true" \
         "$cli_name"
 }
@@ -366,12 +366,12 @@ test_binary_and_encoding() {
     log_info "=== [$cli_name] BINARY AND ENCODING TESTS ==="
 
     run_test "Base64 Binary Data" \
-        "$a4_binary tell '$TEST_DID' --payload '{\"test\":\"binary_like_data\",\"data\":\"$(python3 -c "import base64; print(base64.b64encode(b'\\x00\\x01\\x02\\x03\\x04\\x05\\xFF\\xFE\\xFD').decode())")\",\"encoding\":\"base64\",\"cli\":\"$cli_name\"}' --protocol 'test/binary/1.0' --relay $RELAY_URL" \
+        "$a4_binary tell '$TEST_DID' --body '{\"test\":\"binary_like_data\",\"data\":\"$(python3 -c "import base64; print(base64.b64encode(b'\\x00\\x01\\x02\\x03\\x04\\x05\\xFF\\xFE\\xFD').decode())")\",\"encoding\":\"base64\",\"cli\":\"$cli_name\"}' --body-format json --protocol 'test/binary/1.0' --relay $RELAY_URL" \
         "Delivered: true" \
         "$cli_name"
 
     run_test "Deeply Nested JSON" \
-        "$a4_binary tell '$TEST_DID' --payload '{\"deeply\":{\"nested\":{\"object\":{\"with\":{\"many\":{\"levels\":{\"of\":{\"nesting\":{\"value\":\"deep_test\",\"array\":[{\"nested_in_array\":true}],\"cli\":\"$cli_name\"}}}}}}}}' --protocol 'test/deep-nesting/1.0' --relay $RELAY_URL" \
+        "$a4_binary tell '$TEST_DID' --body '{\"deeply\":{\"nested\":{\"object\":{\"with\":{\"many\":{\"levels\":{\"of\":{\"nesting\":{\"value\":\"deep_test\",\"array\":[{\"nested_in_array\":true}],\"cli\":\"$cli_name\"}}}}}}}}' --body-format json --protocol 'test/deep-nesting/1.0' --relay $RELAY_URL" \
         "Delivered: true" \
         "$cli_name"
 }
@@ -452,12 +452,12 @@ test_edge_cases() {
         "$cli_name"
 
     run_test "Empty Protocol Name" \
-        "$a4_binary tell '$TEST_DID' --payload '\"\"' --protocol '' --relay $RELAY_URL" \
+        "$a4_binary tell '$TEST_DID' --body '\"\"' --body-format json --protocol '' --relay $RELAY_URL" \
         "Delivered: true" \
         "$cli_name"
 
     run_test "Malformed Protocol Identifier" \
-        "$a4_binary tell '$TEST_DID' --payload '{\"test\":\"malformed_protocol\",\"data\":123,\"cli\":\"$cli_name\"}' --protocol 'invalid/protocol/format' --relay $RELAY_URL" \
+        "$a4_binary tell '$TEST_DID' --body '{\"test\":\"malformed_protocol\",\"data\":123,\"cli\":\"$cli_name\"}' --body-format json --protocol 'invalid/protocol/format' --relay $RELAY_URL" \
         "Delivered: true" \
         "$cli_name"
 
@@ -467,7 +467,7 @@ test_edge_cases() {
         "$cli_name"
 
     run_test "Extremely Long DID in Payload" \
-        "$a4_binary tell '$TEST_DID' --payload '{\"test\":\"extremely_long_did\",\"target\":\"$(python3 -c "print('did:agent:z5m2k4p3QiDQbGc9oi4oKvK2gaDCvcxti8E9aRG7mAFJe")\",\"cli\":\"$cli_name\"}' --protocol 'test/long-did/1.0' --relay $RELAY_URL" \
+        "$a4_binary tell '$TEST_DID' --body '{\"test\":\"extremely_long_did\",\"target\":\"$(python3 -c "print('did:agent:z5m2k4p3QiDQbGc9oi4oKvK2gaDCvcxti8E9aRG7mAFJe")\",\"cli\":\"$cli_name\"}' --body-format json --protocol 'test/long-did/1.0' --relay $RELAY_URL" \
         "Delivered: true" \
         "$cli_name"
 

@@ -1,5 +1,7 @@
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
+use std::fs;
+use std::io::{self, Read};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -20,7 +22,10 @@ use quadra_a_runtime::e2e_send::prepare_encrypted_sends_with_session;
 pub struct TellOptions {
     pub target: String,
     pub message: Option<String>,
-    pub payload: Option<String>,
+    pub body: Option<String>,
+    pub body_file: Option<String>,
+    pub body_stdin: bool,
+    pub body_format: Option<String>,
     pub protocol: String,
     pub protocol_explicit: bool,
     pub reply_to: Option<String>,
@@ -30,6 +35,43 @@ pub struct TellOptions {
     pub relay: Option<String>,
     pub json: bool,
     pub human: bool,
+}
+
+#[derive(Clone, Copy)]
+enum TellBodyFormat {
+    Text,
+    Json,
+}
+
+impl TellBodyFormat {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Json => "json",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ProtocolSelection {
+    Explicit,
+    Default,
+    Auto,
+}
+
+impl ProtocolSelection {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Explicit => "explicit",
+            Self::Default => "default",
+            Self::Auto => "auto",
+        }
+    }
+}
+
+struct ResolvedTellBody {
+    format: TellBodyFormat,
+    payload: Value,
 }
 
 pub(crate) struct EnvelopeThreading {
@@ -56,6 +98,87 @@ struct WaitOutcomeDisplay<'a> {
     timeout_hint: Option<&'a str>,
 }
 
+fn wrap_text_body(protocol: &str, body: &str) -> Value {
+    if protocol == "/shell/exec/1.0.0" {
+        json!({ "command": body })
+    } else {
+        json!({ "text": body })
+    }
+}
+
+fn parse_body_format(body_format: Option<&str>) -> Result<TellBodyFormat> {
+    match body_format.map(str::trim) {
+        Some("text") => Ok(TellBodyFormat::Text),
+        Some("json") => Ok(TellBodyFormat::Json),
+        Some(other) => bail!("Body format must be 'text' or 'json', got '{}'", other),
+        None => bail!("Body format is required with --body, --body-file, and --body-stdin"),
+    }
+}
+
+fn read_stdin_body() -> Result<String> {
+    let mut body = String::new();
+    io::stdin().read_to_string(&mut body)?;
+    Ok(body)
+}
+
+fn resolve_tell_body(opts: &TellOptions, effective_protocol: &str) -> Result<ResolvedTellBody> {
+    let mut source_count = 0;
+    if opts.message.is_some() {
+        source_count += 1;
+    }
+    if opts.body.is_some() {
+        source_count += 1;
+    }
+    if opts.body_file.is_some() {
+        source_count += 1;
+    }
+    if opts.body_stdin {
+        source_count += 1;
+    }
+
+    if source_count != 1 {
+        bail!(
+            "Provide exactly one body source: positional message, --body, --body-file, or --body-stdin"
+        );
+    }
+
+    if let Some(message) = &opts.message {
+        if let Some(body_format) = opts.body_format.as_deref() {
+            if body_format.trim() != "text" {
+                bail!("Positional message always uses --body-format text");
+            }
+        }
+
+        return Ok(ResolvedTellBody {
+            format: TellBodyFormat::Text,
+            payload: wrap_text_body(effective_protocol, message),
+        });
+    }
+
+    let format = parse_body_format(opts.body_format.as_deref())?;
+    let raw_body = if let Some(body) = &opts.body {
+        body.clone()
+    } else if let Some(path) = &opts.body_file {
+        fs::read_to_string(path)?
+    } else {
+        read_stdin_body()?
+    };
+
+    let payload = match format {
+        TellBodyFormat::Text => wrap_text_body(effective_protocol, &raw_body),
+        TellBodyFormat::Json => {
+            let parsed: Value = serde_json::from_str(&raw_body)
+                .map_err(|_| anyhow::anyhow!("JSON body must be valid JSON"))?;
+            if !parsed.is_object() {
+                bail!("JSON body must be a JSON object");
+            }
+            parsed
+        }
+    };
+
+    Ok(ResolvedTellBody { format, payload })
+}
+
 pub async fn run(opts: TellOptions) -> Result<()> {
     let mut config = load_config()?;
 
@@ -77,9 +200,15 @@ pub async fn run(opts: TellOptions) -> Result<()> {
     let recipient_did = resolved_target.did.clone();
 
     // Auto-detect protocol from Agent Card if not explicitly set
+    let mut protocol_selection = if opts.protocol_explicit {
+        ProtocolSelection::Explicit
+    } else {
+        ProtocolSelection::Default
+    };
+    let mut protocol_selection_reason: Option<&str> = None;
     let effective_protocol = if !opts.protocol_explicit && opts.protocol == "/agent/msg/1.0.0" {
-        if let Some(card) = &resolved_target.agent {
-            extract_primary_protocol(card).unwrap_or_else(|| opts.protocol.clone())
+        let detected = if let Some(card) = &resolved_target.agent {
+            extract_primary_protocol(card)
         } else if daemon_status.is_some() {
             // Try querying the card via daemon
             match daemon
@@ -91,16 +220,24 @@ pub async fn run(opts: TellOptions) -> Result<()> {
                         if let Ok(card) =
                             serde_json::from_value::<crate::protocol::AgentCard>(card_value.clone())
                         {
-                            extract_primary_protocol(&card).unwrap_or_else(|| opts.protocol.clone())
+                            extract_primary_protocol(&card)
                         } else {
-                            opts.protocol.clone()
+                            None
                         }
                     } else {
-                        opts.protocol.clone()
+                        None
                     }
                 }
-                Err(_) => opts.protocol.clone(),
+                Err(_) => None,
             }
+        } else {
+            None
+        };
+
+        if let Some(protocol) = detected {
+            protocol_selection = ProtocolSelection::Auto;
+            protocol_selection_reason = Some("auto-selected from target capabilities");
+            protocol
         } else {
             opts.protocol.clone()
         }
@@ -108,17 +245,10 @@ pub async fn run(opts: TellOptions) -> Result<()> {
         opts.protocol.clone()
     };
 
-    let payload: Value = if let Some(payload) = &opts.payload {
-        serde_json::from_str(payload).unwrap_or_else(|_| json!({ "text": payload }))
-    } else if let Some(message) = &opts.message {
-        if effective_protocol == "/shell/exec/1.0.0" {
-            json!({ "command": message })
-        } else {
-            json!({ "text": message })
-        }
-    } else {
-        bail!("Provide a message or --payload");
-    };
+    let ResolvedTellBody {
+        format: body_format,
+        payload,
+    } = resolve_tell_body(&opts, &effective_protocol)?;
 
     let thread_id = if opts.new_thread {
         Some(generate_thread_id())
@@ -171,6 +301,11 @@ pub async fn run(opts: TellOptions) -> Result<()> {
                     if opts.human {
                         println!("Message ID: {}", message_id);
                         println!(
+                            "Protocol: {} ({})",
+                            effective_protocol,
+                            protocol_selection_reason.unwrap_or(protocol_selection.as_str())
+                        );
+                        println!(
                             "Message sent, waiting for result ({}s timeout)...",
                             timeout_secs
                         );
@@ -187,6 +322,9 @@ pub async fn run(opts: TellOptions) -> Result<()> {
                                 "messageId": message_id,
                                 "to": recipient_did,
                                 "protocol": effective_protocol,
+                                "protocolSelection": protocol_selection.as_str(),
+                                "protocolSelectionReason": protocol_selection_reason,
+                                "bodyFormat": body_format.as_str(),
                                 "payload": payload,
                                 "threadId": thread_id,
                                 "waitSeconds": timeout_secs,
@@ -230,6 +368,9 @@ pub async fn run(opts: TellOptions) -> Result<()> {
                             "messageId": message_id,
                             "to": recipient_did,
                             "protocol": effective_protocol,
+                            "protocolSelection": protocol_selection.as_str(),
+                            "protocolSelectionReason": protocol_selection_reason,
+                            "bodyFormat": body_format.as_str(),
                             "payload": payload,
                             "threadId": thread_id,
                             "status": "accepted_locally",
@@ -237,6 +378,11 @@ pub async fn run(opts: TellOptions) -> Result<()> {
                     );
                 } else if opts.human {
                     println!("Message accepted locally via daemon ({})", message_id);
+                    println!(
+                        "Protocol: {} ({})",
+                        effective_protocol,
+                        protocol_selection_reason.unwrap_or(protocol_selection.as_str())
+                    );
                     if let Some(thread_id) = &thread_id {
                         println!("Thread: {}", thread_id);
                     }
@@ -246,8 +392,13 @@ pub async fn run(opts: TellOptions) -> Result<()> {
                     LlmFormatter::key_value("Message ID", message_id);
                     LlmFormatter::key_value("To", &recipient_did);
                     LlmFormatter::key_value("Protocol", &effective_protocol);
+                    LlmFormatter::key_value("Protocol Selection", protocol_selection.as_str());
+                    if let Some(reason) = protocol_selection_reason {
+                        LlmFormatter::key_value("Protocol Selection Reason", reason);
+                    }
+                    LlmFormatter::key_value("Body Format", body_format.as_str());
                     LlmFormatter::key_value("Type", "message");
-                    LlmFormatter::key_value("Payload", &payload.to_string());
+                    LlmFormatter::key_value("Body", &payload.to_string());
                     if let Some(thread_id) = &thread_id {
                         LlmFormatter::key_value("Thread ID", thread_id);
                     }
@@ -265,6 +416,9 @@ pub async fn run(opts: TellOptions) -> Result<()> {
                             "error": format!("{}", error),
                             "to": recipient_did,
                             "protocol": effective_protocol,
+                            "protocolSelection": protocol_selection.as_str(),
+                            "protocolSelectionReason": protocol_selection_reason,
+                            "bodyFormat": body_format.as_str(),
                             "payload": payload,
                             "threadId": thread_id,
                             "status": "send_failed",
@@ -338,6 +492,11 @@ pub async fn run(opts: TellOptions) -> Result<()> {
         if opts.human {
             println!("Message ID: {}", prepared.application_envelope.id);
             println!(
+                "Protocol: {} ({})",
+                effective_protocol,
+                protocol_selection_reason.unwrap_or(protocol_selection.as_str())
+            );
+            println!(
                 "Message sent, waiting for result ({}s timeout)...",
                 timeout_secs
             );
@@ -359,6 +518,9 @@ pub async fn run(opts: TellOptions) -> Result<()> {
                     "messageId": prepared.application_envelope.id,
                     "to": recipient_did,
                     "protocol": effective_protocol,
+                    "protocolSelection": protocol_selection.as_str(),
+                    "protocolSelectionReason": protocol_selection_reason,
+                    "bodyFormat": body_format.as_str(),
                     "payload": payload,
                     "threadId": thread_id,
                     "waitSeconds": timeout_secs,
@@ -424,6 +586,9 @@ pub async fn run(opts: TellOptions) -> Result<()> {
                     "messageId": prepared.application_envelope.id,
                     "to": recipient_did,
                     "protocol": effective_protocol,
+                    "protocolSelection": protocol_selection.as_str(),
+                    "protocolSelectionReason": protocol_selection_reason,
+                    "bodyFormat": body_format.as_str(),
                     "payload": payload,
                     "threadId": thread_id,
                     "status": final_status,
@@ -431,6 +596,11 @@ pub async fn run(opts: TellOptions) -> Result<()> {
                 }))?
             );
         } else if opts.human {
+            println!(
+                "Protocol: {} ({})",
+                effective_protocol,
+                protocol_selection_reason.unwrap_or(protocol_selection.as_str())
+            );
             match final_status.as_str() {
                 "accepted" => {
                     println!("Relay accepted message for delivery");
@@ -453,8 +623,13 @@ pub async fn run(opts: TellOptions) -> Result<()> {
             LlmFormatter::key_value("Message ID", &prepared.application_envelope.id);
             LlmFormatter::key_value("To", &recipient_did);
             LlmFormatter::key_value("Protocol", &effective_protocol);
+            LlmFormatter::key_value("Protocol Selection", protocol_selection.as_str());
+            if let Some(reason) = protocol_selection_reason {
+                LlmFormatter::key_value("Protocol Selection Reason", reason);
+            }
+            LlmFormatter::key_value("Body Format", body_format.as_str());
             LlmFormatter::key_value("Type", "message");
-            LlmFormatter::key_value("Payload", &payload.to_string());
+            LlmFormatter::key_value("Body", &payload.to_string());
             if let Some(thread_id) = &thread_id {
                 LlmFormatter::key_value("Thread ID", thread_id);
             }
@@ -528,7 +703,7 @@ pub(crate) fn build_envelope(
     Ok(unsigned.sign(keypair))
 }
 
-async fn wait_for_message_outcome_via_daemon(
+pub(crate) async fn wait_for_message_outcome_via_daemon(
     daemon: &DaemonClient,
     message_id: &str,
     timeout_secs: u64,
@@ -549,7 +724,9 @@ async fn wait_for_message_outcome_via_daemon(
         }
 
         let inbox_params = json!({
-            "limit": 400
+            "limit": 400,
+            "pagination": { "limit": 400 },
+            "filter": {},
         });
 
         if let Ok(response) = daemon.send_command("inbox", inbox_params).await {
@@ -701,12 +878,12 @@ fn render_wait_outcome(
         return;
     }
 
-    LlmFormatter::section("Message Sent");
+    LlmFormatter::section("Message Wait");
     LlmFormatter::key_value("Message ID", display.message_id);
     LlmFormatter::key_value("To", display.recipient_did);
     LlmFormatter::key_value("Protocol", display.protocol);
     LlmFormatter::key_value("Type", "message");
-    LlmFormatter::key_value("Payload", &display.payload.to_string());
+    LlmFormatter::key_value("Body", &display.payload.to_string());
     if let Some(thread_id) = display.thread_id {
         LlmFormatter::key_value("Thread ID", thread_id);
     }
@@ -737,9 +914,9 @@ fn render_wait_outcome(
             LlmFormatter::key_value("Job ID", job_id);
         }
         if outcome.kind == MessageOutcomeKind::Reply {
-            LlmFormatter::key_value("Reply Payload", &payload.to_string());
+            LlmFormatter::key_value("Reply Body", &payload.to_string());
         }
-        LlmFormatter::key_value("Result Payload", &payload.to_string());
+        LlmFormatter::key_value("Result Body", &payload.to_string());
     } else {
         LlmFormatter::key_value("Reply Received", "false");
         LlmFormatter::key_value("Result Received", "false");

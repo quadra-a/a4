@@ -5,6 +5,8 @@ import {
   DAEMON_PID_FILE,
   DAEMON_SOCKET_PATH,
   DAEMON_START_TIMEOUT_MS,
+  PEER_DAEMON_SOCKET_PATH,
+  getLegacyDaemonSocketPath,
 } from './constants.js';
 import { DaemonClient } from './daemon-client.js';
 import { QuadraADaemon } from './daemon-server.js';
@@ -54,12 +56,12 @@ async function waitForDaemonReady(client: DaemonClient): Promise<DaemonStatus> {
 }
 
 export async function isDaemonRunning(): Promise<boolean> {
-  const client = new DaemonClient(SOCKET_PATH);
+  const client = new DaemonClient();
   return client.isDaemonRunning();
 }
 
 export async function getDaemonStatus(): Promise<DaemonStatus> {
-  const client = new DaemonClient(SOCKET_PATH);
+  const client = new DaemonClient();
   return client.send<DaemonStatus>('status', {});
 }
 
@@ -86,15 +88,28 @@ export async function resetDaemonReachabilityPolicy(): Promise<ReachabilityPolic
 }
 
 export async function startDaemonInBackground(_entryHint?: string): Promise<DaemonStartResult> {
-  const client = new DaemonClient(SOCKET_PATH);
+  const ownClient = new DaemonClient(SOCKET_PATH);
+  const peerClients = [
+    new DaemonClient(PEER_DAEMON_SOCKET_PATH),
+    new DaemonClient(getLegacyDaemonSocketPath('rs')),
+  ];
 
-  if (await client.isDaemonRunning()) {
+  if (await ownClient.isDaemonRunning()) {
     const status = await getDaemonStatus();
     return {
       status: 'already_running',
       did: status.did,
       socketPath: SOCKET_PATH,
     };
+  }
+
+  for (const peerClient of peerClients) {
+    if (await peerClient.isDaemonRunning()) {
+      throw new Error(
+        `Another a4 daemon is already running for ${SOCKET_PATH}. ` +
+        `Set a different QUADRA_A_HOME or stop the existing daemon first.`,
+      );
+    }
   }
 
   const child = spawn(process.execPath, [resolveDaemonEntryPath()], {
@@ -112,7 +127,7 @@ export async function startDaemonInBackground(_entryHint?: string): Promise<Daem
     }
   }
 
-  const status = await waitForDaemonReady(client);
+  const status = await waitForDaemonReady(ownClient);
   return {
     status: 'started',
     did: status.did,
@@ -162,7 +177,7 @@ export function cleanupDaemonArtifacts(): void {
 }
 
 export async function stopDaemon(): Promise<boolean> {
-  const client = new DaemonClient(SOCKET_PATH);
+  const client = new DaemonClient();
 
   if (!(await client.isDaemonRunning())) {
     cleanupDaemonArtifacts();
@@ -175,7 +190,7 @@ export async function stopDaemon(): Promise<boolean> {
 }
 
 export async function restartDaemon(entryHint?: string): Promise<{ did: string }> {
-  const client = new DaemonClient(SOCKET_PATH);
+  const client = new DaemonClient();
 
   if (await client.isDaemonRunning()) {
     await client.send('shutdown', {});

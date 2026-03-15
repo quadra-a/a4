@@ -87,9 +87,18 @@ enum Commands {
         target: String,
         /// Message text
         message: Option<String>,
-        /// Raw JSON payload
+        /// Message body
         #[arg(long)]
-        payload: Option<String>,
+        body: Option<String>,
+        /// Read message body from a file
+        #[arg(long)]
+        body_file: Option<String>,
+        /// Read message body from stdin
+        #[arg(long)]
+        body_stdin: bool,
+        /// Body format: text or json
+        #[arg(long)]
+        body_format: Option<String>,
         /// Protocol identifier
         #[arg(long, default_value = "/agent/msg/1.0.0")]
         protocol: String,
@@ -108,6 +117,21 @@ enum Commands {
         /// Relay URL
         #[arg(long, env = "QUADRA_A_RELAY")]
         relay: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+        /// Human-friendly output with colors
+        #[arg(long)]
+        human: bool,
+    },
+
+    /// Wait for a reply or async result for a previously sent message
+    Wait {
+        /// Full message ID or local suffix
+        message_id: String,
+        /// Wait timeout in seconds
+        #[arg(long, default_value = "30")]
+        timeout: u64,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -299,6 +323,9 @@ enum Commands {
         /// Filter by thread ID
         #[arg(long)]
         thread: Option<String>,
+        /// Include internal system/diagnostic messages
+        #[arg(long)]
+        include_system: bool,
         /// Wait for new messages (timeout in seconds)
         #[arg(long)]
         wait: Option<Option<u64>>,
@@ -344,14 +371,32 @@ enum Commands {
         human: bool,
     },
 
-    /// Start relay server
+    /// Register handlers for incoming requests
     Serve {
-        /// Port to listen on
-        #[arg(long, default_value = "8080")]
-        port: u16,
-        /// Host to bind to
-        #[arg(long, default_value = "0.0.0.0")]
-        host: String,
+        /// Capability name to handle
+        #[arg(long)]
+        on: Option<String>,
+        /// Script to execute for matching requests
+        #[arg(long)]
+        exec: Option<String>,
+        /// Directory of handler scripts (filename = capability name)
+        #[arg(long)]
+        handlers: Option<String>,
+        /// Only accept requests from these DIDs
+        #[arg(long)]
+        allow_from: Vec<String>,
+        /// Accept requests from any agent
+        #[arg(long)]
+        public: bool,
+        /// Max concurrent handler executions
+        #[arg(long, default_value = "4")]
+        max_concurrency: usize,
+        /// Handler timeout in seconds
+        #[arg(long, default_value = "60")]
+        timeout: u64,
+        /// Output format: text|json
+        #[arg(long, default_value = "text")]
+        format: String,
     },
 
     /// Stop the local daemon
@@ -539,7 +584,10 @@ async fn main() -> Result<()> {
         Commands::Tell {
             target,
             message,
-            payload,
+            body,
+            body_file,
+            body_stdin,
+            body_format,
             protocol,
             reply_to,
             thread,
@@ -555,7 +603,10 @@ async fn main() -> Result<()> {
             commands::tell::run(commands::tell::TellOptions {
                 target,
                 message,
-                payload,
+                body,
+                body_file,
+                body_stdin,
+                body_format,
                 protocol,
                 protocol_explicit,
                 reply_to,
@@ -563,6 +614,21 @@ async fn main() -> Result<()> {
                 new_thread,
                 wait,
                 relay,
+                json,
+                human,
+            })
+            .await?;
+        }
+
+        Commands::Wait {
+            message_id,
+            timeout,
+            json,
+            human,
+        } => {
+            commands::wait::run(commands::wait::WaitOptions {
+                message_id,
+                timeout_secs: timeout,
                 json,
                 human,
             })
@@ -723,6 +789,7 @@ async fn main() -> Result<()> {
             limit,
             unread,
             thread,
+            include_system,
             wait,
             json,
             human,
@@ -731,6 +798,7 @@ async fn main() -> Result<()> {
                 limit: Some(limit),
                 unread,
                 thread,
+                include_system,
                 wait,
                 human,
                 json,
@@ -793,8 +861,27 @@ async fn main() -> Result<()> {
             commands::peers::run(commands::peers::PeersOptions { json, human }).await?;
         }
 
-        Commands::Serve { port, host } => {
-            commands::serve::run(commands::serve::ServeOptions { port, host }).await?;
+        Commands::Serve {
+            on,
+            exec,
+            handlers,
+            allow_from,
+            public,
+            max_concurrency,
+            timeout,
+            format,
+        } => {
+            commands::serve::run(commands::serve::ServeOptions {
+                on,
+                exec,
+                handlers,
+                allow_from,
+                public,
+                max_concurrency,
+                timeout_secs: timeout,
+                format,
+            })
+            .await?;
         }
 
         Commands::Stop => {

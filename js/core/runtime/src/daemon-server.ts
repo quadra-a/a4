@@ -38,7 +38,13 @@ import type {
   ReachabilityPolicyResponse,
   SetReachabilityPolicyParams,
 } from './daemon-types.js';
-import { DAEMON_SOCKET_PATH, QUADRA_A_HOME } from './constants.js';
+import { DaemonClient } from './daemon-client.js';
+import {
+  DAEMON_SOCKET_PATH,
+  PEER_DAEMON_SOCKET_PATH,
+  QUADRA_A_HOME,
+  getLegacyDaemonSocketPath,
+} from './constants.js';
 import {
   getAgentCard,
   getIdentity,
@@ -495,6 +501,17 @@ export class ClawDaemon {
 
       // Clean up stale socket file
       const { existsSync, unlinkSync } = await import('fs');
+      for (const peerSocketPath of [PEER_DAEMON_SOCKET_PATH, getLegacyDaemonSocketPath('rs')]) {
+        if (existsSync(peerSocketPath)) {
+          const peerClient = new DaemonClient(peerSocketPath);
+          if (await peerClient.isDaemonRunning()) {
+            throw new Error(
+              `Another a4 daemon is already running at ${peerSocketPath}. ` +
+              `Set a different QUADRA_A_HOME or stop the existing daemon first.`,
+            );
+          }
+        }
+      }
       if (existsSync(this.socketPath)) {
         unlinkSync(this.socketPath);
       }

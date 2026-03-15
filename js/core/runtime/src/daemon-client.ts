@@ -2,6 +2,7 @@ import { connect, type Socket } from 'node:net';
 import {
   DAEMON_REQUEST_TIMEOUT_MS,
   DAEMON_SOCKET_PATH,
+  getDaemonSocketClientCandidates,
 } from './constants.js';
 import type {
   DaemonCommand,
@@ -22,18 +23,47 @@ function createRequestId(): string {
 }
 
 export class DaemonClient {
-  private socketPath: string;
+  private socketPaths: string[];
 
   constructor(socketPath: string = DAEMON_SOCKET_PATH) {
-    this.socketPath = socketPath;
+    this.socketPaths = socketPath === DAEMON_SOCKET_PATH
+      ? getDaemonSocketClientCandidates('js')
+      : [socketPath];
   }
 
   async send<TData = unknown, TParams = Record<string, unknown>>(
     command: DaemonCommand,
     params: TParams,
   ): Promise<TData> {
+    let lastError: Error | null = null;
+
+    for (const socketPath of this.socketPaths) {
+      try {
+        return await this.sendViaSocketPath<TData, TParams>(socketPath, command, params);
+      } catch (error) {
+        lastError = error as Error;
+      }
+    }
+
+    throw lastError ?? new Error('Failed to connect to daemon');
+  }
+
+  async isDaemonRunning(): Promise<boolean> {
+    try {
+      await this.send('status', {});
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async sendViaSocketPath<TData = unknown, TParams = Record<string, unknown>>(
+    socketPath: string,
+    command: DaemonCommand,
+    params: TParams,
+  ): Promise<TData> {
     return new Promise((resolve, reject) => {
-      const socket = connect(this.socketPath);
+      const socket = connect(socketPath);
       const requestId = createRequestId();
 
       let responseReceived = false;
@@ -89,26 +119,19 @@ export class DaemonClient {
       });
     });
   }
-
-  async isDaemonRunning(): Promise<boolean> {
-    try {
-      await this.send('status', {});
-      return true;
-    } catch {
-      return false;
-    }
-  }
 }
 
 export class DaemonSubscriptionClient<TData = unknown> {
-  private socketPath: string;
+  private socketPaths: string[];
   private socket: Socket | null = null;
   private buffer = '';
   private pendingRequests = new Map<string, PendingRequest>();
   private subscriptionId: string | null = null;
 
   constructor(socketPath: string = DAEMON_SOCKET_PATH) {
-    this.socketPath = socketPath;
+    this.socketPaths = socketPath === DAEMON_SOCKET_PATH
+      ? getDaemonSocketClientCandidates('js')
+      : [socketPath];
   }
 
   async subscribeInbox(
@@ -119,7 +142,7 @@ export class DaemonSubscriptionClient<TData = unknown> {
       throw new Error('Subscription client already connected');
     }
 
-    const socket = connect(this.socketPath);
+    const socket = await this.connectToFirstAvailableSocket();
     this.socket = socket;
 
     socket.on('data', (data) => {
@@ -164,11 +187,6 @@ export class DaemonSubscriptionClient<TData = unknown> {
         pending.reject(new Error('Subscription socket closed'));
       }
       this.pendingRequests.clear();
-    });
-
-    await new Promise<void>((resolve, reject) => {
-      socket.once('connect', () => resolve());
-      socket.once('error', reject);
     });
 
     const response = await this.sendStreamingRequest<{ subscriptionId: string }, SubscribeInboxParams>(
@@ -220,5 +238,26 @@ export class DaemonSubscriptionClient<TData = unknown> {
 
     this.socket.write(JSON.stringify(request) + '\n');
     return responsePromise;
+  }
+
+  private async connectToFirstAvailableSocket(): Promise<Socket> {
+    let lastError: Error | null = null;
+
+    for (const socketPath of this.socketPaths) {
+      try {
+        return await new Promise<Socket>((resolve, reject) => {
+          const socket = connect(socketPath);
+          socket.once('connect', () => resolve(socket));
+          socket.once('error', (error) => {
+            socket.destroy();
+            reject(error);
+          });
+        });
+      } catch (error) {
+        lastError = error as Error;
+      }
+    }
+
+    throw lastError ?? new Error('Failed to connect to daemon');
   }
 }

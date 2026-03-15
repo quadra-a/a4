@@ -117,7 +117,7 @@ sustained_message_test() {
     for ((i=1; i<=total_messages; i++)); do
         local payload="{\"test\":\"sustained_load\",\"message_id\":$i,\"data\":\"$(python3 -c "print('X' * $payload_size)")\"}"
 
-        if $A4_BINARY tell "$TEST_DID" --payload "$payload" --protocol "load-test/sustained/1.0" --relay $RELAY_URL >/dev/null 2>&1; then
+        if $A4_BINARY tell "$TEST_DID" --body "$payload" --body-format json --protocol "load-test/sustained/1.0" --relay $RELAY_URL >/dev/null 2>&1; then
             ((success_count++))
         else
             ((failure_count++))

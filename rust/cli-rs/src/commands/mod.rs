@@ -32,6 +32,7 @@ pub mod trust_cli;
 pub mod unblock;
 pub mod unpublish;
 pub mod vouch;
+pub mod wait;
 
 // E2E encryption
 pub mod e2e;

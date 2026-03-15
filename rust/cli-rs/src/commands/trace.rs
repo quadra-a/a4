@@ -23,7 +23,14 @@ pub async fn run(opts: TraceOptions) -> Result<()> {
     }
 
     let response = daemon
-        .send_command("inbox", json!({ "limit": 400 }))
+        .send_command(
+            "inbox",
+            json!({
+                "limit": 400,
+                "pagination": { "limit": 400 },
+                "filter": {},
+            }),
+        )
         .await?;
     let messages = response
         .get("messages")

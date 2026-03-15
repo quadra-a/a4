@@ -40,6 +40,7 @@ import { registerLeaveCommand } from './commands/leave.js';
 import { registerPublishCommand } from './commands/publish.js';
 import { registerUnpublishCommand } from './commands/unpublish.js';
 import { registerTraceCommand } from './commands/trace.js';
+import { registerWaitCommand } from './commands/wait.js';
 import { registerReachabilityCommand } from './commands/reachability.js';
 import { registerE2ECommand } from './commands/e2e.js';
 
@@ -70,6 +71,7 @@ registerLeaveCommand(program);
 registerPublishCommand(program);
 registerUnpublishCommand(program);
 registerTraceCommand(program);
+registerWaitCommand(program);
 registerReachabilityCommand(program);
 registerE2ECommand(program);
 registerStopCommand(program);

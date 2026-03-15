@@ -237,7 +237,7 @@ message_throughput_test() {
     for ((i=1; i<=total_messages; i++)); do
         local msg_start=$(date +%s%N)
 
-        if $A4_BINARY tell "$TEST_DID" --payload "$test_payload" --protocol "stress/throughput/1.0" --relay $RELAY_URL >/dev/null 2>&1; then
+        if $A4_BINARY tell "$TEST_DID" --body "$test_payload" --body-format json --protocol "stress/throughput/1.0" --relay $RELAY_URL >/dev/null 2>&1; then
             ((successful_messages++))
         else
             ((failed_messages++))

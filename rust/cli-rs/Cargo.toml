@@ -25,5 +25,6 @@ chrono = "0.4"
 colored = "2"
 anyhow = "1"
 futures-util = "0.3"
+sha2 = "0.10"
 quadra-a-core = { path = "../core" }
 quadra-a-runtime = { path = "../runtime" }

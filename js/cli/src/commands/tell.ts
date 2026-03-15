@@ -1,12 +1,12 @@
-import type { StoredMessage } from '@quadra-a/protocol';
+import { getMessageSortTimestamp, type StoredMessage } from '@quadra-a/protocol';
 import { Command } from 'commander';
 import {
-  buildMessagePayload,
   dispatchMessage,
   formatMessagePayload,
   redactPayloadForDisplay,
   resolveTargetDid,
   resolveThreadId,
+  resolveTellBody,
   type DiscoveryCapability,
 } from '../services/messaging.js';
 import {
@@ -26,6 +26,7 @@ function serializeStoredMessage(message: StoredMessage | null) {
 
   return {
     id: message.envelope.id,
+    timestamp: getMessageSortTimestamp(message),
     from: message.envelope.from,
     protocol: message.envelope.protocol,
     type: message.envelope.type,
@@ -51,8 +52,10 @@ export function registerTellCommand(program: Command): void {
   program
     .command('tell <target> [message]')
     .description('Send a message to a specific agent')
-    .option('--file <path>', 'Attach a file to the message')
-    .option('--payload <json>', 'Message payload (JSON)')
+    .option('--body <value>', 'Message body')
+    .option('--body-file <path>', 'Read message body from a file')
+    .option('--body-stdin', 'Read message body from stdin')
+    .option('--body-format <format>', 'Body format: text|json')
     .option('--protocol <protocol>', 'Protocol to use', '/agent/msg/1.0.0')
     .option('--thread <id>', 'Continue an existing thread')
     .option('--new-thread', 'Start a new thread')
@@ -60,9 +63,14 @@ export function registerTellCommand(program: Command): void {
     .option('--wait [seconds]', 'Wait for a result (default: 30s)')
     .option('--relay <url>', 'Relay WebSocket URL')
     .option('--format <fmt>', 'Output format: text|json', 'text')
+    .option('--json', 'Output as JSON (alias for --format json)')
     .option('--human', 'Human-friendly output with colors')
-    .action(async (target: string, message: string | undefined, options) => {
+    .action(async (target: string, message: string | undefined, options, command: Command) => {
       try {
+        if (options.json) {
+          options.format = 'json';
+        }
+
         const isHuman = Boolean(options.human) && options.format !== 'json';
         const waitTimeoutMs = parseWaitTimeoutMs(options.wait);
         const replyTo = options.replyTo
@@ -81,7 +89,11 @@ export function registerTellCommand(program: Command): void {
 
         // Auto-detect protocol from agent card if not explicitly set
         let effectiveProtocol = options.protocol;
-        if (effectiveProtocol === '/agent/msg/1.0.0') {
+        let protocolSelection: 'explicit' | 'default' | 'auto' = command.getOptionValueSource('protocol') === 'cli'
+          ? 'explicit'
+          : 'default';
+        let protocolSelectionReason: string | null = null;
+        if (protocolSelection !== 'explicit' && effectiveProtocol === '/agent/msg/1.0.0') {
           let detectedProtocol = resolved.agent ? extractPrimaryProtocol(resolved.agent.capabilities) : null;
 
           if (!detectedProtocol) {
@@ -100,17 +112,18 @@ export function registerTellCommand(program: Command): void {
 
           if (detectedProtocol) {
             effectiveProtocol = detectedProtocol;
+            protocolSelection = 'auto';
+            protocolSelectionReason = 'auto-selected from target capabilities';
           }
         }
 
-        let payload = await buildMessagePayload({
+        const { payload, format: bodyFormat } = await resolveTellBody({
           message,
-          payload: options.payload,
-          file: options.file,
-        });
-        if (effectiveProtocol === '/shell/exec/1.0.0' && message && !options.payload && !options.file) {
-          payload = { command: message };
-        }
+          body: options.body,
+          bodyFile: options.bodyFile,
+          bodyStdin: options.bodyStdin,
+          bodyFormat: options.bodyFormat,
+        }, effectiveProtocol);
         const threadId = resolveThreadId(options);
         const result = await dispatchMessage({
           to: resolved.did,
@@ -144,6 +157,10 @@ export function registerTellCommand(program: Command): void {
             threadId: threadId ?? null,
             messageId: result.id,
             replyTo: replyTo ?? null,
+            bodyFormat,
+            protocol: effectiveProtocol,
+            protocolSelection,
+            protocolSelectionReason,
             payload: redactPayloadForDisplay(payload),
             waitSeconds: waitTimeoutMs != null ? waitTimeoutMs / 1000 : null,
             reply: outcome?.kind === 'reply' ? serializeStoredMessage(outcome.message) : null,
@@ -178,6 +195,7 @@ export function registerTellCommand(program: Command): void {
         }
         info(`Message ID: ${result.id}`);
         info(`Path: ${result.usedDaemon ? 'daemon-backed send' : 'direct relay fallback'}`);
+        info(`Protocol: ${effectiveProtocol} (${protocolSelectionReason ?? protocolSelection})`);
         if (replyTo) {
           info(`Reply To: ${replyTo}`);
         }

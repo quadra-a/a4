@@ -3,6 +3,9 @@
 set -euo pipefail
 PASS=0; FAIL=0
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/common.sh"
+
 assert_json() {
   local label="$1" output="$2"
   if echo "$output" | python3 -c "import json,sys; json.load(sys.stdin)" 2>/dev/null; then
@@ -33,18 +36,16 @@ assert_ndjson() {
   fi
 }
 
-RS="repos/a4/rust/target/release/a4"
-JS="node repos/a4/js/cli/dist/index.js"
 TARGET="did:agent:z5m2k4p3QiDQbGc9oi4oKvK2gaDCvcxti8E9aRG7mAFJe"
 
 echo "=== Rust CLI --json ==="
 # status (已有 --json)
-OUT=$($RS status --json 2>&1); assert_json "status --json" "$OUT"
+OUT=$(run_rs status --json 2>&1); assert_json "status --json" "$OUT"
 # tell --json (may fail to send, but should output JSON even on error)
-OUT=$($RS tell "$TARGET" "test" --json --protocol /agent/msg/1.0.0 2>&1 || true)
+OUT=$(run_rs tell "$TARGET" "test" --json --protocol /agent/msg/1.0.0 2>&1 || true)
 assert_json "tell --json" "$OUT"
 # inbox --json outputs NDJSON (one JSON per line)
-OUT=$($RS inbox --json --limit 2 2>&1 || true)
+OUT=$(run_rs inbox --json --limit 2 2>&1 || true)
 if [ -n "$OUT" ]; then
   assert_ndjson "inbox --json (NDJSON)" "$OUT"
 else
@@ -54,12 +55,12 @@ fi
 echo ""
 echo "=== JS CLI --json ==="
 # status
-OUT=$($JS status --json 2>&1); assert_json "status --json" "$OUT"
+OUT=$(run_js status --json 2>&1); assert_json "status --json" "$OUT"
 # tell --json (may fail to send, but should output JSON even on error)
-OUT=$($JS tell "$TARGET" "test" --json --protocol /agent/msg/1.0.0 2>&1 || true)
+OUT=$(run_js tell "$TARGET" "test" --json --protocol /agent/msg/1.0.0 2>&1 || true)
 assert_json "tell --json" "$OUT"
 # inbox --json
-OUT=$($JS inbox --json --limit 2 2>&1 || true)
+OUT=$(run_js inbox --json --limit 2 2>&1 || true)
 assert_json "inbox --json" "$OUT"
 
 echo ""

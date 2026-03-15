@@ -2,10 +2,10 @@
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TESTS=(
-  test-default-protocol.sh
+  test-protocol-selection.sh
   test-unified-flags.sh
   test-socket-fallback.sh
-  test-smart-payload.sh
+  test-smart-body.sh
   test-inbox-job-aggregation.sh
 )
 PASSED=0; FAILED=0; FAILURES=()

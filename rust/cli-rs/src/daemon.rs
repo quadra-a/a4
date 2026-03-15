@@ -3,8 +3,11 @@
 /// Request:  {"id":"req_...","command":"send","params":{...}}\n
 /// Response: {"id":"req_...","success":true,"data":{...}}\n
 use anyhow::{Context, Result};
+use dirs::home_dir;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -48,14 +51,39 @@ use quadra_a_runtime::session_manager::ManagedRelayState;
 pub const DEFAULT_RS_DAEMON_SOCKET: &str = "/tmp/quadra-a-rs.sock";
 pub const DEFAULT_JS_DAEMON_SOCKET: &str = "/tmp/quadra-a.sock";
 
-/// Server binding path (daemon start only)
+fn quadra_a_home() -> PathBuf {
+    std::env::var("QUADRA_A_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".quadra-a")
+        })
+}
+
+fn derived_home_hash() -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(quadra_a_home().to_string_lossy().as_bytes());
+    hex::encode(hasher.finalize())[..8].to_string()
+}
+
+fn derived_daemon_socket_path(runtime: &str) -> String {
+    let suffix = if runtime == "rs" { "-rs" } else { "" };
+    format!("/tmp/quadra-a-{}{}.sock", derived_home_hash(), suffix)
+}
+
+pub fn peer_daemon_socket_path() -> String {
+    derived_daemon_socket_path("js")
+}
+
 pub fn daemon_server_socket_path() -> String {
     std::env::var("QUADRA_A_RS_SOCKET_PATH")
         .or_else(|_| std::env::var("QUADRA_A_SOCKET_PATH"))
-        .unwrap_or_else(|_| DEFAULT_RS_DAEMON_SOCKET.to_string())
+        .unwrap_or_else(|_| derived_daemon_socket_path("rs"))
 }
 
-/// Client path: tries Rust socket first, falls back to JS socket
+/// Client path: tries the Rust daemon for the current QUADRA_A_HOME first,
+/// then the JS daemon for the same QUADRA_A_HOME, then legacy global sockets.
 pub fn daemon_socket_path() -> String {
     if let Ok(explicit) =
         std::env::var("QUADRA_A_RS_SOCKET_PATH").or_else(|_| std::env::var("QUADRA_A_SOCKET_PATH"))
@@ -63,14 +91,20 @@ pub fn daemon_socket_path() -> String {
         return explicit;
     }
 
-    let rs = DEFAULT_RS_DAEMON_SOCKET.to_string();
-    if std::path::Path::new(&rs).exists() {
-        return rs;
+    let candidates = [
+        derived_daemon_socket_path("rs"),
+        derived_daemon_socket_path("js"),
+        DEFAULT_RS_DAEMON_SOCKET.to_string(),
+        DEFAULT_JS_DAEMON_SOCKET.to_string(),
+    ];
+
+    for candidate in candidates {
+        if std::path::Path::new(&candidate).exists() {
+            return candidate;
+        }
     }
-    if std::path::Path::new(DEFAULT_JS_DAEMON_SOCKET).exists() {
-        return DEFAULT_JS_DAEMON_SOCKET.to_string();
-    }
-    rs
+
+    derived_daemon_socket_path("rs")
 }
 
 fn now_ms() -> u64 {
@@ -1039,6 +1073,7 @@ impl DaemonServer {
         match command {
             "status" => handle_status(state).await,
             "inbox" => handle_inbox(params, state).await,
+            "mark_read" => handle_mark_read(params, state).await,
             "send" => handle_send(params, state).await,
             "discover" => handle_discover(params, state).await,
             "peers" => handle_peers(params, state).await,
@@ -1068,24 +1103,25 @@ impl DaemonServer {
     }
 
     async fn check_no_other_daemon_running(&self) -> Result<()> {
-        // Check for the other daemon variant's socket (JS ↔ Rust)
-        let other_socket = if self.socket_path.contains("-rs") {
-            self.socket_path.replace("-rs.sock", ".sock")
-        } else {
-            self.socket_path.replace(".sock", "-rs.sock")
-        };
+        let peer_candidates = [
+            peer_daemon_socket_path(),
+            DEFAULT_JS_DAEMON_SOCKET.to_string(),
+        ];
 
-        if std::path::Path::new(&other_socket).exists() {
+        for other_socket in peer_candidates {
+            if other_socket == self.socket_path || !std::path::Path::new(&other_socket).exists() {
+                continue;
+            }
+
             let client = DaemonClient::new(&other_socket);
             if client.is_running().await {
                 anyhow::bail!(
                     "Another a4 daemon is already running at {}.\n\
-                     Two daemons with the same identity will corrupt E2E encryption state.\n\
-                     Stop it first, then retry.",
+                     This QUADRA_A_HOME is already bound to a different daemon socket.\n\
+                     Stop it first or use a different QUADRA_A_HOME, then retry.",
                     other_socket
                 );
             }
-            // Stale socket file, safe to ignore
         }
 
         // Also check own socket for an already-running instance
@@ -1142,7 +1178,7 @@ async fn handle_status(state: Arc<RwLock<DaemonState>>) -> Result<Value> {
 }
 
 async fn handle_inbox(params: Value, state: Arc<RwLock<DaemonState>>) -> Result<Value> {
-    let mut state_guard = state.write().await;
+    let state_guard = state.write().await;
     let limit = json_u64(
         params
             .get("limit")
@@ -1152,6 +1188,7 @@ async fn handle_inbox(params: Value, state: Arc<RwLock<DaemonState>>) -> Result<
     let unread = params
         .get("unread")
         .or_else(|| params.get("filter").and_then(|f| f.get("unread")))
+        .or_else(|| params.get("filter").and_then(|f| f.get("unreadOnly")))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let thread_id = params
@@ -1172,6 +1209,20 @@ async fn handle_inbox(params: Value, state: Arc<RwLock<DaemonState>>) -> Result<
         "messages": messages,
         "total": total,
     }))
+}
+
+async fn handle_mark_read(params: Value, state: Arc<RwLock<DaemonState>>) -> Result<Value> {
+    let message_id = params
+        .get("id")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Missing 'id' field"))?;
+
+    let mut state_guard = state.write().await;
+    let marked = state_guard.messages.mark_read(message_id);
+
+    Ok(json!({ "marked": marked }))
 }
 
 async fn handle_send(params: Value, state: Arc<RwLock<DaemonState>>) -> Result<Value> {

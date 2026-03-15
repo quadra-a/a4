@@ -263,7 +263,7 @@ benchmark_messaging() {
     measure_command "Basic Message Send" "$A4_BINARY" tell "$TEST_DID" "Benchmark test" --relay "$RELAY_URL" || ((failures++))
     measure_command "Message with Wait Flag" "$A4_BINARY" tell "$TEST_DID" "Request test" --wait --relay "$RELAY_URL" || ((failures++))
     measure_command "Custom Protocol Message" "$A4_BINARY" tell "$TEST_DID" "Custom protocol test" --protocol "benchmark/test/1.0" --relay "$RELAY_URL" || ((failures++))
-    measure_command "JSON Payload Message" "$A4_BINARY" tell "$TEST_DID" --payload "$json_payload" --relay "$RELAY_URL" || ((failures++))
+    measure_command "JSON Payload Message" "$A4_BINARY" tell "$TEST_DID" --body "$json_payload" --body-format json --relay "$RELAY_URL" || ((failures++))
 
     return $failures
 }
@@ -286,7 +286,7 @@ size = int(sys.argv[1])
 print(json.dumps({"test": f"payload_size_{size}", "data": "A" * size}, separators=(",", ":")))
 PY
 )
-        measure_command "${size}B Payload" "$A4_BINARY" tell "$TEST_DID" --payload "$payload" --protocol "benchmark/size-$size/1.0" --relay "$RELAY_URL" || ((failures++))
+        measure_command "${size}B Payload" "$A4_BINARY" tell "$TEST_DID" --body "$payload" --body-format json --protocol "benchmark/size-$size/1.0" --relay "$RELAY_URL" || ((failures++))
     done
 
     return $failures

@@ -222,7 +222,7 @@ run_tests_for_cli() {
     # Test 4: Large payload
     log_info "[$cli_name] Testing large payload (1KB)..."
     local large_payload="{\"test\":\"large\",\"data\":\"$(python3 -c "print('A' * 1000)")\",\"cli\":\"$cli_name\"}"
-    if run_timed_cli 45 "\"$cli_cmd\" tell '$TEST_DID' --payload '$large_payload' --relay \"$RELAY_URL\"" >/dev/null 2>&1; then
+    if run_timed_cli 45 "\"$cli_cmd\" tell '$TEST_DID' --body '$large_payload' --body-format json --relay \"$RELAY_URL\"" >/dev/null 2>&1; then
         log_success "[$cli_name] Large payload working"
     else
         log_error "[$cli_name] Large payload failed"

@@ -22,6 +22,24 @@ export interface MessagePayloadInput {
   file?: string;
 }
 
+export type TellBodyFormat = 'text' | 'json';
+export type TellBodySource = 'positional' | 'inline' | 'file' | 'stdin';
+
+export interface TellBodyInput {
+  message?: string;
+  body?: string;
+  bodyFile?: string;
+  bodyStdin?: boolean;
+  bodyFormat?: string;
+}
+
+export interface ResolvedTellBody {
+  source: TellBodySource;
+  format: TellBodyFormat;
+  payload: Record<string, unknown>;
+  rawText: string | null;
+}
+
 export interface MessageThreadInput {
   thread?: string;
   newThread?: boolean;
@@ -47,6 +65,105 @@ export interface DispatchMessageInput {
 export interface DispatchMessageResult {
   id: string;
   usedDaemon: boolean;
+}
+
+function normalizeBodyFormat(bodyFormat?: string): TellBodyFormat {
+  if (bodyFormat === 'text' || bodyFormat === 'json') {
+    return bodyFormat;
+  }
+
+  throw new Error('Body format must be either "text" or "json".');
+}
+
+async function readStdinText(): Promise<string> {
+  const chunks: Buffer[] = [];
+
+  for await (const chunk of process.stdin) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+function wrapTextBody(protocol: string, body: string): Record<string, unknown> {
+  if (protocol === '/shell/exec/1.0.0') {
+    return { command: body };
+  }
+
+  return { text: body };
+}
+
+function parseJsonBody(raw: string): Record<string, unknown> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error('JSON body must be valid JSON.');
+  }
+
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new Error('JSON body must be a JSON object.');
+  }
+
+  return parsed as Record<string, unknown>;
+}
+
+export async function resolveTellBody(
+  input: TellBodyInput,
+  protocol: string,
+): Promise<ResolvedTellBody> {
+  const sources = [
+    input.message !== undefined ? 'positional' : null,
+    input.body !== undefined ? 'inline' : null,
+    input.bodyFile ? 'file' : null,
+    input.bodyStdin ? 'stdin' : null,
+  ].filter((value): value is TellBodySource => value !== null);
+
+  if (sources.length !== 1) {
+    throw new Error('Provide exactly one body source: positional message, --body, --body-file, or --body-stdin.');
+  }
+
+  const source = sources[0];
+
+  if (source === 'positional') {
+    if (input.bodyFormat && input.bodyFormat !== 'text') {
+      throw new Error('Positional message always uses --body-format text.');
+    }
+
+    return {
+      source,
+      format: 'text',
+      payload: wrapTextBody(protocol, input.message ?? ''),
+      rawText: input.message ?? '',
+    };
+  }
+
+  if (!input.bodyFormat) {
+    throw new Error('Body format is required with --body, --body-file, and --body-stdin.');
+  }
+
+  const format = normalizeBodyFormat(input.bodyFormat);
+  const rawBody = source === 'inline'
+    ? input.body ?? ''
+    : source === 'file'
+      ? await readFile(input.bodyFile!, 'utf8')
+      : await readStdinText();
+
+  if (format === 'json') {
+    return {
+      source,
+      format,
+      payload: parseJsonBody(rawBody),
+      rawText: null,
+    };
+  }
+
+  return {
+    source,
+    format,
+    payload: wrapTextBody(protocol, rawBody),
+    rawText: rawBody,
+  };
 }
 
 export async function buildMessagePayload(input: MessagePayloadInput): Promise<Record<string, unknown>> {

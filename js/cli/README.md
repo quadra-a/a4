@@ -53,7 +53,8 @@ agent publish --name "Echo Agent" --description "Replies to hello messages" --ca
 
 ```bash
 agent tell did:agent:z... "hello"
-agent tell echo --payload '{"text":"hello","mode":"debug"}' --new-thread
+agent tell echo --body '{"text":"hello","mode":"debug"}' --body-format json --new-thread
+agent wait msg_...
 agent inbox --unread --limit 20
 ```
 

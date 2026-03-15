@@ -54,6 +54,32 @@ function payloadPreview(payload: unknown, limit = 72): string {
   return text.length > limit ? `${text.slice(0, limit)}…` : text;
 }
 
+function isSystemDiagnosticMessage(message: StoredMessage): boolean {
+  return message.envelope.protocol === 'e2e/decrypt-failed';
+}
+
+function filterSystemMessages(messages: StoredMessage[], includeSystem: boolean): StoredMessage[] {
+  return includeSystem ? messages : messages.filter((message) => !isSystemDiagnosticMessage(message));
+}
+
+function serializeMessage(message: StoredMessage) {
+  return {
+    ...message,
+    timestamp: getMessageSortTimestamp(message),
+    category: isSystemDiagnosticMessage(message) ? 'system' : 'message',
+    userVisible: !isSystemDiagnosticMessage(message),
+  };
+}
+
+function serializeMessagePage(page: MessagePage, includeSystem: boolean) {
+  const messages = filterSystemMessages(page.messages, includeSystem);
+  return {
+    ...page,
+    total: messages.length,
+    messages: messages.map((message) => serializeMessage(message)),
+  };
+}
+
 function renderMessageList(page: MessagePage, options: {
   human?: boolean;
   unread?: boolean;
@@ -61,13 +87,15 @@ function renderMessageList(page: MessagePage, options: {
   protocol?: string;
   thread?: string;
   replyTo?: string;
+  includeSystem?: boolean;
 }): void {
-  const unreadCount = page.messages.filter((message) => !message.readAt).length;
+  const visibleMessages = filterSystemMessages(page.messages, Boolean(options.includeSystem));
+  const unreadCount = visibleMessages.filter((message) => !message.readAt).length;
 
   if (options.human) {
-    console.log(`\nInbox (${page.total} total, ${unreadCount} unread)\n`);
+    console.log(`\nInbox (${visibleMessages.length} total, ${unreadCount} unread)\n`);
 
-    if (page.messages.length === 0) {
+    if (visibleMessages.length === 0) {
       console.log('  No messages.');
       return;
     }
@@ -76,7 +104,7 @@ function renderMessageList(page: MessagePage, options: {
     const jobGroups = new Map<string, StoredMessage[]>();
     const ungrouped: StoredMessage[] = [];
 
-    for (const message of page.messages) {
+    for (const message of visibleMessages) {
       const payload = message.envelope.payload as Record<string, unknown> | undefined;
       const jobId = payload?.jobId as string | undefined;
       if (jobId) {
@@ -151,17 +179,17 @@ function renderMessageList(page: MessagePage, options: {
   }
 
   llmSection('Inbox');
-  llmKeyValue('Total', page.total.toString());
+  llmKeyValue('Total', visibleMessages.length.toString());
   llmKeyValue('Unread', unreadCount.toString());
-  llmKeyValue('Showing', page.messages.length.toString());
+  llmKeyValue('Showing', visibleMessages.length.toString());
   console.log();
 
-  if (page.messages.length === 0) {
+  if (visibleMessages.length === 0) {
     console.log('No messages.');
     return;
   }
 
-  const rows = page.messages.map((message) => [
+  const rows = visibleMessages.map((message) => [
     message.envelope.id.slice(-8),
     message.envelope.type,
     message.envelope.from,
@@ -219,6 +247,7 @@ export function createInboxCommand(): Command {
     .option('--protocol <protocol>', 'Filter by protocol')
     .option('--thread <id>', 'Filter by conversation thread')
     .option('--reply-to <id>', 'Filter by reply target message ID')
+    .option('--include-system', 'Include internal system/diagnostic messages')
     .option('--wait [seconds]', 'Wait for the first matching message (default: 30s)')
     .option('--limit <n>', 'Max messages to show', '50')
     .option('--format <fmt>', 'Output format: text|json', 'text')
@@ -249,7 +278,7 @@ export function createInboxCommand(): Command {
           }
 
           if (options.format === 'json') {
-            console.log(JSON.stringify(message, null, 2));
+            console.log(JSON.stringify(serializeMessage(message), null, 2));
           } else {
             renderMessageDetail(message);
           }
@@ -261,7 +290,7 @@ export function createInboxCommand(): Command {
         });
 
         if (options.format === 'json') {
-          console.log(JSON.stringify(page, null, 2));
+          console.log(JSON.stringify(serializeMessagePage(page, Boolean(options.includeSystem)), null, 2));
           return;
         }
 
@@ -272,6 +301,7 @@ export function createInboxCommand(): Command {
           protocol: options.protocol,
           thread: options.thread,
           replyTo: filter.replyTo as string | undefined,
+          includeSystem: Boolean(options.includeSystem),
         });
       } catch (error) {
         logger.error('Inbox list failed', error);
@@ -295,7 +325,7 @@ export function createInboxCommand(): Command {
         }
 
         if (options.format === 'json') {
-          console.log(JSON.stringify(message, null, 2));
+          console.log(JSON.stringify(serializeMessage(message), null, 2));
         } else {
           renderMessageDetail(message);
         }

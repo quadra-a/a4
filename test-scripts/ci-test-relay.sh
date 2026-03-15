@@ -161,7 +161,7 @@ run_ci_tests() {
         "$A4_BINARY tell '$TEST_DID' 'CI test message' --relay $RELAY_URL"
 
     run_ci_test "JSON Payload" \
-        "$A4_BINARY tell '$TEST_DID' --payload '{\"test\":\"ci\",\"timestamp\":\"$(quadra_iso_timestamp)\"}' --relay $RELAY_URL"
+        "$A4_BINARY tell '$TEST_DID' --body '{\"test\":\"ci\",\"timestamp\":\"$(quadra_iso_timestamp)\"}' --body-format json --relay $RELAY_URL"
 
     run_ci_test "Custom Protocol" \
         "$A4_BINARY tell '$TEST_DID' 'CI protocol test' --protocol 'ci/test/1.0' --relay $RELAY_URL"
@@ -175,7 +175,7 @@ run_ci_tests() {
 
     # Payload size tests
     run_ci_test "Medium Payload (5KB)" \
-        "$A4_BINARY tell '$TEST_DID' --payload '{\"test\":\"ci_payload\",\"data\":\"$(python3 -c "print('A' * 5000)")\"}' --relay $RELAY_URL"
+        "$A4_BINARY tell '$TEST_DID' --body '{\"test\":\"ci_payload\",\"data\":\"$(python3 -c "print('A' * 5000)")\"}' --body-format json --relay $RELAY_URL"
 
     # Discovery tests
     run_ci_test "WebSocket Discovery" \
