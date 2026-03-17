@@ -160,17 +160,6 @@ fn stored_message_status(message: &StoredMessage) -> &'static str {
         {
             return "failed";
         }
-
-        if e2e.deliveries.iter().any(|delivery| {
-            matches!(
-                delivery.state,
-                E2EDeliveryState::Accepted
-                    | E2EDeliveryState::Delivered
-                    | E2EDeliveryState::Received
-            )
-        }) {
-            return "delivered";
-        }
     }
 
     match message.direction {
@@ -181,7 +170,21 @@ fn stored_message_status(message: &StoredMessage) -> &'static str {
                 "pending"
             }
         }
-        MessageDirection::Outbound => "pending",
+        MessageDirection::Outbound => {
+            if let Some(e2e) = message.e2e.as_ref() {
+                if e2e.deliveries.iter().any(|delivery| {
+                    matches!(
+                        delivery.state,
+                        E2EDeliveryState::Accepted
+                            | E2EDeliveryState::Delivered
+                            | E2EDeliveryState::Received
+                    )
+                }) {
+                    return "delivered";
+                }
+            }
+            "pending"
+        }
     }
 }
 

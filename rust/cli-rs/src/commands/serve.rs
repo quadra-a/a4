@@ -47,7 +47,10 @@ fn capability_protocol(capability: &str) -> String {
 }
 
 fn protocol_matches_capability(protocol: &str, capability: &str) -> bool {
-    protocol.trim() == capability_protocol(capability)
+    let p = protocol.trim();
+    let cap = normalize_capability_id(capability);
+    let prefixed = capability_protocol(capability);
+    p == prefixed || p == cap
 }
 
 fn handler_filename_to_capability(path: &Path) -> Option<String> {
@@ -256,12 +259,14 @@ async fn poll_once(
         .unwrap_or_default();
 
     for message in messages {
-        if message.get("direction").and_then(|value| value.as_str()) != Some("inbound") {
+        let dir = message.get("direction").and_then(|value| value.as_str()).unwrap_or("?");
+        if dir != "inbound" {
             continue;
         }
 
         let envelope = message.get("envelope").cloned().unwrap_or(Value::Null);
-        if envelope.get("type").and_then(|value| value.as_str()) != Some("message") {
+        let etype = envelope.get("type").and_then(|value| value.as_str()).unwrap_or("?");
+        if etype != "message" {
             continue;
         }
 
