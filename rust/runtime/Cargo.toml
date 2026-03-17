@@ -2,7 +2,13 @@
 name = "quadra-a-runtime"
 version = "0.1.0-beta.1"
 edition = "2021"
+description = "Runtime helpers for local quadra-a applications and services"
 license = "GPL-3.0"
+readme = "README.md"
+repository = "https://github.com/quadra-a/a4"
+homepage = "https://github.com/quadra-a/a4"
+keywords = ["agent", "runtime", "messaging", "daemon", "quadra-a"]
+categories = ["network-programming"]
 
 [lib]
 name = "quadra_a_runtime"
@@ -17,4 +23,4 @@ tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.21", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 hex = "0.4"
 ciborium = "0.2"
-quadra-a-core = { path = "../core" }
+quadra-a-core = { version = "0.1.0-beta.1", path = "../core" }

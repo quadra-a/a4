@@ -3,7 +3,7 @@
 This repository is set up for coordinated versioned releases across three surfaces:
 
 - npm packages under `js/`
-- Rust CLI release artifacts under `rust/`
+- Rust crates and CLI release artifacts under `rust/`
 - the relay Docker image published as `quadraa/relay`
 
 ## Versioning
@@ -28,6 +28,7 @@ git push origin v0.1.0-beta.1
 That tag drives:
 
 - npm package publishing
+- Rust crate publishing
 - Rust release artifact builds and GitHub Release publishing
 - relay Docker image publishing
 
@@ -42,6 +43,7 @@ That tag drives:
 ## Required GitHub secrets
 
 - `NPM_TOKEN`
+- `CRATES_IO_TOKEN`
 - `DOCKERHUB_USERNAME` or `DOCKER_USERNAME`
 - `DOCKERHUB_TOKEN` or `DOCKER_PASSWORD`
 
@@ -52,9 +54,11 @@ pnpm --dir js release:check
 cargo test --workspace
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
+cargo package --workspace
 ```
 
 ## Notes
 
 - npm publishing is performed with `pnpm publish`, not `npm publish`, so workspace dependencies are rewritten to concrete published versions inside packed manifests.
 - `rust/Cargo.lock` is expected to be committed so `--locked` release builds are reproducible.
+- Rust crate publishing is ordered `quadra-a-core` → `quadra-a-runtime` → `quadra-a-cli-rs` because the later crates depend on the earlier ones.

@@ -1,0 +1,79 @@
+name: Publish Rust Crates
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to publish (branch, tag, or SHA)
+        required: false
+        default: ""
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Resolve workspace version
+        id: version
+        run: |
+          VERSION="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' cli-rs/Cargo.toml | head -n 1)"
+          CORE_VERSION="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' core/Cargo.toml | head -n 1)"
+          RUNTIME_VERSION="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' runtime/Cargo.toml | head -n 1)"
+
+          if [[ -z "$VERSION" || -z "$CORE_VERSION" || -z "$RUNTIME_VERSION" ]]; then
+            echo "Failed to read crate versions" >&2
+            exit 1
+          fi
+
+          if [[ "$VERSION" != "$CORE_VERSION" || "$VERSION" != "$RUNTIME_VERSION" ]]; then
+            echo "Rust crate versions must match: cli=$VERSION core=$CORE_VERSION runtime=$RUNTIME_VERSION" >&2
+            exit 1
+          fi
+
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            TAG_VERSION="${GITHUB_REF#refs/tags/v}"
+            if [[ "$TAG_VERSION" != "$VERSION" ]]; then
+              echo "Tag version v$TAG_VERSION does not match Cargo.toml version $VERSION" >&2
+              exit 1
+            fi
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Verify crate packages
+        run: cargo package --workspace --locked
+
+      - name: Publish quadra-a-core
+        run: cargo publish -p quadra-a-core --locked --token "${CRATES_IO_TOKEN}"
+        env:
+          CRATES_IO_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+
+      - name: Wait for quadra-a-core index propagation
+        run: sleep 30
+
+      - name: Publish quadra-a-runtime
+        run: cargo publish -p quadra-a-runtime --locked --token "${CRATES_IO_TOKEN}"
+        env:
+          CRATES_IO_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+
+      - name: Wait for quadra-a-runtime index propagation
+        run: sleep 30
+
+      - name: Publish quadra-a-cli-rs
+        run: cargo publish -p quadra-a-cli-rs --locked --token "${CRATES_IO_TOKEN}"
+        env:
+          CRATES_IO_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}

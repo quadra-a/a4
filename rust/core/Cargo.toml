@@ -2,7 +2,13 @@
 name = "quadra-a-core"
 version = "0.1.0-beta.1"
 edition = "2021"
+description = "Core protocol primitives for the quadra-a agent network"
 license = "GPL-3.0"
+readme = "README.md"
+repository = "https://github.com/quadra-a/a4"
+homepage = "https://github.com/quadra-a/a4"
+keywords = ["agent", "protocol", "networking", "e2e", "quadra-a"]
+categories = ["network-programming", "cryptography"]
 
 [lib]
 name = "quadra_a_core"
