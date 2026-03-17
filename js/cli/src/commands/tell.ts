@@ -36,6 +36,10 @@ function serializeStoredMessage(message: StoredMessage | null) {
   };
 }
 
+export function resolveTellMessageType(replyTo?: string | null): 'message' | 'reply' {
+  return replyTo ? 'reply' : 'message';
+}
+
 export function extractPrimaryProtocol(capabilities?: DiscoveryCapability[]): string | null {
   if (!capabilities) return null;
 
@@ -190,7 +194,7 @@ export function registerTellCommand(program: Command): void {
           to: resolved.did,
           protocol: effectiveProtocol,
           payload,
-          type: 'message',
+          type: resolveTellMessageType(replyTo),
           replyTo,
           threadId,
           relay: options.relay,

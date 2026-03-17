@@ -116,6 +116,14 @@ fn parse_body_format(body_format: Option<&str>) -> Result<TellBodyFormat> {
     }
 }
 
+fn tell_message_type(reply_to: Option<&str>) -> &'static str {
+    if reply_to.is_some() {
+        "reply"
+    } else {
+        "message"
+    }
+}
+
 fn read_stdin_body() -> Result<String> {
     let mut body = String::new();
     io::stdin().read_to_string(&mut body)?;
@@ -295,9 +303,10 @@ pub async fn run(opts: TellOptions) -> Result<()> {
     }
 
     if daemon_status.is_some() {
+        let message_type = tell_message_type(opts.reply_to.as_deref());
         let mut params = json!({
             "to": recipient_did,
-            "type": "message",
+            "type": message_type,
             "protocol": effective_protocol,
             "payload": payload,
         });
@@ -470,7 +479,7 @@ pub async fn run(opts: TellOptions) -> Result<()> {
     let envelope = build_envelope(
         &identity.did,
         &recipient_did,
-        "message",
+        tell_message_type(opts.reply_to.as_deref()),
         &effective_protocol,
         payload.clone(),
         EnvelopeThreading {
@@ -732,33 +741,44 @@ pub(crate) async fn wait_for_message_outcome_via_daemon(
             return Ok(None);
         }
 
-        let inbox_params = json!({
-            "limit": 400,
-            "pagination": { "limit": 400 },
-            "filter": {},
-        });
-
-        if let Ok(response) = daemon.send_command("inbox", inbox_params).await {
-            let messages = response
-                .get("messages")
-                .and_then(|messages| messages.as_array())
-                .map(Vec::as_slice)
-                .unwrap_or(&[]);
-
-            // Sort messages by timestamp and process only new ones
-            for message in sort_messages_by_timestamp(messages) {
-                if let Some(id) = get_message_id(&message) {
-                    let id_string = id.to_string();
-                    if seen_ids.contains(&id_string) {
-                        continue;
-                    }
-                    seen_ids.insert(id_string);
+        let mut candidates = Vec::<Value>::new();
+        for inbox_params in [
+            json!({
+                "limit": 100,
+                "pagination": { "limit": 100 },
+                "filter": {
+                    "direction": "inbound",
+                    "replyTo": message_id,
+                },
+            }),
+            json!({
+                "limit": 400,
+                "pagination": { "limit": 400 },
+                "filter": {
+                    "direction": "inbound",
+                },
+            }),
+        ] {
+            if let Ok(response) = daemon.send_command("inbox", inbox_params).await {
+                if let Some(messages) = response.get("messages").and_then(|messages| messages.as_array()) {
+                    candidates.extend(messages.iter().cloned());
                 }
+            }
+        }
 
-                if let Some(outcome) = tracker.observe(&message) {
-                    if outcome.terminal {
-                        return Ok(Some(outcome));
-                    }
+        // Sort messages by timestamp and process only new ones
+        for message in sort_messages_by_timestamp(&candidates) {
+            if let Some(id) = get_message_id(&message) {
+                let id_string = id.to_string();
+                if seen_ids.contains(&id_string) {
+                    continue;
+                }
+                seen_ids.insert(id_string);
+            }
+
+            if let Some(outcome) = tracker.observe(&message) {
+                if outcome.terminal {
+                    return Ok(Some(outcome));
                 }
             }
         }
@@ -1065,8 +1085,8 @@ fn describe_protocols(protocols: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_wait_json_response, extract_primary_protocol, validate_tell_body_input,
-        ProtocolSelection, TellBodyFormat, TellOptions,
+        build_wait_json_response, extract_primary_protocol, tell_message_type,
+        validate_tell_body_input, ProtocolSelection, TellBodyFormat, TellOptions,
     };
     use crate::commands::message_lifecycle::{MessageOutcome, MessageOutcomeKind};
     use crate::protocol::{AgentCard, Capability};
@@ -1230,5 +1250,11 @@ mod tests {
         assert!(error
             .to_string()
             .contains("Positional message always uses --body-format text"));
+    }
+
+    #[test]
+    fn tell_message_type_defaults_to_reply_when_reply_to_is_present() {
+        assert_eq!(tell_message_type(Some("msg-1")), "reply");
+        assert_eq!(tell_message_type(None), "message");
     }
 }

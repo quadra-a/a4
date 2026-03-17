@@ -104,7 +104,7 @@ if (isMain) {
   program.parse();
 }
 
-export { extractPrimaryProtocol } from './commands/tell.js';
+export { extractPrimaryProtocol, resolveTellMessageType } from './commands/tell.js';
 export {
   buildServeHandlers,
   claimServeMessage,

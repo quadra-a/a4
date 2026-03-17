@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { extractPrimaryProtocol } from '../dist/index.js';
+import { extractPrimaryProtocol, resolveTellMessageType } from '../dist/index.js';
 
 test('extractPrimaryProtocol prefers capability metadata.protocol', () => {
   const protocol = extractPrimaryProtocol([
@@ -50,4 +50,9 @@ test('extractPrimaryProtocol returns null for ambiguous protocol metadata', () =
   ]);
 
   assert.equal(protocol, null);
+});
+
+test('resolveTellMessageType treats --reply-to as a formal reply', () => {
+  assert.equal(resolveTellMessageType('msg-1'), 'reply');
+  assert.equal(resolveTellMessageType(undefined), 'message');
 });

@@ -241,6 +241,7 @@ async fn poll_once(
                 "unread": true,
                 "pagination": { "limit": INBOX_POLL_LIMIT },
                 "filter": {
+                    "direction": "inbound",
                     "unreadOnly": true,
                     "status": "pending",
                     "type": "message",

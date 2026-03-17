@@ -121,6 +121,129 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+fn json_string_filter(value: Option<&Value>) -> Option<HashSet<String>> {
+    let value = value?;
+    let values = match value {
+        Value::String(text) => vec![text.trim().to_string()],
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| item.as_str().map(str::trim).map(ToOwned::to_owned))
+            .collect::<Vec<_>>(),
+        _ => return None,
+    };
+
+    let values = values
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .collect::<HashSet<_>>();
+
+    if values.is_empty() {
+        None
+    } else {
+        Some(values)
+    }
+}
+
+fn matches_string_filter(value: Option<&str>, allowed: Option<&HashSet<String>>) -> bool {
+    match allowed {
+        None => true,
+        Some(allowed) => value.is_some_and(|value| allowed.contains(value)),
+    }
+}
+
+fn stored_message_status(message: &StoredMessage) -> &'static str {
+    if let Some(e2e) = message.e2e.as_ref() {
+        if e2e
+            .deliveries
+            .iter()
+            .any(|delivery| delivery.state == E2EDeliveryState::Failed)
+        {
+            return "failed";
+        }
+
+        if e2e.deliveries.iter().any(|delivery| {
+            matches!(
+                delivery.state,
+                E2EDeliveryState::Accepted
+                    | E2EDeliveryState::Delivered
+                    | E2EDeliveryState::Received
+            )
+        }) {
+            return "delivered";
+        }
+    }
+
+    match message.direction {
+        MessageDirection::Inbound => {
+            if message.read {
+                "delivered"
+            } else {
+                "pending"
+            }
+        }
+        MessageDirection::Outbound => "pending",
+    }
+}
+
+fn inbox_message_matches(
+    message: &StoredMessage,
+    unread_only: bool,
+    thread_id: Option<&str>,
+    directions: Option<&HashSet<String>>,
+    from_dids: Option<&HashSet<String>>,
+    to_dids: Option<&HashSet<String>>,
+    protocols: Option<&HashSet<String>>,
+    envelope_types: Option<&HashSet<String>>,
+    reply_tos: Option<&HashSet<String>>,
+    statuses: Option<&HashSet<String>>,
+) -> bool {
+    if unread_only && message.read {
+        return false;
+    }
+
+    if let Some(thread_id) = thread_id {
+        let effective = effective_thread_id(message);
+        if message.thread_id.as_deref() != Some(thread_id) && effective != thread_id {
+            return false;
+        }
+    }
+
+    if !matches_string_filter(Some(message.direction.as_str()), directions) {
+        return false;
+    }
+
+    if !matches_string_filter(Some(message.from.as_str()), from_dids) {
+        return false;
+    }
+
+    if !matches_string_filter(Some(message.to.as_str()), to_dids) {
+        return false;
+    }
+
+    if !matches_string_filter(
+        message.envelope.get("protocol").and_then(|value| value.as_str()),
+        protocols,
+    ) {
+        return false;
+    }
+
+    if !matches_string_filter(
+        message.envelope.get("type").and_then(|value| value.as_str()),
+        envelope_types,
+    ) {
+        return false;
+    }
+
+    if !matches_string_filter(
+        message.envelope.get("replyTo").and_then(|value| value.as_str()),
+        reply_tos,
+    ) {
+        return false;
+    }
+
+    matches_string_filter(Some(stored_message_status(message)), statuses)
+}
+
 fn json_u64(value: Option<&Value>) -> Option<u64> {
     value.and_then(|v| {
         v.as_u64().or_else(|| {
@@ -2478,7 +2601,8 @@ async fn handle_status(state: Arc<RwLock<DaemonState>>) -> Result<Value> {
 }
 
 async fn handle_inbox(params: Value, state: Arc<RwLock<DaemonState>>) -> Result<Value> {
-    let state_guard = state.write().await;
+    let state_guard = state.read().await;
+    let filter = params.get("filter");
     let limit = json_u64(
         params
             .get("limit")
@@ -2487,20 +2611,64 @@ async fn handle_inbox(params: Value, state: Arc<RwLock<DaemonState>>) -> Result<
     .unwrap_or(20) as usize;
     let unread = params
         .get("unread")
-        .or_else(|| params.get("filter").and_then(|f| f.get("unread")))
-        .or_else(|| params.get("filter").and_then(|f| f.get("unreadOnly")))
+        .or_else(|| filter.and_then(|f| f.get("unread")))
+        .or_else(|| filter.and_then(|f| f.get("unreadOnly")))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let thread_id = params
         .get("threadId")
-        .or_else(|| params.get("filter").and_then(|f| f.get("threadId")))
+        .or_else(|| filter.and_then(|f| f.get("threadId")))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    let directions =
+        json_string_filter(params.get("direction").or_else(|| filter.and_then(|f| f.get("direction"))));
+    let from_dids =
+        json_string_filter(params.get("fromDid").or_else(|| filter.and_then(|f| f.get("fromDid"))));
+    let to_dids =
+        json_string_filter(params.get("toDid").or_else(|| filter.and_then(|f| f.get("toDid"))));
+    let protocols = json_string_filter(
+        params
+            .get("protocol")
+            .or_else(|| filter.and_then(|f| f.get("protocol"))),
+    );
+    let envelope_types =
+        json_string_filter(params.get("type").or_else(|| filter.and_then(|f| f.get("type"))));
+    let reply_tos = json_string_filter(
+        params
+            .get("replyTo")
+            .or_else(|| filter.and_then(|f| f.get("replyTo"))),
+    );
+    let statuses =
+        json_string_filter(params.get("status").or_else(|| filter.and_then(|f| f.get("status"))));
 
-    let (selected, total) = state_guard
+    let mut selected = state_guard
         .messages
-        .inbox_page(limit, unread, thread_id.as_deref());
-    let messages = selected
+        .all_messages()
+        .iter()
+        .filter(|message| {
+            inbox_message_matches(
+                message,
+                unread,
+                thread_id.as_deref(),
+                directions.as_ref(),
+                from_dids.as_ref(),
+                to_dids.as_ref(),
+                protocols.as_ref(),
+                envelope_types.as_ref(),
+                reply_tos.as_ref(),
+                statuses.as_ref(),
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    selected.sort_by_key(|message| message.timestamp);
+    let total = selected.len();
+    let page = selected
+        .into_iter()
+        .rev()
+        .take(limit)
+        .collect::<Vec<_>>();
+    let messages = page
         .into_iter()
         .map(|message| message_to_inbox_json(&message))
         .collect::<Vec<_>>();
@@ -2508,6 +2676,7 @@ async fn handle_inbox(params: Value, state: Arc<RwLock<DaemonState>>) -> Result<
     Ok(json!({
         "messages": messages,
         "total": total,
+        "hasMore": total > limit,
     }))
 }
 
@@ -3489,6 +3658,7 @@ fn message_to_inbox_json(message: &StoredMessage) -> Value {
         "from": message.from,
         "to": message.to,
         "direction": message.direction.as_str(),
+        "status": stored_message_status(message),
         "envelope": message.envelope,
         "timestamp": message.timestamp,
         "threadId": effective_thread_id(message),
@@ -3598,14 +3768,14 @@ mod tests {
     use super::{
         build_session_reset_ack_envelope, build_session_reset_envelope,
         build_session_retry_envelope, clear_pending_peer_recovery, encode_envelope_bytes,
-        get_peer_recovery_state, handle_e2e_reset_notify, handle_send,
-        inbound_rejection_reason, compute_local_interaction_score, DaemonState, PeerRecoveryState,
+        compute_local_interaction_score, get_peer_recovery_state, handle_e2e_reset_notify,
+        handle_inbox, handle_send, inbound_rejection_reason, DaemonState, PeerRecoveryState,
         PendingDecryptFailure, PendingReplayRequest, RecoveryCoordinator,
         DEFAULT_JS_DAEMON_SOCKET, DEFAULT_RS_DAEMON_SOCKET,
     };
     use crate::config::{Config, IdentityConfig, TrustConfig};
     use crate::identity::KeyPair;
-    use quadra_a_runtime::inbox::parse_envelope_value;
+    use quadra_a_runtime::inbox::{parse_envelope_value, MessageDirection, StoredMessage};
     use quadra_a_runtime::relay_worker::{RelaySendOutcome, RelayWorkerCommand};
     use quadra_a_runtime::session_manager::ManagedRelayState;
     use serde_json::json;
@@ -3982,5 +4152,83 @@ mod tests {
 
         assert_eq!(interaction_count, 2);
         assert_eq!(local_trust, 1.0);
+    }
+
+    #[tokio::test]
+    async fn handle_inbox_applies_direction_type_reply_to_and_status_filters() {
+        let state = Arc::new(RwLock::new(DaemonState {
+            config: Config::default(),
+            relay_runtime: ManagedRelayState::new(
+                quadra_a_core::config::ReachabilityPolicy::default(),
+            ),
+            relay_sender: None,
+            outbound_send_lock: Arc::new(Mutex::new(())),
+            peer_session_locks: Arc::new(Mutex::new(HashMap::new())),
+            recovery_coordinator: Arc::new(Mutex::new(RecoveryCoordinator::default())),
+            messages_path: std::env::temp_dir()
+                .join(format!("a4-daemon-messages-{}.json", uuid::Uuid::new_v4())),
+            messages: quadra_a_runtime::inbox::MessageStore::default(),
+            running: true,
+        }));
+
+        {
+            let mut guard = state.write().await;
+            guard.messages.store(StoredMessage {
+                id: "msg-request".to_string(),
+                from: "did:agent:me".to_string(),
+                to: "did:agent:gpu".to_string(),
+                envelope: json!({
+                    "id": "msg-request",
+                    "type": "message",
+                    "protocol": "/capability/gpu/compute",
+                    "payload": { "size": 1024 }
+                }),
+                timestamp: 1,
+                thread_id: None,
+                read: true,
+                direction: MessageDirection::Outbound,
+                e2e: None,
+            });
+            guard.messages.store(StoredMessage {
+                id: "msg-reply".to_string(),
+                from: "did:agent:gpu".to_string(),
+                to: "did:agent:me".to_string(),
+                envelope: json!({
+                    "id": "msg-reply",
+                    "type": "reply",
+                    "protocol": "/capability/gpu/compute",
+                    "replyTo": "msg-request",
+                    "payload": { "ok": true }
+                }),
+                timestamp: 2,
+                thread_id: None,
+                read: false,
+                direction: MessageDirection::Inbound,
+                e2e: None,
+            });
+        }
+
+        let response = handle_inbox(
+            json!({
+                "pagination": { "limit": 20 },
+                "filter": {
+                    "direction": "inbound",
+                    "type": "reply",
+                    "replyTo": "msg-request",
+                    "status": "pending"
+                }
+            }),
+            Arc::clone(&state),
+        )
+        .await
+        .expect("filtered inbox query succeeds");
+
+        let messages = response["messages"]
+            .as_array()
+            .expect("messages array present");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["id"], "msg-reply");
+        assert_eq!(messages[0]["direction"], "inbound");
+        assert_eq!(messages[0]["status"], "pending");
     }
 }
