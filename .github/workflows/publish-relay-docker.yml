@@ -3,8 +3,13 @@ name: Publish Relay Docker Image
 on:
   push:
     tags:
-      - 'relay-v*'
+      - "v*"
   workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to build (branch, tag, or SHA)
+        required: false
+        default: ""
 
 jobs:
   publish-docker:
@@ -17,6 +22,8 @@ jobs:
         working-directory: js
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
 
       - uses: actions/setup-node@v4
         with:
@@ -27,28 +34,46 @@ jobs:
           version: 9
 
       - name: Install dependencies
-        run: pnpm install --no-frozen-lockfile
+        run: pnpm install --frozen-lockfile
+
+      - name: Resolve image version and channel tag
+        id: release
+        run: |
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          else
+            VERSION="$(node -p "require('./relay/package.json').version")"
+          fi
+
+          RELAY_VERSION="$(node -p "require('./relay/package.json').version")"
+          if [[ "$VERSION" != "$RELAY_VERSION" ]]; then
+            echo "relay/package.json version $RELAY_VERSION does not match release version $VERSION" >&2
+            exit 1
+          fi
+
+          if [[ "$VERSION" == *-* ]]; then
+            PRERELEASE="${VERSION#*-}"
+            CHANNEL_TAG="${PRERELEASE%%.*}"
+          else
+            CHANNEL_TAG="latest"
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "channel_tag=$CHANNEL_TAG" >> "$GITHUB_OUTPUT"
 
       - name: Build relay workspace packages
         run: |
           pnpm --filter ./core/protocol build
           pnpm --filter ./relay build
 
+      - uses: docker/setup-qemu-action@v3
+
       - uses: docker/setup-buildx-action@v3
 
       - uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
-
-      - name: Resolve image version
-        id: version
-        run: |
-          VERSION="${GITHUB_REF#refs/tags/relay-v}"
-          if [[ -z "$VERSION" || "$VERSION" == "$GITHUB_REF" ]]; then
-            VERSION="$(node -p \"require('./relay/package.json').version\")"
-          fi
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          username: ${{ secrets.DOCKERHUB_USERNAME || secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN || secrets.DOCKER_PASSWORD }}
 
       - name: Resolve image tags
         id: tags
@@ -56,7 +81,7 @@ jobs:
           IMAGE_REPO: ${{ vars.DOCKER_IMAGE_REPO }}
           EXTRA_IMAGE_REPOS: ${{ vars.EXTRA_DOCKER_IMAGE_REPOS }}
         run: |
-          IMAGE_REPO="${IMAGE_REPO:-quadra-a/relay}"
+          IMAGE_REPO="${IMAGE_REPO:-quadraa/relay}"
           RAW_REPOS="$IMAGE_REPO"
           if [[ -n "${EXTRA_IMAGE_REPOS:-}" ]]; then
             RAW_REPOS="$RAW_REPOS,$EXTRA_IMAGE_REPOS"
@@ -69,8 +94,8 @@ jobs:
             if [[ -z "$repo" ]]; then
               continue
             fi
-            TAGS+="$repo:${{ steps.version.outputs.version }}"$'\n'
-            TAGS+="$repo:latest"$'\n'
+            TAGS+="$repo:${{ steps.release.outputs.version }}"$'\n'
+            TAGS+="$repo:${{ steps.release.outputs.channel_tag }}"$'\n'
           done
 
           {
@@ -89,5 +114,9 @@ jobs:
           push: true
           provenance: false
           tags: ${{ steps.tags.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.release.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

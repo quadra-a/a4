@@ -3,11 +3,12 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERSION="${1:-$(node -p "require('$ROOT_DIR/package.json').version")}" 
-IMAGE_REPO="${IMAGE_REPO:-highway1net/relay}"
+IMAGE_REPO="${IMAGE_REPO:-quadraa/relay}"
 EXTRA_IMAGE_REPOS="${EXTRA_IMAGE_REPOS:-}"
 PLATFORMS="${PLATFORMS:-linux/amd64,linux/arm64}"
 BUILDER_NAME="${BUILDER_NAME:-relay-multiarch}"
 BUILD_PROVENANCE="${BUILD_PROVENANCE:-false}"
+CHANNEL_TAG="${CHANNEL_TAG:-}"
 DRY_RUN="${DRY_RUN:-}"
 
 trim() {
@@ -59,11 +60,24 @@ ensure_builder() {
 cd "$ROOT_DIR"
 collect_image_repos
 
+if [[ -z "$CHANNEL_TAG" ]]; then
+  if [[ "$VERSION" == *-* ]]; then
+    prerelease="${VERSION#*-}"
+    CHANNEL_TAG="${prerelease%%.*}"
+  else
+    CHANNEL_TAG="latest"
+  fi
+fi
+
 declare -a TAG_ARGS=()
 declare -a PUBLISHED_TAGS=()
 for repo in "${IMAGE_REPOS[@]}"; do
-  TAG_ARGS+=( -t "$repo:$VERSION" -t "$repo:latest" )
-  PUBLISHED_TAGS+=( "$repo:$VERSION" "$repo:latest" )
+  TAG_ARGS+=( -t "$repo:$VERSION" )
+  PUBLISHED_TAGS+=( "$repo:$VERSION" )
+  if [[ -n "$CHANNEL_TAG" ]]; then
+    TAG_ARGS+=( -t "$repo:$CHANNEL_TAG" )
+    PUBLISHED_TAGS+=( "$repo:$CHANNEL_TAG" )
+  fi
 done
 
 if [[ -n "$DRY_RUN" ]]; then
@@ -75,7 +89,7 @@ if [[ -n "$DRY_RUN" ]]; then
 fi
 
 echo "Installing relay dependencies..."
-pnpm install --no-frozen-lockfile
+pnpm install --frozen-lockfile
 
 echo "Building relay package..."
 pnpm build

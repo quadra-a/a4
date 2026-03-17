@@ -1,6 +1,6 @@
 {
   "name": "@quadra-a/relay",
-  "version": "0.0.1",
+  "version": "0.1.0-beta.1",
   "description": "WebSocket relay server for quadra-a",
   "type": "module",
   "keywords": [
@@ -32,13 +32,18 @@
       "types": "./dist/index.d.ts"
     }
   },
+  "files": [
+    "dist",
+    "README.md"
+  ],
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
     "test": "vitest run",
     "clean": "rm -rf dist",
     "start": "node dist/index.js",
-    "smoke:local": "node --experimental-strip-types scripts/smoke-relay.ts"
+    "smoke:local": "node --experimental-strip-types scripts/smoke-relay.ts",
+    "prepack": "pnpm build"
   },
   "dependencies": {
     "cbor-x": "^1.5.4",
@@ -52,6 +57,9 @@
     "typescript": "^5.7.2",
     "vitest": "^2.1.8",
     "@quadra-a/protocol": "workspace:*"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "license": "GPL-3.0"
 }

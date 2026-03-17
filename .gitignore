@@ -14,6 +14,7 @@ lerna-debug.log*
 dist/
 build/
 coverage/
+.release-pack/
 *.tsbuildinfo
 *.log
 .next/
@@ -53,6 +54,7 @@ Desktop.ini
 # Rust specific
 target/
 Cargo.lock
+!rust/Cargo.lock
 **/*.rs.bk
 *.pdb
 

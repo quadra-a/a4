@@ -3,13 +3,13 @@ name: Build Rust CLI Release Artifacts
 on:
   push:
     tags:
-      - 'cli-rs-v*'
+      - "v*"
   workflow_dispatch:
     inputs:
       ref:
         description: Git ref to build (branch, tag, or SHA)
         required: false
-        default: ''
+        default: ""
 
 jobs:
   prepare:
@@ -19,6 +19,7 @@ jobs:
     outputs:
       checkout_ref: ${{ steps.ref.outputs.checkout_ref }}
       version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -33,20 +34,35 @@ jobs:
         shell: bash
         run: |
           VERSION="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' rust/cli-rs/Cargo.toml | head -n 1)"
-          if [[ -z "$VERSION" ]]; then
-            echo "Failed to read version from rust/cli-rs/Cargo.toml" >&2
+          CORE_VERSION="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' rust/core/Cargo.toml | head -n 1)"
+          RUNTIME_VERSION="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' rust/runtime/Cargo.toml | head -n 1)"
+
+          if [[ -z "$VERSION" || -z "$CORE_VERSION" || -z "$RUNTIME_VERSION" ]]; then
+            echo "Failed to read Rust crate versions" >&2
             exit 1
           fi
 
-          if [[ "${{ github.event_name }}" == "push" && "${GITHUB_REF:-}" == refs/tags/cli-rs-v* ]]; then
-            TAG_VERSION="${GITHUB_REF#refs/tags/cli-rs-v}"
+          if [[ "$VERSION" != "$CORE_VERSION" || "$VERSION" != "$RUNTIME_VERSION" ]]; then
+            echo "Rust crate versions must match: cli=$VERSION core=$CORE_VERSION runtime=$RUNTIME_VERSION" >&2
+            exit 1
+          fi
+
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            TAG_VERSION="${GITHUB_REF#refs/tags/v}"
             if [[ "$TAG_VERSION" != "$VERSION" ]]; then
-              echo "Tag version cli-rs-v$TAG_VERSION does not match Cargo.toml version $VERSION" >&2
+              echo "Tag version v$TAG_VERSION does not match Cargo.toml version $VERSION" >&2
               exit 1
             fi
           fi
 
+          if [[ "$VERSION" == *-* ]]; then
+            PRERELEASE=true
+          else
+            PRERELEASE=false
+          fi
+
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
 
   build:
     needs: prepare
@@ -78,6 +94,9 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - uses: docker/setup-qemu-action@v3
+        if: contains(matrix.target, 'linux')
+
       - name: Install cross
         if: contains(matrix.target, 'musl')
         run: cargo install cross --git https://github.com/cross-rs/cross
@@ -93,7 +112,8 @@ jobs:
       - name: Package release archive
         id: package
         run: |
-          archive_path="$(./cli-rs/scripts/package-release.sh --target ${{ matrix.target }} --out-dir "$PWD/dist")"
+          mkdir -p "$RUNNER_TEMP/dist"
+          archive_path="$(./cli-rs/scripts/package-release.sh --target ${{ matrix.target }} --out-dir "$RUNNER_TEMP/dist")"
           checksum_path="${archive_path}.sha256"
           shasum -a 256 "$archive_path" > "$checksum_path"
           echo "archive_path=$archive_path" >> "$GITHUB_OUTPUT"
@@ -112,7 +132,7 @@ jobs:
     needs:
       - prepare
       - build
-    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/cli-rs-v') }}
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -127,3 +147,7 @@ jobs:
         with:
           files: dist/*
           fail_on_unmatched_files: true
+          tag_name: ${{ github.ref_name }}
+          name: a4 v${{ needs.prepare.outputs.version }}
+          generate_release_notes: true
+          prerelease: ${{ needs.prepare.outputs.prerelease == 'true' }}

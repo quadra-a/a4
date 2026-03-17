@@ -1,0 +1,134 @@
+name: Publish JS Packages
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to publish (branch, tag, or SHA)
+        required: false
+        default: ""
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        shell: bash
+        working-directory: js
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Resolve release version and npm tag
+        id: release
+        run: |
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          else
+            VERSION="$(node -p "require('./cli/package.json').version")"
+          fi
+
+          if [[ -z "$VERSION" ]]; then
+            echo "Failed to resolve release version" >&2
+            exit 1
+          fi
+
+          if [[ "$VERSION" == *-* ]]; then
+            PRERELEASE="${VERSION#*-}"
+            NPM_TAG="${PRERELEASE%%.*}"
+          else
+            NPM_TAG="latest"
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "npm_tag=$NPM_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Verify manifest versions
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFileSync } from 'node:fs';
+
+          const releaseVersion = process.env.RELEASE_VERSION;
+          const manifests = [
+            'package.json',
+            'core/protocol/package.json',
+            'core/runtime/package.json',
+            'cli/package.json',
+            'mcp-server/package.json',
+            'relay/package.json',
+          ];
+
+          for (const manifest of manifests) {
+            const value = JSON.parse(readFileSync(manifest, 'utf8'));
+            if (value.version !== releaseVersion) {
+              console.error(`${manifest} has version ${value.version}, expected ${releaseVersion}`);
+              process.exit(1);
+            }
+          }
+          NODE
+
+      - name: Build workspace packages
+        run: pnpm run build
+
+      - name: Run tests
+        run: pnpm run test
+
+      - name: Verify publish tarballs
+        run: |
+          mkdir -p "$RUNNER_TEMP/npm-packs"
+          pnpm --filter ./core/protocol pack --pack-destination "$RUNNER_TEMP/npm-packs"
+          pnpm --filter ./core/runtime pack --pack-destination "$RUNNER_TEMP/npm-packs"
+          pnpm --filter ./cli pack --pack-destination "$RUNNER_TEMP/npm-packs"
+          pnpm --filter ./mcp-server pack --pack-destination "$RUNNER_TEMP/npm-packs"
+          pnpm --filter ./relay pack --pack-destination "$RUNNER_TEMP/npm-packs"
+
+      - name: Publish @quadra-a/protocol
+        run: pnpm --filter ./core/protocol publish --access public --tag "${{ steps.release.outputs.npm_tag }}" --no-git-checks
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_PROVENANCE: "true"
+
+      - name: Publish @quadra-a/runtime
+        run: pnpm --filter ./core/runtime publish --access public --tag "${{ steps.release.outputs.npm_tag }}" --no-git-checks
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_PROVENANCE: "true"
+
+      - name: Publish @quadra-a/cli
+        run: pnpm --filter ./cli publish --access public --tag "${{ steps.release.outputs.npm_tag }}" --no-git-checks
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_PROVENANCE: "true"
+
+      - name: Publish @quadra-a/mcp-server
+        run: pnpm --filter ./mcp-server publish --access public --tag "${{ steps.release.outputs.npm_tag }}" --no-git-checks
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_PROVENANCE: "true"
+
+      - name: Publish @quadra-a/relay
+        run: pnpm --filter ./relay publish --access public --tag "${{ steps.release.outputs.npm_tag }}" --no-git-checks
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_PROVENANCE: "true"

@@ -1,12 +1,13 @@
 {
   "name": "@quadra-a/a4-js-workspace",
-  "version": "0.0.1",
+  "version": "0.1.0-beta.1",
   "private": true,
   "type": "module",
   "scripts": {
     "build": "pnpm -r --filter ./core/protocol --filter ./core/runtime --filter ./cli --filter ./mcp-server --filter ./relay build",
     "test": "pnpm -r --if-present --filter ./core/protocol --filter ./core/runtime --filter ./cli --filter ./mcp-server --filter ./relay test",
-    "clean": "pnpm -r --if-present --filter ./core/protocol --filter ./core/runtime --filter ./cli --filter ./mcp-server --filter ./relay clean && rm -rf node_modules"
+    "clean": "pnpm -r --if-present --filter ./core/protocol --filter ./core/runtime --filter ./cli --filter ./mcp-server --filter ./relay clean && rm -rf node_modules .release-pack",
+    "release:check": "pnpm run build && pnpm run test && rm -rf .release-pack && mkdir -p .release-pack && pnpm --filter ./core/protocol pack --pack-destination .release-pack && pnpm --filter ./core/runtime pack --pack-destination .release-pack && pnpm --filter ./cli pack --pack-destination .release-pack && pnpm --filter ./mcp-server pack --pack-destination .release-pack && pnpm --filter ./relay pack --pack-destination .release-pack"
   },
   "license": "GPL-3.0"
 }

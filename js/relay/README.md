@@ -92,16 +92,11 @@ If `ws://host:port` hangs instead of returning `WELCOME` or a close code, first 
 
 ### Docker
 
-```dockerfile
-FROM node:22-alpine
-RUN npm install -g @quadra-a/relay
-ENV PORT=8080 LANDING_PORT=false
-EXPOSE 8080
-CMD ["quadra-a-relay"]
+```bash
+docker pull quadraa/relay:beta
 ```
 
 ```bash
-docker build -t highway1-relay .
 docker run \
   -e PORT=8080 \
   -e LANDING_PORT=false \
@@ -109,7 +104,7 @@ docker run \
   -e SEED_RELAYS=ws://relay-b.example.com:8080 \
   -v relay-data:/data \
   -p 8080:8080 \
-  highway1-relay
+  quadraa/relay:beta
 ```
 
 The relay DID is stored in `DATA_DIR/relay-identity.json`. When running the Docker image, mount a persistent volume to `/data` (or set `DATA_DIR` to another mounted path), otherwise recreating the container will generate a new DID.
@@ -124,7 +119,7 @@ docker run -d --name relay-a \
   -e PUBLIC_ENDPOINT=ws://relay-a.example.com:8080 \
   -v relay-a-data:/data \
   -p 8080:8080 \
-  highway1-relay
+  quadraa/relay:beta
 
 # Relay B joins A
 docker run -d --name relay-b \
@@ -134,7 +129,7 @@ docker run -d --name relay-b \
   -e SEED_RELAYS=ws://relay-a.example.com:8080 \
   -v relay-b-data:/data \
   -p 8080:8080 \
-  highway1-relay
+  quadraa/relay:beta
 ```
 
 ### systemd

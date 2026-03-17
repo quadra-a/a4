@@ -1,6 +1,6 @@
 {
   "name": "@quadra-a/cli",
-  "version": "0.0.1",
+  "version": "0.1.0-beta.1",
   "description": "CLI tool for quadra-a network",
   "type": "module",
   "keywords": [
@@ -24,11 +24,17 @@
   "bin": {
     "a4": "./dist/index.js"
   },
+  "files": [
+    "dist",
+    "a4",
+    "bin"
+  ],
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
     "test": "pnpm build && node --test test/*.test.mjs",
-    "clean": "rm -rf dist"
+    "clean": "rm -rf dist",
+    "prepack": "pnpm build"
   },
   "dependencies": {
     "@quadra-a/protocol": "workspace:*",
@@ -49,6 +55,9 @@
   },
   "engines": {
     "node": ">=22.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "license": "GPL-3.0"
 }
