@@ -12,6 +12,7 @@ export * from './agent-runtime.js';
 export * from './group-runtime.js';
 export * from './messaging.js';
 export * from './inbox.js';
+export * from './inbox-visibility.js';
 export * from './message-trace.js';
 export * from './trust.js';
 export type { MessagePage, QueueStats, StoredMessage } from '@quadra-a/protocol';

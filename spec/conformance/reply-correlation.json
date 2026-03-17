@@ -1,0 +1,157 @@
+{
+  "version": 1,
+  "subject": "reply-correlation",
+  "cases": [
+    {
+      "id": "REPLY-001",
+      "description": "Formal replies correlate directly by replyTo.",
+      "input": {
+        "requestId": "msg-request",
+        "messages": [
+          {
+            "id": "msg-request",
+            "direction": "outbound",
+            "from": "did:agent:me",
+            "to": "did:agent:worker",
+            "type": "message",
+            "protocol": "/jobs/1.0.0",
+            "payload": {
+              "task": "ping"
+            },
+            "timestamp": 1
+          },
+          {
+            "id": "msg-reply",
+            "direction": "inbound",
+            "from": "did:agent:worker",
+            "to": "did:agent:me",
+            "type": "reply",
+            "protocol": "/jobs/1.0.0",
+            "replyTo": "msg-request",
+            "payload": {
+              "ok": true
+            },
+            "timestamp": 2
+          }
+        ]
+      },
+      "expected": {
+        "found": true,
+        "messageId": "msg-reply",
+        "kind": "reply",
+        "status": null,
+        "terminal": true
+      }
+    },
+    {
+      "id": "REPLY-002",
+      "description": "Async lifecycle updates correlate after the first direct match sets job context.",
+      "input": {
+        "requestId": "msg-request",
+        "messages": [
+          {
+            "id": "msg-request",
+            "direction": "outbound",
+            "from": "did:agent:me",
+            "to": "did:agent:worker",
+            "type": "message",
+            "protocol": "/jobs/1.0.0",
+            "payload": {
+              "task": "matrix"
+            },
+            "timestamp": 1
+          },
+          {
+            "id": "msg-running",
+            "direction": "inbound",
+            "from": "did:agent:worker",
+            "to": "did:agent:me",
+            "type": "message",
+            "protocol": "/jobs/1.0.0",
+            "replyTo": "msg-request",
+            "payload": {
+              "status": "running",
+              "jobId": "job-1"
+            },
+            "timestamp": 2
+          },
+          {
+            "id": "msg-success",
+            "direction": "inbound",
+            "from": "did:agent:worker",
+            "to": "did:agent:me",
+            "type": "message",
+            "protocol": "/jobs/1.0.0",
+            "payload": {
+              "status": "success",
+              "jobId": "job-1"
+            },
+            "timestamp": 3
+          }
+        ]
+      },
+      "expected": {
+        "found": true,
+        "messageId": "msg-success",
+        "kind": "result",
+        "status": "success",
+        "terminal": true
+      }
+    },
+    {
+      "id": "REPLY-003",
+      "description": "Mismatched protocol does not correlate later async updates.",
+      "input": {
+        "requestId": "msg-request",
+        "messages": [
+          {
+            "id": "msg-request",
+            "direction": "outbound",
+            "from": "did:agent:me",
+            "to": "did:agent:worker",
+            "type": "message",
+            "protocol": "/jobs/1.0.0",
+            "payload": {
+              "task": "matrix"
+            },
+            "timestamp": 1
+          },
+          {
+            "id": "msg-running",
+            "direction": "inbound",
+            "from": "did:agent:worker",
+            "to": "did:agent:me",
+            "type": "message",
+            "protocol": "/jobs/1.0.0",
+            "replyTo": "msg-request",
+            "payload": {
+              "status": "running",
+              "jobId": "job-1"
+            },
+            "timestamp": 2
+          },
+          {
+            "id": "msg-wrong-protocol",
+            "direction": "inbound",
+            "from": "did:agent:worker",
+            "to": "did:agent:me",
+            "type": "message",
+            "protocol": "/other/1.0.0",
+            "payload": {
+              "status": "success",
+              "jobId": "job-1"
+            },
+            "timestamp": 3
+          }
+        ]
+      },
+      "expected": {
+        "found": true,
+        "messageId": "msg-running",
+        "kind": "result",
+        "status": "running",
+        "terminal": false
+      }
+    }
+  ]
+}

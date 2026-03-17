@@ -1,0 +1,107 @@
+{
+  "version": 1,
+  "subject": "daemon-persistence",
+  "cases": [
+    {
+      "id": "PERSIST-001",
+      "description": "Reply history survives a storage roundtrip.",
+      "input": {
+        "requestId": "msg-request",
+        "messages": [
+          {
+            "id": "msg-request",
+            "direction": "outbound",
+            "from": "did:agent:me",
+            "to": "did:agent:worker",
+            "type": "message",
+            "protocol": "/jobs/1.0.0",
+            "payload": {
+              "task": "ping"
+            },
+            "timestamp": 1
+          },
+          {
+            "id": "msg-reply",
+            "direction": "inbound",
+            "from": "did:agent:worker",
+            "to": "did:agent:me",
+            "type": "reply",
+            "protocol": "/jobs/1.0.0",
+            "replyTo": "msg-request",
+            "payload": {
+              "ok": true
+            },
+            "timestamp": 2
+          }
+        ]
+      },
+      "expected": {
+        "totalMessages": 2,
+        "messageIds": [
+          "msg-request",
+          "msg-reply"
+        ],
+        "outcomeId": "msg-reply",
+        "status": null
+      }
+    },
+    {
+      "id": "PERSIST-002",
+      "description": "Async result history survives a storage roundtrip.",
+      "input": {
+        "requestId": "msg-request",
+        "messages": [
+          {
+            "id": "msg-request",
+            "direction": "outbound",
+            "from": "did:agent:me",
+            "to": "did:agent:worker",
+            "type": "message",
+            "protocol": "/jobs/1.0.0",
+            "payload": {
+              "task": "matrix"
+            },
+            "timestamp": 1
+          },
+          {
+            "id": "msg-running",
+            "direction": "inbound",
+            "from": "did:agent:worker",
+            "to": "did:agent:me",
+            "type": "message",
+            "protocol": "/jobs/1.0.0",
+            "replyTo": "msg-request",
+            "payload": {
+              "status": "running",
+              "jobId": "job-7"
+            },
+            "timestamp": 2
+          },
+          {
+            "id": "msg-success",
+            "direction": "inbound",
+            "from": "did:agent:worker",
+            "to": "did:agent:me",
+            "type": "message",
+            "protocol": "/jobs/1.0.0",
+            "payload": {
+              "status": "success",
+              "jobId": "job-7"
+            },
+            "timestamp": 3
+          }
+        ]
+      },
+      "expected": {
+        "totalMessages": 3,
+        "messageIds": [
+          "msg-request",
+          "msg-running",
+          "msg-success"
+        ],
+        "outcomeId": "msg-success",
+        "status": "success"
+      }
+    }
+  ]
+}

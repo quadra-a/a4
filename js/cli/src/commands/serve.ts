@@ -66,7 +66,9 @@ export function capabilityProtocol(capability: string): string {
 }
 
 export function protocolMatchesCapability(protocol: string, capability: string): boolean {
-  return protocol.trim() === capabilityProtocol(capability);
+  const normalizedProtocol = protocol.trim();
+  const bareCapability = normalizeCapabilityId(capability);
+  return normalizedProtocol === capabilityProtocol(capability) || normalizedProtocol === bareCapability;
 }
 
 export function extractExecArgsFromArgv(argv: string[]): string[] {

@@ -14,9 +14,10 @@ import {
   releaseServeMessage,
 } from '../dist/index.js';
 
-test('protocolMatchesCapability uses exact capability protocols', () => {
+test('protocolMatchesCapability accepts prefixed and bare capability protocols', () => {
   assert.equal(protocolMatchesCapability('/capability/gpu/compute', 'gpu/compute'), true);
   assert.equal(protocolMatchesCapability('/capability/gpu', 'gpu'), true);
+  assert.equal(protocolMatchesCapability('gpu/compute', 'gpu/compute'), true);
   assert.equal(protocolMatchesCapability('/capability/gpu/compute/v2', 'gpu/compute'), false);
   assert.equal(protocolMatchesCapability('/capability/gpu-compute', 'gpu/compute'), false);
 });

@@ -1,0 +1,99 @@
+name: Conformance CI
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'spec/conformance/**'
+      - 'js/**'
+      - 'rust/**'
+      - 'test-scripts/conformance/**'
+      - '.github/workflows/conformance-ci.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'spec/conformance/**'
+      - 'js/**'
+      - 'rust/**'
+      - 'test-scripts/conformance/**'
+      - '.github/workflows/conformance-ci.yml'
+
+jobs:
+  js-conformance:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        working-directory: js
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Build workspace packages
+        working-directory: js
+        run: pnpm run build
+
+      - name: Run JS conformance
+        run: node test-scripts/conformance/run-js.mjs --out "$RUNNER_TEMP/js-conformance.json"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: js-conformance
+          path: ${{ runner.temp }}/js-conformance.json
+          if-no-files-found: error
+
+  rust-conformance:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Run Rust conformance
+        working-directory: rust
+        run: cargo run --package quadra-a-cli-rs --bin a4-conformance -- --out "$RUNNER_TEMP/rust-conformance.json"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rust-conformance
+          path: ${{ runner.temp }}/rust-conformance.json
+          if-no-files-found: error
+
+  cross-runtime-diff:
+    runs-on: ubuntu-latest
+    needs: [js-conformance, rust-conformance]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: js-conformance
+          path: ${{ runner.temp }}/js
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rust-conformance
+          path: ${{ runner.temp }}/rust
+
+      - name: Compare JS and Rust conformance outputs
+        run: |
+          node test-scripts/conformance/compare-results.mjs \
+            --js "$RUNNER_TEMP/js/js-conformance.json" \
+            --rust "$RUNNER_TEMP/rust/rust-conformance.json"

@@ -1,15 +1,6 @@
-mod commands;
-mod config;
-mod daemon;
-mod e2e_state;
-mod identity;
-mod protocol;
-mod relay;
-mod trust;
-mod ui;
-
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use quadra_a_cli_rs::commands;
 use std::env;
 
 const SERVE_AFTER_HELP: &str = "\

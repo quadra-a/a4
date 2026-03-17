@@ -26,6 +26,7 @@ import type {
   E2ERetryMetadata,
 } from './types.js';
 import { normalizeEnvelope } from './envelope.js';
+import { storedMessageStatus } from './status.js';
 import { compareMessagesBySortTimestamp, getMessageSortTimestamp } from './timestamp.js';
 
 const logger = createLogger('message-storage');
@@ -352,6 +353,7 @@ export class MessageStorage {
     return {
       ...msg,
       envelope,
+      status: storedMessageStatus({ ...msg, envelope }),
     };
   }
 

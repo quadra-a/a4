@@ -6,8 +6,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 use crate::commands::message_lifecycle::{
-    envelope_payload, envelope_type, message_id, message_timestamp, protocol, reply_to,
-    source_did, MessageOutcome, MessageOutcomeKind, MessageOutcomeTracker,
+    envelope_payload, envelope_type, message_id, message_timestamp, protocol, reply_to, source_did,
+    MessageOutcome, MessageOutcomeKind, MessageOutcomeTracker,
 };
 use crate::config::load_config;
 use crate::daemon::{daemon_socket_path, DaemonClient};
@@ -349,16 +349,18 @@ pub async fn run(opts: TellOptions) -> Result<()> {
                         println!(
                             "{}",
                             serde_json::to_string_pretty(&build_wait_json_response(
-                                message_id,
-                                &recipient_did,
-                                &effective_protocol,
-                                protocol_selection,
-                                protocol_selection_reason,
-                                body_format,
-                                &payload,
-                                thread_id.as_deref(),
-                                timeout_secs,
-                                outcome.as_ref(),
+                                WaitJsonResponse {
+                                    message_id,
+                                    recipient_did: &recipient_did,
+                                    effective_protocol: &effective_protocol,
+                                    protocol_selection,
+                                    protocol_selection_reason,
+                                    body_format,
+                                    payload: &payload,
+                                    thread_id: thread_id.as_deref(),
+                                    timeout_secs,
+                                    outcome: outcome.as_ref(),
+                                },
                             ))?
                         );
                         if outcome.is_none() {
@@ -538,18 +540,18 @@ pub async fn run(opts: TellOptions) -> Result<()> {
         if opts.json {
             println!(
                 "{}",
-                serde_json::to_string_pretty(&build_wait_json_response(
-                    &prepared.application_envelope.id,
-                    &recipient_did,
-                    &effective_protocol,
+                serde_json::to_string_pretty(&build_wait_json_response(WaitJsonResponse {
+                    message_id: &prepared.application_envelope.id,
+                    recipient_did: &recipient_did,
+                    effective_protocol: &effective_protocol,
                     protocol_selection,
                     protocol_selection_reason,
                     body_format,
-                    &payload,
-                    thread_id.as_deref(),
+                    payload: &payload,
+                    thread_id: thread_id.as_deref(),
                     timeout_secs,
-                    outcome.as_ref(),
-                ))?
+                    outcome: outcome.as_ref(),
+                }))?
             );
             if outcome.is_none() {
                 std::process::exit(1);
@@ -760,7 +762,10 @@ pub(crate) async fn wait_for_message_outcome_via_daemon(
             }),
         ] {
             if let Ok(response) = daemon.send_command("inbox", inbox_params).await {
-                if let Some(messages) = response.get("messages").and_then(|messages| messages.as_array()) {
+                if let Some(messages) = response
+                    .get("messages")
+                    .and_then(|messages| messages.as_array())
+                {
                     candidates.extend(messages.iter().cloned());
                 }
             }
@@ -909,39 +914,41 @@ fn serialize_stored_message(message: &Value) -> Value {
     })
 }
 
-fn build_wait_json_response(
-    message_id: &str,
-    recipient_did: &str,
-    effective_protocol: &str,
+struct WaitJsonResponse<'a> {
+    message_id: &'a str,
+    recipient_did: &'a str,
+    effective_protocol: &'a str,
     protocol_selection: ProtocolSelection,
-    protocol_selection_reason: Option<&str>,
+    protocol_selection_reason: Option<&'a str>,
     body_format: TellBodyFormat,
-    payload: &Value,
-    thread_id: Option<&str>,
+    payload: &'a Value,
+    thread_id: Option<&'a str>,
     timeout_secs: u64,
-    outcome: Option<&MessageOutcome>,
-) -> Value {
+    outcome: Option<&'a MessageOutcome>,
+}
+
+fn build_wait_json_response(args: WaitJsonResponse<'_>) -> Value {
     json!({
-        "messageId": message_id,
-        "to": recipient_did,
-        "protocol": effective_protocol,
-        "protocolSelection": protocol_selection.as_str(),
-        "protocolSelectionReason": protocol_selection_reason,
-        "bodyFormat": body_format.as_str(),
-        "payload": payload,
-        "threadId": thread_id,
-        "waitSeconds": timeout_secs,
-        "reply": outcome
+        "messageId": args.message_id,
+        "to": args.recipient_did,
+        "protocol": args.effective_protocol,
+        "protocolSelection": args.protocol_selection.as_str(),
+        "protocolSelectionReason": args.protocol_selection_reason,
+        "bodyFormat": args.body_format.as_str(),
+        "payload": args.payload,
+        "threadId": args.thread_id,
+        "waitSeconds": args.timeout_secs,
+        "reply": args.outcome
             .filter(|outcome| outcome.kind == MessageOutcomeKind::Reply)
             .map(|outcome| serialize_stored_message(&outcome.message)),
-        "result": outcome.map(|outcome| json!({
+        "result": args.outcome.map(|outcome| json!({
             "kind": outcome.kind.as_str(),
             "status": outcome.status,
             "jobId": outcome.job_id,
             "terminal": outcome.terminal,
             "message": serialize_stored_message(&outcome.message),
         })),
-        "timedOut": outcome.is_none(),
+        "timedOut": args.outcome.is_none(),
     })
 }
 
@@ -1048,6 +1055,7 @@ fn outcome_payload(outcome: &MessageOutcome) -> Option<&Value> {
     envelope_payload(&outcome.message)
 }
 
+#[cfg(test)]
 fn extract_primary_protocol(card: &crate::protocol::AgentCard) -> Option<String> {
     let mut declared_protocols = collect_declared_protocols(card);
     if declared_protocols.len() == 1 {
@@ -1063,8 +1071,7 @@ fn collect_declared_protocols(card: &crate::protocol::AgentCard) -> Vec<String> 
         if let Some(metadata) = &capability.metadata {
             if let Some(protocol) = metadata.get("protocol").and_then(|value| value.as_str()) {
                 let protocol = protocol.trim();
-                if !protocol.is_empty()
-                    && !declared_protocols.iter().any(|entry| entry == protocol)
+                if !protocol.is_empty() && !declared_protocols.iter().any(|entry| entry == protocol)
                 {
                     declared_protocols.push(protocol.to_string());
                 }
@@ -1087,6 +1094,7 @@ mod tests {
     use super::{
         build_wait_json_response, extract_primary_protocol, tell_message_type,
         validate_tell_body_input, ProtocolSelection, TellBodyFormat, TellOptions,
+        WaitJsonResponse,
     };
     use crate::commands::message_lifecycle::{MessageOutcome, MessageOutcomeKind};
     use crate::protocol::{AgentCard, Capability};
@@ -1137,18 +1145,18 @@ mod tests {
             terminal: true,
         };
 
-        let value = build_wait_json_response(
-            "msg_origin",
-            "did:agent:target",
-            "/agent/msg/1.0.0",
-            ProtocolSelection::Auto,
-            Some("auto-selected from target capabilities"),
-            TellBodyFormat::Text,
-            &json!({ "text": "hello" }),
-            Some("thread_123"),
-            30,
-            Some(&outcome),
-        );
+        let value = build_wait_json_response(WaitJsonResponse {
+            message_id: "msg_origin",
+            recipient_did: "did:agent:target",
+            effective_protocol: "/agent/msg/1.0.0",
+            protocol_selection: ProtocolSelection::Auto,
+            protocol_selection_reason: Some("auto-selected from target capabilities"),
+            body_format: TellBodyFormat::Text,
+            payload: &json!({ "text": "hello" }),
+            thread_id: Some("thread_123"),
+            timeout_secs: 30,
+            outcome: Some(&outcome),
+        });
 
         assert_eq!(value["reply"]["payload"]["text"], "done");
         assert_eq!(value["result"]["message"]["payload"]["text"], "done");
@@ -1170,18 +1178,18 @@ mod tests {
             terminal: true,
         };
 
-        let value = build_wait_json_response(
-            "msg_origin",
-            "did:agent:target",
-            "/jobs/1.0.0",
-            ProtocolSelection::Default,
-            None,
-            TellBodyFormat::Json,
-            &json!({ "task": "compute" }),
-            None,
-            15,
-            Some(&outcome),
-        );
+        let value = build_wait_json_response(WaitJsonResponse {
+            message_id: "msg_origin",
+            recipient_did: "did:agent:target",
+            effective_protocol: "/jobs/1.0.0",
+            protocol_selection: ProtocolSelection::Default,
+            protocol_selection_reason: None,
+            body_format: TellBodyFormat::Json,
+            payload: &json!({ "task": "compute" }),
+            thread_id: None,
+            timeout_secs: 15,
+            outcome: Some(&outcome),
+        });
 
         assert!(value["reply"].is_null());
         assert_eq!(value["result"]["message"]["payload"]["status"], "success");

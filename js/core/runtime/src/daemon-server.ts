@@ -60,6 +60,7 @@ import { resolvePublishedDevices, resolvePublishedPreKeyBundles } from './e2e-co
 import { prepareEncryptedSends } from './e2e-send.js';
 import { prepareEncryptedReceive } from './e2e-receive.js';
 import { withLocalE2EStateTransaction } from './e2e-state.js';
+import { paginateVisibleInboxMessages } from './inbox-visibility.js';
 
 const logger = createLogger('daemon');
 const PEER_RECOVERY_DEBOUNCE_MS = 500;
@@ -1988,7 +1989,12 @@ export class ClawDaemon {
   private async handleInbox(req: DaemonRequest): Promise<DaemonResponse> {
     if (!this.queue) return { id: req.id, success: false, error: 'Queue not initialized' };
     const { filter, pagination } = req.params || {};
-    const page = await this.queue.getInbox(filter, pagination);
+    const allMessages = await this.queue.store.queryMessages('inbound', filter ?? {}, {
+      limit: Number.MAX_SAFE_INTEGER,
+      offset: 0,
+    });
+    const blockedDids = new Set((await this.queue.store.listBlocked()).map((entry) => entry.did));
+    const page = paginateVisibleInboxMessages(allMessages.messages, blockedDids, pagination ?? {});
     return { id: req.id, success: true, data: page };
   }
 

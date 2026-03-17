@@ -7,7 +7,7 @@ use dirs::home_dir;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -23,15 +23,14 @@ use crate::config::{
 use crate::e2e_state::{with_local_e2e_state_transaction, with_locked_config_transaction};
 use crate::identity::KeyPair;
 use crate::protocol::{
-    cbor_x_encode_json, relay_unsigned_endorsement_value, AgentCard, Envelope,
-    EnvelopeUnsigned,
+    cbor_x_encode_json, relay_unsigned_endorsement_value, AgentCard, Envelope, EnvelopeUnsigned,
 };
 use crate::relay::connect_first_available;
 use crate::trust::{ActivityLevel, NetworkPosition, TrustEngine};
 use quadra_a_core::e2e::{
     assert_published_sender_device_matches_prekey_message,
-    decode_encrypted_application_envelope_payload, DecodedEncryptedApplicationMessage,
-    ensure_local_e2e_config, EncryptedApplicationEnvelopePayload,
+    decode_encrypted_application_envelope_payload, ensure_local_e2e_config,
+    DecodedEncryptedApplicationMessage, EncryptedApplicationEnvelopePayload,
     E2E_APPLICATION_ENVELOPE_PROTOCOL,
 };
 use quadra_a_runtime::card::{
@@ -151,7 +150,7 @@ fn matches_string_filter(value: Option<&str>, allowed: Option<&HashSet<String>>)
     }
 }
 
-fn stored_message_status(message: &StoredMessage) -> &'static str {
+pub(crate) fn stored_message_status(message: &StoredMessage) -> &'static str {
     if let Some(e2e) = message.e2e.as_ref() {
         if e2e
             .deliveries
@@ -188,63 +187,84 @@ fn stored_message_status(message: &StoredMessage) -> &'static str {
     }
 }
 
-fn inbox_message_matches(
-    message: &StoredMessage,
+pub(crate) fn inbox_message_visible(message: &StoredMessage, config: &Config) -> bool {
+    if message.direction != MessageDirection::Inbound {
+        return true;
+    }
+
+    !config
+        .trust_config
+        .as_ref()
+        .is_some_and(|trust| trust.is_blocked(&message.from))
+}
+
+struct InboxFilterSet<'a> {
     unread_only: bool,
-    thread_id: Option<&str>,
-    directions: Option<&HashSet<String>>,
-    from_dids: Option<&HashSet<String>>,
-    to_dids: Option<&HashSet<String>>,
-    protocols: Option<&HashSet<String>>,
-    envelope_types: Option<&HashSet<String>>,
-    reply_tos: Option<&HashSet<String>>,
-    statuses: Option<&HashSet<String>>,
-) -> bool {
-    if unread_only && message.read {
+    thread_id: Option<&'a str>,
+    directions: Option<&'a HashSet<String>>,
+    from_dids: Option<&'a HashSet<String>>,
+    to_dids: Option<&'a HashSet<String>>,
+    protocols: Option<&'a HashSet<String>>,
+    envelope_types: Option<&'a HashSet<String>>,
+    reply_tos: Option<&'a HashSet<String>>,
+    statuses: Option<&'a HashSet<String>>,
+}
+
+fn inbox_message_matches(message: &StoredMessage, filters: &InboxFilterSet<'_>) -> bool {
+    if filters.unread_only && message.read {
         return false;
     }
 
-    if let Some(thread_id) = thread_id {
+    if let Some(thread_id) = filters.thread_id {
         let effective = effective_thread_id(message);
         if message.thread_id.as_deref() != Some(thread_id) && effective != thread_id {
             return false;
         }
     }
 
-    if !matches_string_filter(Some(message.direction.as_str()), directions) {
+    if !matches_string_filter(Some(message.direction.as_str()), filters.directions) {
         return false;
     }
 
-    if !matches_string_filter(Some(message.from.as_str()), from_dids) {
+    if !matches_string_filter(Some(message.from.as_str()), filters.from_dids) {
         return false;
     }
 
-    if !matches_string_filter(Some(message.to.as_str()), to_dids) {
+    if !matches_string_filter(Some(message.to.as_str()), filters.to_dids) {
         return false;
     }
 
     if !matches_string_filter(
-        message.envelope.get("protocol").and_then(|value| value.as_str()),
-        protocols,
+        message
+            .envelope
+            .get("protocol")
+            .and_then(|value| value.as_str()),
+        filters.protocols,
     ) {
         return false;
     }
 
     if !matches_string_filter(
-        message.envelope.get("type").and_then(|value| value.as_str()),
-        envelope_types,
+        message
+            .envelope
+            .get("type")
+            .and_then(|value| value.as_str()),
+        filters.envelope_types,
     ) {
         return false;
     }
 
     if !matches_string_filter(
-        message.envelope.get("replyTo").and_then(|value| value.as_str()),
-        reply_tos,
+        message
+            .envelope
+            .get("replyTo")
+            .and_then(|value| value.as_str()),
+        filters.reply_tos,
     ) {
         return false;
     }
 
-    matches_string_filter(Some(stored_message_status(message)), statuses)
+    matches_string_filter(Some(stored_message_status(message)), filters.statuses)
 }
 
 fn json_u64(value: Option<&Value>) -> Option<u64> {
@@ -352,7 +372,7 @@ fn merge_cli_fields_before_save(config: &mut Config) {
     }
 }
 
-fn load_persisted_message_store(path: &PathBuf) -> MessageStore {
+fn load_persisted_message_store(path: &Path) -> MessageStore {
     match MessageStore::load_from_path(path) {
         Ok(store) => store,
         Err(error) => {
@@ -395,7 +415,9 @@ fn upsert_message_retry(
     direction: MessageDirection,
     retry: E2ERetryMetadata,
 ) -> bool {
-    let updated = state.messages.upsert_e2e_retry(message_id, direction, retry);
+    let updated = state
+        .messages
+        .upsert_e2e_retry(message_id, direction, retry);
     if updated {
         persist_messages(state);
     }
@@ -490,14 +512,22 @@ fn compute_local_interaction_score(
         .iter()
         .copied()
         .filter(|message| message.direction == MessageDirection::Inbound)
-        .filter_map(|message| message.envelope.get("replyTo").and_then(|value| value.as_str()))
+        .filter_map(|message| {
+            message
+                .envelope
+                .get("replyTo")
+                .and_then(|value| value.as_str())
+        })
         .collect::<HashSet<_>>();
     let completed = outbound_requests
         .iter()
         .filter(|message| replied_to.contains(message.id.as_str()))
         .count();
     let success_rate = completed as f64 / outbound_requests.len() as f64;
-    (interaction_count, (0.2 + success_rate * 0.8).clamp(0.0, 1.0))
+    (
+        interaction_count,
+        (0.2 + success_rate * 0.8).clamp(0.0, 1.0),
+    )
 }
 
 fn clear_peer_sessions(config: &mut Config, peer_did: &str) -> usize {
@@ -637,7 +667,10 @@ fn clear_pending_peer_batch<T>(
     batches: &mut HashMap<String, PendingPeerBatch<T>>,
     peer_did: &str,
 ) -> usize {
-    batches.remove(peer_did).map(|batch| batch.items.len()).unwrap_or(0)
+    batches
+        .remove(peer_did)
+        .map(|batch| batch.items.len())
+        .unwrap_or(0)
 }
 
 fn note_peer_recovery_epoch(
@@ -657,10 +690,7 @@ fn note_peer_recovery_epoch(
     }
 }
 
-fn next_peer_recovery_epoch(
-    recovery_coordinator: &mut RecoveryCoordinator,
-    peer_did: &str,
-) -> u64 {
+fn next_peer_recovery_epoch(recovery_coordinator: &mut RecoveryCoordinator, peer_did: &str) -> u64 {
     let floor = recovery_coordinator
         .recovery_epoch_floors
         .get(peer_did)
@@ -673,6 +703,7 @@ fn next_peer_recovery_epoch(
     epoch
 }
 
+#[cfg(test)]
 async fn clear_pending_peer_recovery(
     state: &Arc<RwLock<DaemonState>>,
     peer_did: &str,
@@ -713,10 +744,7 @@ async fn get_peer_recovery_state(
     guard.peer_recoveries.get(peer_did).cloned()
 }
 
-async fn get_peer_session_lock(
-    state: &Arc<RwLock<DaemonState>>,
-    peer_did: &str,
-) -> Arc<Mutex<()>> {
+async fn get_peer_session_lock(state: &Arc<RwLock<DaemonState>>, peer_did: &str) -> Arc<Mutex<()>> {
     let lock_registry = {
         let state_guard = state.read().await;
         Arc::clone(&state_guard.peer_session_locks)
@@ -771,10 +799,7 @@ async fn clear_all_peer_recoveries(state: &Arc<RwLock<DaemonState>>) -> usize {
     count
 }
 
-async fn clear_persisted_peer_sessions(
-    state: &Arc<RwLock<DaemonState>>,
-    peer_did: &str,
-) -> usize {
+async fn clear_persisted_peer_sessions(state: &Arc<RwLock<DaemonState>>, peer_did: &str) -> usize {
     match with_locked_config_transaction({
         let peer_did = peer_did.to_string();
         move |mut config| async move {
@@ -908,10 +933,7 @@ async fn handle_remote_peer_recovery(
         guard
             .peer_recoveries
             .insert(peer_did.to_string(), recovery.clone());
-        (
-            recovery,
-            (replay_requests, retry_notifications),
-        )
+        (recovery, (replay_requests, retry_notifications))
     };
 
     let cleared_count = clear_persisted_peer_sessions(state, peer_did).await;
@@ -992,11 +1014,7 @@ async fn schedule_peer_retry_notification(
     });
 }
 
-async fn flush_peer_replay(
-    state: Arc<RwLock<DaemonState>>,
-    peer_did: String,
-    generation: u64,
-) {
+async fn flush_peer_replay(state: Arc<RwLock<DaemonState>>, peer_did: String, generation: u64) {
     let coordinator = {
         let state_guard = state.read().await;
         Arc::clone(&state_guard.recovery_coordinator)
@@ -1560,9 +1578,13 @@ async fn prepare_encrypted_send_batches_without_commit(
         let keypair = KeyPair::from_hex(&identity_for_send.private_key)?;
         let invite_token = resolve_relay_invite_token(None, Some(&config));
         let mut query_session = connect_query_session(&relay_url, invite_token.as_deref()).await?;
-        let prepared =
-            prepare_encrypted_sends_with_session(&mut query_session, &config, &keypair, envelope_for_send)
-                .await?;
+        let prepared = prepare_encrypted_sends_with_session(
+            &mut query_session,
+            &config,
+            &keypair,
+            envelope_for_send,
+        )
+        .await?;
         let _ = query_session.goodbye().await;
         Ok((prepared, config))
     })
@@ -2016,11 +2038,9 @@ impl DaemonServer {
                         resolve_relay_invite_token(None, Some(&state_guard.config))
                     };
 
-                    if let Ok(payload) =
-                        serde_json::from_value::<EncryptedApplicationEnvelopePayload>(
-                            transport_envelope.payload.clone(),
-                        )
-                    {
+                    if let Ok(payload) = serde_json::from_value::<EncryptedApplicationEnvelopePayload>(
+                        transport_envelope.payload.clone(),
+                    ) {
                         if let Ok(DecodedEncryptedApplicationMessage::PreKey(message)) =
                             decode_encrypted_application_envelope_payload(&payload)
                         {
@@ -2156,7 +2176,9 @@ impl DaemonServer {
                                             e2e: Some(StoredMessageE2EMetadata {
                                                 deliveries: vec![E2EDeliveryMetadata {
                                                     transport: "unknown".into(),
-                                                    transport_message_id: Some(transport_message_id.clone()),
+                                                    transport_message_id: Some(
+                                                        transport_message_id.clone(),
+                                                    ),
                                                     sender_device_id: "unknown".into(),
                                                     receiver_device_id: receiver_device_id.clone(),
                                                     session_id: "unknown".into(),
@@ -2554,7 +2576,11 @@ async fn handle_list_peers(params: Value, state: Arc<RwLock<DaemonState>>) -> Re
         .unwrap_or_else(|| Value::Array(Vec::new())))
 }
 
-async fn handle_block_alias(action: &str, mut params: Value, state: Arc<RwLock<DaemonState>>) -> Result<Value> {
+async fn handle_block_alias(
+    action: &str,
+    mut params: Value,
+    state: Arc<RwLock<DaemonState>>,
+) -> Result<Value> {
     let params_object = params
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("Invalid block command parameters"))?;
@@ -2623,54 +2649,66 @@ async fn handle_inbox(params: Value, state: Arc<RwLock<DaemonState>>) -> Result<
         .or_else(|| filter.and_then(|f| f.get("threadId")))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    let directions =
-        json_string_filter(params.get("direction").or_else(|| filter.and_then(|f| f.get("direction"))));
-    let from_dids =
-        json_string_filter(params.get("fromDid").or_else(|| filter.and_then(|f| f.get("fromDid"))));
-    let to_dids =
-        json_string_filter(params.get("toDid").or_else(|| filter.and_then(|f| f.get("toDid"))));
+    let directions = json_string_filter(
+        params
+            .get("direction")
+            .or_else(|| filter.and_then(|f| f.get("direction"))),
+    );
+    let from_dids = json_string_filter(
+        params
+            .get("fromDid")
+            .or_else(|| filter.and_then(|f| f.get("fromDid"))),
+    );
+    let to_dids = json_string_filter(
+        params
+            .get("toDid")
+            .or_else(|| filter.and_then(|f| f.get("toDid"))),
+    );
     let protocols = json_string_filter(
         params
             .get("protocol")
             .or_else(|| filter.and_then(|f| f.get("protocol"))),
     );
-    let envelope_types =
-        json_string_filter(params.get("type").or_else(|| filter.and_then(|f| f.get("type"))));
+    let envelope_types = json_string_filter(
+        params
+            .get("type")
+            .or_else(|| filter.and_then(|f| f.get("type"))),
+    );
     let reply_tos = json_string_filter(
         params
             .get("replyTo")
             .or_else(|| filter.and_then(|f| f.get("replyTo"))),
     );
-    let statuses =
-        json_string_filter(params.get("status").or_else(|| filter.and_then(|f| f.get("status"))));
+    let statuses = json_string_filter(
+        params
+            .get("status")
+            .or_else(|| filter.and_then(|f| f.get("status"))),
+    );
+    let filters = InboxFilterSet {
+        unread_only: unread,
+        thread_id: thread_id.as_deref(),
+        directions: directions.as_ref(),
+        from_dids: from_dids.as_ref(),
+        to_dids: to_dids.as_ref(),
+        protocols: protocols.as_ref(),
+        envelope_types: envelope_types.as_ref(),
+        reply_tos: reply_tos.as_ref(),
+        statuses: statuses.as_ref(),
+    };
 
     let mut selected = state_guard
         .messages
         .all_messages()
         .iter()
         .filter(|message| {
-            inbox_message_matches(
-                message,
-                unread,
-                thread_id.as_deref(),
-                directions.as_ref(),
-                from_dids.as_ref(),
-                to_dids.as_ref(),
-                protocols.as_ref(),
-                envelope_types.as_ref(),
-                reply_tos.as_ref(),
-                statuses.as_ref(),
-            )
+            inbox_message_visible(message, &state_guard.config)
+                && inbox_message_matches(message, &filters)
         })
         .cloned()
         .collect::<Vec<_>>();
     selected.sort_by_key(|message| message.timestamp);
     let total = selected.len();
-    let page = selected
-        .into_iter()
-        .rev()
-        .take(limit)
-        .collect::<Vec<_>>();
+    let page = selected.into_iter().rev().take(limit).collect::<Vec<_>>();
     let messages = page
         .into_iter()
         .map(|message| message_to_inbox_json(&message))
@@ -2812,17 +2850,20 @@ async fn handle_send(params: Value, state: Arc<RwLock<DaemonState>>) -> Result<V
     // Phase 3: Store outbound message (brief write lock).
     {
         let mut sg = state.write().await;
-        store_message(&mut sg, StoredMessage {
-            id: message_id.clone(),
-            from: identity.did.clone(),
-            to: to.clone(),
-            timestamp: json_u64(envelope_json.get("timestamp")).unwrap_or_else(now_ms),
-            thread_id: thread_id.clone(),
-            envelope: envelope_json.clone(),
-            read: true,
-            direction: MessageDirection::Outbound,
-            e2e: initial_e2e,
-        });
+        store_message(
+            &mut sg,
+            StoredMessage {
+                id: message_id.clone(),
+                from: identity.did.clone(),
+                to: to.clone(),
+                timestamp: json_u64(envelope_json.get("timestamp")).unwrap_or_else(now_ms),
+                thread_id: thread_id.clone(),
+                envelope: envelope_json.clone(),
+                read: true,
+                direction: MessageDirection::Outbound,
+                e2e: initial_e2e,
+            },
+        );
     }
 
     // Phase 4: Send via relay (no state lock — relay worker can process
@@ -2837,7 +2878,8 @@ async fn handle_send(params: Value, state: Arc<RwLock<DaemonState>>) -> Result<V
         match send_envelope_via_worker(&relay_sender, &to, envelope_bytes).await {
             Ok(outcome) => {
                 if let Some(accepted_config) = accepted_config.as_ref() {
-                    if let Err(error) = commit_e2e_state_after_accept(&state, accepted_config).await {
+                    if let Err(error) = commit_e2e_state_after_accept(&state, accepted_config).await
+                    {
                         if let Some(delivery) = delivery.as_mut() {
                             delivery.transport_message_id = Some(outcome.relay_message_id.clone());
                             delivery.state = E2EDeliveryState::Failed;
@@ -3174,7 +3216,10 @@ fn local_endorsement_to_js_value(endorsement: &EndorsementV2) -> Value {
     })
 }
 
-async fn handle_create_endorsement(params: Value, state: Arc<RwLock<DaemonState>>) -> Result<Value> {
+async fn handle_create_endorsement(
+    params: Value,
+    state: Arc<RwLock<DaemonState>>,
+) -> Result<Value> {
     let target_did = params
         .get("targetDid")
         .or_else(|| params.get("did"))
@@ -3245,14 +3290,8 @@ async fn handle_create_endorsement(params: Value, state: Arc<RwLock<DaemonState>
     }
 
     if let Ok(card) = build_agent_card_from_config(&next_config, &identity) {
-        if let Ok((mut session, _relay_url)) = connect_first_available(
-            None,
-            Some(&next_config),
-            &identity.did,
-            &card,
-            &keypair,
-        )
-        .await
+        if let Ok((mut session, _relay_url)) =
+            connect_first_available(None, Some(&next_config), &identity.did, &card, &keypair).await
         {
             let _ = session.publish_endorsement(&endorsement).await;
             let _ = session.goodbye().await;
@@ -3476,14 +3515,8 @@ async fn handle_publish_card(params: Value, state: Arc<RwLock<DaemonState>>) -> 
 
     let keypair = KeyPair::from_hex(&identity.private_key)?;
     let card = build_agent_card_from_config(&next_config, &identity)?;
-    let (mut session, _relay_url) = connect_first_available(
-        None,
-        Some(&next_config),
-        &identity.did,
-        &card,
-        &keypair,
-    )
-    .await?;
+    let (mut session, _relay_url) =
+        connect_first_available(None, Some(&next_config), &identity.did, &card, &keypair).await?;
     session.publish_card().await?;
     let _ = session.goodbye().await;
 
@@ -3655,7 +3688,7 @@ fn merge_endorsements(existing: &mut Vec<EndorsementV2>, incoming: Vec<Endorseme
     existing.extend(dedup.into_values());
 }
 
-fn message_to_inbox_json(message: &StoredMessage) -> Value {
+pub(crate) fn message_to_inbox_json(message: &StoredMessage) -> Value {
     json!({
         "id": message.id,
         "from": message.from,
@@ -3770,11 +3803,11 @@ impl DaemonClient {
 mod tests {
     use super::{
         build_session_reset_ack_envelope, build_session_reset_envelope,
-        build_session_retry_envelope, clear_pending_peer_recovery, encode_envelope_bytes,
-        compute_local_interaction_score, get_peer_recovery_state, handle_e2e_reset_notify,
-        handle_inbox, handle_send, inbound_rejection_reason, DaemonState, PeerRecoveryState,
-        PendingDecryptFailure, PendingReplayRequest, RecoveryCoordinator,
-        DEFAULT_JS_DAEMON_SOCKET, DEFAULT_RS_DAEMON_SOCKET,
+        build_session_retry_envelope, clear_pending_peer_recovery, compute_local_interaction_score,
+        encode_envelope_bytes, get_peer_recovery_state, handle_e2e_reset_notify, handle_inbox,
+        handle_send, inbound_rejection_reason, DaemonState, PeerRecoveryState,
+        PendingDecryptFailure, PendingReplayRequest, RecoveryCoordinator, DEFAULT_JS_DAEMON_SOCKET,
+        DEFAULT_RS_DAEMON_SOCKET,
     };
     use crate::config::{Config, IdentityConfig, TrustConfig};
     use crate::identity::KeyPair;
@@ -4233,5 +4266,85 @@ mod tests {
         assert_eq!(messages[0]["id"], "msg-reply");
         assert_eq!(messages[0]["direction"], "inbound");
         assert_eq!(messages[0]["status"], "pending");
+    }
+
+    #[tokio::test]
+    async fn handle_inbox_hides_blocked_inbound_messages_by_default() {
+        let mut trust = TrustConfig::new();
+        trust.block_agent("did:agent:blocked".to_string());
+
+        let state = Arc::new(RwLock::new(DaemonState {
+            config: Config {
+                trust_config: Some(trust),
+                ..Config::default()
+            },
+            relay_runtime: ManagedRelayState::new(
+                quadra_a_core::config::ReachabilityPolicy::default(),
+            ),
+            relay_sender: None,
+            outbound_send_lock: Arc::new(Mutex::new(())),
+            peer_session_locks: Arc::new(Mutex::new(HashMap::new())),
+            recovery_coordinator: Arc::new(Mutex::new(RecoveryCoordinator::default())),
+            messages_path: std::env::temp_dir()
+                .join(format!("a4-daemon-messages-{}.json", uuid::Uuid::new_v4())),
+            messages: quadra_a_runtime::inbox::MessageStore::default(),
+            running: true,
+        }));
+
+        {
+            let mut guard = state.write().await;
+            guard.messages.store(StoredMessage {
+                id: "msg-blocked".to_string(),
+                from: "did:agent:blocked".to_string(),
+                to: "did:agent:me".to_string(),
+                envelope: json!({
+                    "id": "msg-blocked",
+                    "type": "message",
+                    "protocol": "/agent/msg/1.0.0",
+                    "from": "did:agent:blocked",
+                    "to": "did:agent:me",
+                    "payload": { "text": "blocked" }
+                }),
+                timestamp: 1,
+                thread_id: None,
+                read: false,
+                direction: MessageDirection::Inbound,
+                e2e: None,
+            });
+            guard.messages.store(StoredMessage {
+                id: "msg-outbound".to_string(),
+                from: "did:agent:me".to_string(),
+                to: "did:agent:blocked".to_string(),
+                envelope: json!({
+                    "id": "msg-outbound",
+                    "type": "message",
+                    "protocol": "/agent/msg/1.0.0",
+                    "from": "did:agent:me",
+                    "to": "did:agent:blocked",
+                    "payload": { "text": "still visible" }
+                }),
+                timestamp: 2,
+                thread_id: None,
+                read: true,
+                direction: MessageDirection::Outbound,
+                e2e: None,
+            });
+        }
+
+        let response = handle_inbox(
+            json!({
+                "pagination": { "limit": 20 },
+                "filter": {}
+            }),
+            Arc::clone(&state),
+        )
+        .await
+        .expect("inbox query succeeds");
+
+        let messages = response["messages"]
+            .as_array()
+            .expect("messages array present");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["id"], "msg-outbound");
     }
 }

@@ -305,7 +305,9 @@ fn parse_daemon_trust_score(data: &serde_json::Value) -> Result<crate::trust::Tr
             .unwrap_or(0) as u32,
         general_endorsements: breakdown_data["generalEndorsements"].as_u64().unwrap_or(0) as u32,
         recent_activity: parse_activity_level(
-            breakdown_data["recentActivity"].as_str().unwrap_or("Medium"),
+            breakdown_data["recentActivity"]
+                .as_str()
+                .unwrap_or("Medium"),
         ),
         network_position: parse_network_position(
             breakdown_data["networkPosition"]
@@ -385,7 +387,10 @@ mod tests {
         assert_eq!(parsed.score, 0.91);
         assert_eq!(parsed.endorsement_count, 4);
         assert_eq!(parsed.interaction_count, 7);
-        assert!(matches!(parsed.breakdown.recent_activity, ActivityLevel::High));
+        assert!(matches!(
+            parsed.breakdown.recent_activity,
+            ActivityLevel::High
+        ));
         assert!(matches!(
             parsed.breakdown.network_position,
             NetworkPosition::WellConnected
@@ -414,7 +419,13 @@ mod tests {
         assert_eq!(parsed.network_trust, 0.66);
         assert_eq!(parsed.endorsement_count, 3);
         assert_eq!(parsed.interaction_count, 12);
-        assert!(matches!(parsed.breakdown.recent_activity, ActivityLevel::High));
-        assert!(matches!(parsed.breakdown.network_position, NetworkPosition::Connected));
+        assert!(matches!(
+            parsed.breakdown.recent_activity,
+            ActivityLevel::High
+        ));
+        assert!(matches!(
+            parsed.breakdown.network_position,
+            NetworkPosition::Connected
+        ));
     }
 }

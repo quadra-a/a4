@@ -8,9 +8,9 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
-use tokio::sync::Mutex;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout, Duration};
 
 use crate::config::{build_card, load_config};
@@ -46,7 +46,7 @@ fn capability_protocol(capability: &str) -> String {
     format!("/capability/{}", normalize_capability_id(capability))
 }
 
-fn protocol_matches_capability(protocol: &str, capability: &str) -> bool {
+pub(crate) fn protocol_matches_capability(protocol: &str, capability: &str) -> bool {
     let p = protocol.trim();
     let cap = normalize_capability_id(capability);
     let prefixed = capability_protocol(capability);
@@ -100,11 +100,7 @@ fn handler_command_display(handler: &HandlerEntry) -> String {
     if handler.exec_args.is_empty() {
         handler.exec.display().to_string()
     } else {
-        format!(
-            "{} {}",
-            handler.exec.display(),
-            handler.exec_args.join(" ")
-        )
+        format!("{} {}", handler.exec.display(), handler.exec_args.join(" "))
     }
 }
 
@@ -259,13 +255,19 @@ async fn poll_once(
         .unwrap_or_default();
 
     for message in messages {
-        let dir = message.get("direction").and_then(|value| value.as_str()).unwrap_or("?");
+        let dir = message
+            .get("direction")
+            .and_then(|value| value.as_str())
+            .unwrap_or("?");
         if dir != "inbound" {
             continue;
         }
 
         let envelope = message.get("envelope").cloned().unwrap_or(Value::Null);
-        let etype = envelope.get("type").and_then(|value| value.as_str()).unwrap_or("?");
+        let etype = envelope
+            .get("type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("?");
         if etype != "message" {
             continue;
         }
@@ -443,12 +445,18 @@ async fn poll_once(
     Ok(())
 }
 
-async fn claim_message(claimed_message_ids: &Arc<Mutex<HashSet<String>>>, message_id: &str) -> bool {
+async fn claim_message(
+    claimed_message_ids: &Arc<Mutex<HashSet<String>>>,
+    message_id: &str,
+) -> bool {
     let mut claimed = claimed_message_ids.lock().await;
     claimed.insert(message_id.to_string())
 }
 
-async fn release_message_claim(claimed_message_ids: &Arc<Mutex<HashSet<String>>>, message_id: &str) {
+async fn release_message_claim(
+    claimed_message_ids: &Arc<Mutex<HashSet<String>>>,
+    message_id: &str,
+) {
     let mut claimed = claimed_message_ids.lock().await;
     claimed.remove(message_id);
 }
@@ -543,9 +551,13 @@ mod tests {
     }
 
     #[test]
-    fn protocol_matching_uses_exact_capability_protocols() {
-        assert!(protocol_matches_capability("/capability/gpu/compute", "gpu/compute"));
+    fn protocol_matching_accepts_prefixed_and_bare_capability_protocols() {
+        assert!(protocol_matches_capability(
+            "/capability/gpu/compute",
+            "gpu/compute"
+        ));
         assert!(protocol_matches_capability("/capability/gpu", "gpu"));
+        assert!(protocol_matches_capability("gpu/compute", "gpu/compute"));
         assert!(!protocol_matches_capability(
             "/capability/gpu/compute/v2",
             "gpu/compute"
@@ -579,7 +591,9 @@ mod tests {
         opts.exec = Some("python gpu_handler.py".to_string());
 
         let error = build_handlers(&opts).expect_err("invalid exec value should fail");
-        assert!(error.to_string().contains("Pass handler arguments after `--`"));
+        assert!(error
+            .to_string()
+            .contains("Pass handler arguments after `--`"));
     }
 
     #[test]

@@ -246,7 +246,11 @@ async fn try_daemon_endorsements(
 }
 
 fn normalize_daemon_endorsement(endorsement: &serde_json::Value) -> Result<serde_json::Value> {
-    if endorsement.get("endorser").and_then(|value| value.as_str()).is_some() {
+    if endorsement
+        .get("endorser")
+        .and_then(|value| value.as_str())
+        .is_some()
+    {
         return Ok(endorsement.clone());
     }
 
@@ -350,8 +354,8 @@ mod tests {
             "timestamp": 5678
         });
 
-        let normalized = normalize_daemon_endorsement(&original)
-            .expect("keeps rust daemon endorsement intact");
+        let normalized =
+            normalize_daemon_endorsement(&original).expect("keeps rust daemon endorsement intact");
 
         assert_eq!(normalized, original);
     }

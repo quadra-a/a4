@@ -383,8 +383,9 @@ impl MessageStore {
 
     pub fn remove_inbound_from(&mut self, did: &str) -> usize {
         let before = self.messages.len();
-        self.messages
-            .retain(|message| !(message.direction == MessageDirection::Inbound && message.from == did));
+        self.messages.retain(|message| {
+            !(message.direction == MessageDirection::Inbound && message.from == did)
+        });
         before.saturating_sub(self.messages.len())
     }
 
@@ -890,10 +891,7 @@ mod tests {
         let stored = store
             .get_message("msg-transport", MessageDirection::Outbound)
             .expect("message exists");
-        let delivery = &stored
-            .e2e
-            .expect("e2e metadata")
-            .deliveries[0];
+        let delivery = &stored.e2e.expect("e2e metadata").deliveries[0];
         assert_eq!(delivery.state, E2EDeliveryState::Delivered);
         assert_eq!(delivery.error, None);
         assert_eq!(delivery.transport_message_id.as_deref(), Some("relay-1"));

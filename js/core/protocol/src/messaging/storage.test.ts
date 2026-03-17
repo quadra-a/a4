@@ -97,6 +97,46 @@ describe('MessageStorage - Thread Operations', () => {
     };
   };
 
+  describe('Status Semantics', () => {
+    it('derives delivered status from readAt for inbound messages', async () => {
+      const msg = createTestMessage('msg-status-1', 'did:agent:alice', 'did:agent:bob', undefined, undefined, {
+        direction: 'inbound',
+        receivedAt: 100,
+      });
+      msg.status = 'pending';
+      msg.readAt = 110;
+
+      await storage.putMessage(msg);
+
+      const retrieved = await storage.getMessage('msg-status-1');
+      expect(retrieved?.status).toBe('delivered');
+    });
+
+    it('keeps unread inbound messages pending even when E2E delivery is received', async () => {
+      const msg = createTestMessage('msg-status-2', 'did:agent:alice', 'did:agent:bob', undefined, undefined, {
+        direction: 'inbound',
+        receivedAt: 100,
+      });
+      msg.status = 'pending';
+      msg.e2e = {
+        deliveries: [{
+          transport: 'session',
+          transportMessageId: 'transport-1',
+          senderDeviceId: 'sender-1',
+          receiverDeviceId: 'receiver-1',
+          sessionId: 'session-1',
+          state: 'received',
+          recordedAt: 101,
+        }],
+      };
+
+      await storage.putMessage(msg);
+
+      const page = await storage.queryMessages('inbound', { status: 'pending' });
+      expect(page.messages.map((message) => message.envelope.id)).toContain('msg-status-2');
+    });
+  });
+
   describe('Thread Storage', () => {
     it('should store messages with thread ID', async () => {
       const threadId = generateThreadId();

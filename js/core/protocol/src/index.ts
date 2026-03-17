@@ -25,6 +25,7 @@ export * from './messaging/envelope.js';
 export * from './messaging/codec.js';
 export * from './messaging/router.js';
 export * from './messaging/types.js';
+export * from './messaging/status.js';
 export * from './messaging/storage.js';
 export * from './messaging/queue.js';
 export * from './messaging/timestamp.js';

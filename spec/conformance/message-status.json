@@ -1,0 +1,149 @@
+{
+  "version": 1,
+  "subject": "message-status",
+  "cases": [
+    {
+      "id": "MSG-001",
+      "description": "Unread inbound messages stay pending.",
+      "input": {
+        "message": {
+          "id": "msg-inbound-unread",
+          "direction": "inbound",
+          "from": "did:agent:peer",
+          "to": "did:agent:me",
+          "type": "message",
+          "protocol": "/agent/msg/1.0.0",
+          "payload": {
+            "text": "hello"
+          },
+          "read": false
+        }
+      },
+      "expected": {
+        "status": "pending"
+      }
+    },
+    {
+      "id": "MSG-002",
+      "description": "Read inbound messages are delivered.",
+      "input": {
+        "message": {
+          "id": "msg-inbound-read",
+          "direction": "inbound",
+          "from": "did:agent:peer",
+          "to": "did:agent:me",
+          "type": "message",
+          "protocol": "/agent/msg/1.0.0",
+          "payload": {
+            "text": "done"
+          },
+          "read": true,
+          "deliveries": [
+            {
+              "state": "received"
+            }
+          ]
+        }
+      },
+      "expected": {
+        "status": "delivered"
+      }
+    },
+    {
+      "id": "MSG-003",
+      "description": "Inbound unread plus E2E received still stays pending.",
+      "input": {
+        "message": {
+          "id": "msg-inbound-received",
+          "direction": "inbound",
+          "from": "did:agent:peer",
+          "to": "did:agent:me",
+          "type": "message",
+          "protocol": "/agent/msg/1.0.0",
+          "payload": {
+            "text": "arrived"
+          },
+          "read": false,
+          "deliveries": [
+            {
+              "state": "received"
+            }
+          ]
+        }
+      },
+      "expected": {
+        "status": "pending"
+      }
+    },
+    {
+      "id": "MSG-004",
+      "description": "Outbound messages without successful delivery stay pending.",
+      "input": {
+        "message": {
+          "id": "msg-outbound-pending",
+          "direction": "outbound",
+          "from": "did:agent:me",
+          "to": "did:agent:peer",
+          "type": "message",
+          "protocol": "/agent/msg/1.0.0",
+          "payload": {
+            "text": "work"
+          }
+        }
+      },
+      "expected": {
+        "status": "pending"
+      }
+    },
+    {
+      "id": "MSG-005",
+      "description": "Outbound messages with received delivery are delivered.",
+      "input": {
+        "message": {
+          "id": "msg-outbound-delivered",
+          "direction": "outbound",
+          "from": "did:agent:me",
+          "to": "did:agent:peer",
+          "type": "message",
+          "protocol": "/agent/msg/1.0.0",
+          "payload": {
+            "text": "done"
+          },
+          "deliveries": [
+            {
+              "state": "received"
+            }
+          ]
+        }
+      },
+      "expected": {
+        "status": "delivered"
+      }
+    },
+    {
+      "id": "MSG-006",
+      "description": "Any failed delivery marks the message failed.",
+      "input": {
+        "message": {
+          "id": "msg-failed",
+          "direction": "outbound",
+          "from": "did:agent:me",
+          "to": "did:agent:peer",
+          "type": "message",
+          "protocol": "/agent/msg/1.0.0",
+          "payload": {
+            "text": "boom"
+          },
+          "deliveries": [
+            {
+              "state": "failed"
+            }
+          ]
+        }
+      },
+      "expected": {
+        "status": "failed"
+      }
+    }
+  ]
+}

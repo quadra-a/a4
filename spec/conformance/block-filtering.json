@@ -1,0 +1,85 @@
+{
+  "version": 1,
+  "subject": "block-filtering",
+  "cases": [
+    {
+      "id": "BLOCK-001",
+      "description": "Blocked inbound senders are hidden from the default inbox view.",
+      "input": {
+        "blockedDids": [
+          "did:agent:blocked"
+        ],
+        "messages": [
+          {
+            "id": "msg-blocked",
+            "direction": "inbound",
+            "from": "did:agent:blocked",
+            "to": "did:agent:me",
+            "type": "message",
+            "protocol": "/agent/msg/1.0.0",
+            "payload": {
+              "text": "blocked"
+            },
+            "timestamp": 1
+          },
+          {
+            "id": "msg-allowed",
+            "direction": "inbound",
+            "from": "did:agent:friend",
+            "to": "did:agent:me",
+            "type": "message",
+            "protocol": "/agent/msg/1.0.0",
+            "payload": {
+              "text": "visible"
+            },
+            "timestamp": 2
+          },
+          {
+            "id": "msg-outbound",
+            "direction": "outbound",
+            "from": "did:agent:me",
+            "to": "did:agent:blocked",
+            "type": "message",
+            "protocol": "/agent/msg/1.0.0",
+            "payload": {
+              "text": "history stays visible"
+            },
+            "timestamp": 3
+          }
+        ]
+      },
+      "expected": {
+        "visibleIds": [
+          "msg-allowed",
+          "msg-outbound"
+        ]
+      }
+    },
+    {
+      "id": "BLOCK-002",
+      "description": "Without a block, the same inbound message stays visible.",
+      "input": {
+        "blockedDids": [],
+        "messages": [
+          {
+            "id": "msg-blocked",
+            "direction": "inbound",
+            "from": "did:agent:blocked",
+            "to": "did:agent:me",
+            "type": "message",
+            "protocol": "/agent/msg/1.0.0",
+            "payload": {
+              "text": "visible again"
+            },
+            "timestamp": 1
+          }
+        ]
+      },
+      "expected": {
+        "visibleIds": [
+          "msg-blocked"
+        ]
+      }
+    }
+  ]
+}

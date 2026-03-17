@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "subject": "protocol-matching",
+  "cases": [
+    {
+      "id": "PROTO-001",
+      "description": "Prefixed capability protocols match slash capabilities.",
+      "input": {
+        "protocol": "/capability/gpu/compute",
+        "capability": "gpu/compute"
+      },
+      "expected": {
+        "matches": true
+      }
+    },
+    {
+      "id": "PROTO-002",
+      "description": "Bare capability protocols also match.",
+      "input": {
+        "protocol": "gpu/compute",
+        "capability": "gpu/compute"
+      },
+      "expected": {
+        "matches": true
+      }
+    },
+    {
+      "id": "PROTO-003",
+      "description": "Capability normalization trims surrounding slashes.",
+      "input": {
+        "protocol": "gpu/compute",
+        "capability": "/gpu/compute/"
+      },
+      "expected": {
+        "matches": true
+      }
+    },
+    {
+      "id": "PROTO-004",
+      "description": "Extra protocol segments do not match.",
+      "input": {
+        "protocol": "/capability/gpu/compute/v2",
+        "capability": "gpu/compute"
+      },
+      "expected": {
+        "matches": false
+      }
+    },
+    {
+      "id": "PROTO-005",
+      "description": "Different capability tokens do not match.",
+      "input": {
+        "protocol": "/capability/gpu-compute",
+        "capability": "gpu/compute"
+      },
+      "expected": {
+        "matches": false
+      }
+    }
+  ]
+}
