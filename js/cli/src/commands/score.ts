@@ -9,9 +9,11 @@ export function registerScoreCommand(program: Command): void {
     .description('Show the local trust score for an agent')
     .option('--relay <url>', 'Relay WebSocket URL for resolving non-alias targets')
     .option('--format <fmt>', 'Output format: text|json', 'text')
+    .option('--json', 'Output as JSON (alias for --format json)')
     .option('--human', 'Human-friendly output with colors')
     .action(async (target: string, options) => {
       try {
+        if (options.json) options.format = 'json';
         const resolved = await resolveTargetDid(target, options.relay);
         const { score, endorsements } = await getTrustScore(resolved.did);
 

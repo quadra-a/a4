@@ -64,11 +64,13 @@ export function registerSendCommand(program: Command): void {
     .option('--wait [seconds]', 'Wait for a result (default: 30s)')
     .option('--relay <url>', 'Relay WebSocket URL')
     .option('--format <fmt>', 'Output format: text|json', 'text')
+    .option('--json', 'Output as JSON (alias for --format json)')
     .option('--human', 'Human-friendly output with colors')
     .option('--thread <id>', 'Continue conversation in existing thread')
     .option('--new-thread', 'Start a new conversation thread')
     .action(async (options) => {
       try {
+        if (options.json) options.format = 'json';
         const isHuman = Boolean(options.human) && options.format !== 'json';
         const normalized = normalizeSendType(options.type);
         const explicitWaitMs = parseWaitTimeoutMs(options.wait);

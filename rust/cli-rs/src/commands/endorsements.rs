@@ -237,9 +237,48 @@ async fn try_daemon_endorsements(
 
     let endorsements = data["endorsements"]
         .as_array()
-        .ok_or_else(|| anyhow::anyhow!("Invalid endorsements response from daemon"))?;
+        .ok_or_else(|| anyhow::anyhow!("Invalid endorsements response from daemon"))?
+        .iter()
+        .map(normalize_daemon_endorsement)
+        .collect::<Result<Vec<_>>>()?;
 
-    Ok(endorsements.clone())
+    Ok(endorsements)
+}
+
+fn normalize_daemon_endorsement(endorsement: &serde_json::Value) -> Result<serde_json::Value> {
+    if endorsement.get("endorser").and_then(|value| value.as_str()).is_some() {
+        return Ok(endorsement.clone());
+    }
+
+    let endorser = endorsement
+        .get("from")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| anyhow::anyhow!("Invalid daemon endorsement response"))?;
+    let endorsee = endorsement
+        .get("to")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| anyhow::anyhow!("Invalid daemon endorsement response"))?;
+    let strength = endorsement
+        .get("score")
+        .and_then(|value| value.as_f64())
+        .ok_or_else(|| anyhow::anyhow!("Invalid daemon endorsement score"))?;
+    let comment = endorsement
+        .get("reason")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string());
+
+    Ok(serde_json::json!({
+        "endorser": endorser,
+        "endorsee": endorsee,
+        "domain": endorsement.get("domain").cloned().unwrap_or(serde_json::Value::Null),
+        "type": "general",
+        "strength": strength,
+        "comment": comment,
+        "timestamp": endorsement.get("timestamp").cloned().unwrap_or(serde_json::Value::from(0)),
+        "expires": endorsement.get("expires").cloned().unwrap_or(serde_json::Value::Null),
+        "version": endorsement.get("version").cloned().unwrap_or(serde_json::Value::String("2.0".to_string())),
+        "signature": endorsement.get("signature").cloned().unwrap_or(serde_json::Value::String(String::new())),
+    }))
 }
 
 async fn query_from_relay(
@@ -273,4 +312,47 @@ async fn query_from_relay(
 
     session.goodbye().await?;
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_daemon_endorsement;
+    use serde_json::json;
+
+    #[test]
+    fn normalizes_js_daemon_endorsement_shape() {
+        let normalized = normalize_daemon_endorsement(&json!({
+            "from": "did:agent:alice",
+            "to": "did:agent:bob",
+            "score": 0.8,
+            "reason": "Reliable GPU worker",
+            "domain": "gpu-compute",
+            "timestamp": 1234,
+            "signature": "abc"
+        }))
+        .expect("normalizes js daemon endorsement");
+
+        assert_eq!(normalized["endorser"].as_str(), Some("did:agent:alice"));
+        assert_eq!(normalized["endorsee"].as_str(), Some("did:agent:bob"));
+        assert_eq!(normalized["strength"].as_f64(), Some(0.8));
+        assert_eq!(normalized["comment"].as_str(), Some("Reliable GPU worker"));
+        assert_eq!(normalized["type"].as_str(), Some("general"));
+    }
+
+    #[test]
+    fn preserves_rust_daemon_endorsement_shape() {
+        let original = json!({
+            "endorser": "did:agent:alice",
+            "endorsee": "did:agent:bob",
+            "strength": 0.9,
+            "type": "capability",
+            "comment": "Fast",
+            "timestamp": 5678
+        });
+
+        let normalized = normalize_daemon_endorsement(&original)
+            .expect("keeps rust daemon endorsement intact");
+
+        assert_eq!(normalized, original);
+    }
 }

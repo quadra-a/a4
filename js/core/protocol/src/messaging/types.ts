@@ -21,6 +21,7 @@ export type E2EDeliveryState = 'pending' | 'sent' | 'received' | 'failed';
 
 export interface E2EDeliveryMetadata {
   transport: 'prekey' | 'session';
+  transportMessageId?: string;
   senderDeviceId: string;
   receiverDeviceId: string;
   sessionId: string;

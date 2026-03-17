@@ -70,6 +70,10 @@ export class MessageQueue {
     return this.storage.getMessage(id, 'outbound');
   }
 
+  async getOutboundMessageByTransportMessageId(transportMessageId: string): Promise<StoredMessage | null> {
+    return this.storage.getMessageByTransportMessageId(transportMessageId, 'outbound');
+  }
+
   async markAsRead(id: string): Promise<void> {
     await this.storage.updateMessage(id, { readAt: Date.now() });
   }

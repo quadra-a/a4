@@ -190,6 +190,16 @@ describe('agent-runtime read-only sessions', () => {
     expect(result).toEqual({ did: 'did:agent:target', name: 'Target Agent' });
   });
 
+  it('unwraps Rust-style card query responses from the daemon', async () => {
+    sendMock.mockResolvedValue({ card: { did: 'did:agent:target', name: 'Wrapped Agent' } });
+    daemonState.running = true;
+
+    const result = await runtime.queryAgentCard('did:agent:target');
+
+    expect(sendMock).toHaveBeenCalledWith('query_agent_card', { did: 'did:agent:target' });
+    expect(result).toEqual({ did: 'did:agent:target', name: 'Wrapped Agent' });
+  });
+
   it('uses an anonymous relay session for DID lookups when the daemon is offline', async () => {
     queryAgentCardMock.mockResolvedValue({ did: 'did:agent:target', name: 'Target Agent' });
 

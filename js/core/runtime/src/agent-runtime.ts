@@ -53,6 +53,7 @@ export type DiscoveryCapability = string | {
   id?: string;
   name?: string;
   description?: string;
+  metadata?: Record<string, unknown>;
 };
 
 /**
@@ -252,7 +253,11 @@ export async function queryAgentCard(did: string, relay?: string): Promise<Disco
   const client = new DaemonClient();
 
   if (await client.isDaemonRunning()) {
-    return client.send<DiscoveryAgent | null>('query_agent_card', { did });
+    const result = await client.send<DiscoveryAgent | { card?: DiscoveryAgent | null } | null>('query_agent_card', { did });
+    if (result && typeof result === 'object' && 'card' in result) {
+      return result.card ?? null;
+    }
+    return result as DiscoveryAgent | null;
   }
 
   return withAnonymousQueryRelaySession({ relay }, async ({ relayIndex }) => relayIndex.queryAgentCard(did));
@@ -295,7 +300,13 @@ export async function publishAgentCard(input: PublishCardInput = {}) {
 
   const client = new DaemonClient();
   if (await client.isDaemonRunning()) {
-    return client.send<{ did: string; card: typeof nextCard }>('publish_card', nextCard);
+    try {
+      return await client.send<{ did: string; card: typeof nextCard }>('publish_card', nextCard);
+    } catch (error) {
+      if (!(error instanceof Error) || !error.message.includes('Unknown command')) {
+        throw error;
+      }
+    }
   }
 
   await withRelaySession(

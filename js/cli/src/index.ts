@@ -12,7 +12,9 @@ if (!Promise.withResolvers) {
   };
 }
 
-import { basename } from 'node:path';
+import { realpathSync } from 'node:fs';
+import { basename, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { Command } from 'commander';
 import { createRequire } from 'module';
 import { registerFindCommand } from './commands/find.js';
@@ -87,4 +89,28 @@ program.addCommand(createSessionsCommand());
 registerDaemonCommand(program);
 program.addCommand(createTrustCommand(), { hidden: true });
 
-program.parse();
+const invokedPath = process.argv[1];
+const isMain = (() => {
+  if (!invokedPath) return false;
+
+  try {
+    return import.meta.url === pathToFileURL(realpathSync(invokedPath)).href;
+  } catch {
+    return import.meta.url === pathToFileURL(resolve(invokedPath)).href;
+  }
+})();
+
+if (isMain) {
+  program.parse();
+}
+
+export { extractPrimaryProtocol } from './commands/tell.js';
+export {
+  buildServeHandlers,
+  claimServeMessage,
+  extractExecArgsFromArgv,
+  handlerFilenameToCapability,
+  processServeInboxPage,
+  protocolMatchesCapability,
+  releaseServeMessage,
+} from './commands/serve.js';

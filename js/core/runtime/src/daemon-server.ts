@@ -56,13 +56,68 @@ import {
   updateReachabilityPolicy,
 } from './config.js';
 import { policyToReachabilityStatus, type ReachabilityPolicy } from './reachability.js';
-import { getTrustScore, endorseAgent, queryNetworkEndorsements } from './trust.js';
 import { resolvePublishedDevices, resolvePublishedPreKeyBundles } from './e2e-config.js';
 import { prepareEncryptedSends } from './e2e-send.js';
 import { prepareEncryptedReceive } from './e2e-receive.js';
 import { withLocalE2EStateTransaction } from './e2e-state.js';
 
 const logger = createLogger('daemon');
+const PEER_RECOVERY_DEBOUNCE_MS = 500;
+const MAX_SESSION_REPLAY_ATTEMPTS = 3;
+
+interface PendingReplayRequest {
+  lookupMessageId: string;
+  reason: string;
+  requestedAt: number;
+}
+
+interface PendingDecryptFailure {
+  transportMessageId: string;
+  reason: string;
+  requestedAt: number;
+  threadId?: string;
+}
+
+interface PendingPeerBatch<T> {
+  items: Map<string, T>;
+  timer: NodeJS.Timeout | null;
+  running: boolean;
+}
+
+interface PeerRecoveryState {
+  epoch: number;
+  startedAt: number;
+  reason: string;
+  awaitingAck: boolean;
+}
+
+type RemoteRecoveryAction = 'ack' | 'resend-reset';
+
+interface RemoteRecoveryDecision {
+  action: RemoteRecoveryAction;
+  state: PeerRecoveryState;
+  clearAfterSend: boolean;
+  cancelled: { replayRequests: number; retryNotifications: number };
+  clearedCount: number;
+}
+
+class AsyncMutex {
+  private tail: Promise<void> = Promise.resolve();
+
+  async runExclusive<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.tail;
+    let release!: () => void;
+    this.tail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous.catch(() => undefined);
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
+  }
+}
 
 function getInviteToken(): string | undefined {
   return process.env.QUADRA_A_INVITE_TOKEN
@@ -83,6 +138,12 @@ export class ClawDaemon {
   private defense: DefenseMiddleware | null = null;
   private trustSystem: TrustSystem | null = null;
   private socketSubscriptions = new Map<Socket, Set<string>>();
+  private peerSendLocks = new Map<string, AsyncMutex>();
+  private peerSessionLocks = new Map<string, AsyncMutex>();
+  private pendingReplayBatches = new Map<string, PendingPeerBatch<PendingReplayRequest>>();
+  private pendingRetryNotifications = new Map<string, PendingPeerBatch<PendingDecryptFailure>>();
+  private peerRecoveryStates = new Map<string, PeerRecoveryState>();
+  private peerRecoveryEpochFloors = new Map<string, number>();
 
   constructor(socketPath: string = DAEMON_SOCKET_PATH) {
     this.socketPath = socketPath;
@@ -100,6 +161,320 @@ export class ClawDaemon {
       publicKey: this.identity.publicKey,
       privateKey: this.identity.privateKey,
     });
+  }
+
+  private getPeerSendLock(peerDid: string): AsyncMutex {
+    let mutex = this.peerSendLocks.get(peerDid);
+    if (!mutex) {
+      mutex = new AsyncMutex();
+      this.peerSendLocks.set(peerDid, mutex);
+    }
+    return mutex;
+  }
+
+  private withPeerSendLock<T>(peerDid: string, operation: () => Promise<T>): Promise<T> {
+    return this.getPeerSendLock(peerDid).runExclusive(operation);
+  }
+
+  private getPeerSessionLock(peerDid: string): AsyncMutex {
+    let mutex = this.peerSessionLocks.get(peerDid);
+    if (!mutex) {
+      mutex = new AsyncMutex();
+      this.peerSessionLocks.set(peerDid, mutex);
+    }
+    return mutex;
+  }
+
+  private withPeerSessionLock<T>(peerDid: string, operation: () => Promise<T>): Promise<T> {
+    return this.getPeerSessionLock(peerDid).runExclusive(operation);
+  }
+
+  private getOrCreatePeerBatch<T>(
+    batches: Map<string, PendingPeerBatch<T>>,
+    peerDid: string,
+  ): PendingPeerBatch<T> {
+    let batch = batches.get(peerDid);
+    if (!batch) {
+      batch = {
+        items: new Map<string, T>(),
+        timer: null,
+        running: false,
+      };
+      batches.set(peerDid, batch);
+    }
+    return batch;
+  }
+
+  private clearPendingPeerBatch<T>(
+    batches: Map<string, PendingPeerBatch<T>>,
+    peerDid: string,
+  ): number {
+    const batch = batches.get(peerDid);
+    if (!batch) {
+      return 0;
+    }
+
+    if (batch.timer) {
+      clearTimeout(batch.timer);
+    }
+    const pendingCount = batch.items.size;
+    batch.items.clear();
+    batches.delete(peerDid);
+    return pendingCount;
+  }
+
+  private clearPendingPeerRecovery(peerDid: string): { replayRequests: number; retryNotifications: number } {
+    return {
+      replayRequests: this.clearPendingPeerBatch(this.pendingReplayBatches, peerDid),
+      retryNotifications: this.clearPendingPeerBatch(this.pendingRetryNotifications, peerDid),
+    };
+  }
+
+  private clearAllPendingRecovery(): { replayPeers: number; retryPeers: number } {
+    const replayPeers = this.pendingReplayBatches.size;
+    const retryPeers = this.pendingRetryNotifications.size;
+    for (const batch of this.pendingReplayBatches.values()) {
+      if (batch.timer) {
+        clearTimeout(batch.timer);
+      }
+      batch.items.clear();
+    }
+    for (const batch of this.pendingRetryNotifications.values()) {
+      if (batch.timer) {
+        clearTimeout(batch.timer);
+      }
+      batch.items.clear();
+    }
+    this.pendingReplayBatches.clear();
+    this.pendingRetryNotifications.clear();
+    return { replayPeers, retryPeers };
+  }
+
+  private notePeerRecoveryEpoch(peerDid: string, epoch: number): void {
+    const currentFloor = this.peerRecoveryEpochFloors.get(peerDid) ?? 0;
+    if (epoch > currentFloor) {
+      this.peerRecoveryEpochFloors.set(peerDid, epoch);
+    }
+  }
+
+  private nextPeerRecoveryEpoch(peerDid: string): number {
+    const floor = this.peerRecoveryEpochFloors.get(peerDid) ?? 0;
+    const epoch = Math.max(Date.now(), floor + 1);
+    this.peerRecoveryEpochFloors.set(peerDid, epoch);
+    return epoch;
+  }
+
+  private getPeerRecoveryState(peerDid: string): PeerRecoveryState | undefined {
+    return this.peerRecoveryStates.get(peerDid);
+  }
+
+  private clearPeerRecoveryState(peerDid: string, epoch?: number): boolean {
+    const current = this.peerRecoveryStates.get(peerDid);
+    if (!current) {
+      return false;
+    }
+    if (epoch != null && current.epoch !== epoch) {
+      return false;
+    }
+    this.peerRecoveryStates.delete(peerDid);
+    this.notePeerRecoveryEpoch(peerDid, current.epoch);
+    return true;
+  }
+
+  private clearAllPeerRecoveryStates(): number {
+    const count = this.peerRecoveryStates.size;
+    for (const [peerDid, recovery] of this.peerRecoveryStates.entries()) {
+      this.notePeerRecoveryEpoch(peerDid, recovery.epoch);
+    }
+    this.peerRecoveryStates.clear();
+    return count;
+  }
+
+  private async clearPersistedPeerSessions(peerDid: string): Promise<number> {
+    return withLocalE2EStateTransaction(this.identity, async ({ e2eConfig, setE2EConfig }) => {
+      const cleared = this.clearPeerSessions(e2eConfig, peerDid);
+      if (cleared.clearedCount > 0) {
+        setE2EConfig(cleared.e2eConfig);
+      }
+      return cleared.clearedCount;
+    });
+  }
+
+  private async beginLocalPeerRecovery(
+    peerDid: string,
+    reason: string,
+    requestedAt = Date.now(),
+  ): Promise<{
+    state: PeerRecoveryState;
+    started: boolean;
+    cancelled: { replayRequests: number; retryNotifications: number };
+    clearedCount: number;
+  }> {
+    const existing = this.getPeerRecoveryState(peerDid);
+    if (existing) {
+      return {
+        state: existing,
+        started: false,
+        cancelled: { replayRequests: 0, retryNotifications: 0 },
+        clearedCount: 0,
+      };
+    }
+
+    const state: PeerRecoveryState = {
+      epoch: this.nextPeerRecoveryEpoch(peerDid),
+      startedAt: requestedAt,
+      reason,
+      awaitingAck: true,
+    };
+    this.peerRecoveryStates.set(peerDid, state);
+
+    const cancelled = this.clearPendingPeerRecovery(peerDid);
+    let clearedCount = 0;
+    try {
+      clearedCount = await this.clearPersistedPeerSessions(peerDid);
+    } catch (error) {
+      logger.warn('Failed to clear local E2E sessions while starting peer recovery', {
+        peerDid,
+        epoch: state.epoch,
+        error: (error as Error).message,
+      });
+    }
+
+    return {
+      state,
+      started: true,
+      cancelled,
+      clearedCount,
+    };
+  }
+
+  private async handleRemotePeerRecovery(
+    peerDid: string,
+    epoch: number,
+    reason: string,
+    requestedAt = Date.now(),
+  ): Promise<RemoteRecoveryDecision> {
+    this.notePeerRecoveryEpoch(peerDid, epoch);
+    const current = this.getPeerRecoveryState(peerDid);
+
+    if (current && current.epoch > epoch) {
+      return {
+        action: current.awaitingAck ? 'resend-reset' : 'ack',
+        state: current,
+        clearAfterSend: !current.awaitingAck,
+        cancelled: { replayRequests: 0, retryNotifications: 0 },
+        clearedCount: 0,
+      };
+    }
+
+    if (current && current.epoch === epoch) {
+      return {
+        action: 'ack',
+        state: current,
+        clearAfterSend: true,
+        cancelled: { replayRequests: 0, retryNotifications: 0 },
+        clearedCount: 0,
+      };
+    }
+
+    const state: PeerRecoveryState = {
+      epoch,
+      startedAt: requestedAt,
+      reason,
+      awaitingAck: false,
+    };
+    this.peerRecoveryStates.set(peerDid, state);
+
+    const cancelled = this.clearPendingPeerRecovery(peerDid);
+    let clearedCount = 0;
+    try {
+      clearedCount = await this.clearPersistedPeerSessions(peerDid);
+    } catch (error) {
+      logger.warn('Failed to clear local E2E sessions while applying peer reset', {
+        peerDid,
+        epoch,
+        error: (error as Error).message,
+      });
+    }
+
+    return {
+      action: 'ack',
+      state,
+      clearAfterSend: true,
+      cancelled,
+      clearedCount,
+    };
+  }
+
+  private formatPeerRecoveryError(peerDid: string, recovery: PeerRecoveryState): string {
+    return `Peer ${peerDid} is recovering E2E session (epoch ${recovery.epoch}, reason ${recovery.reason}); retry after session-reset-ack`;
+  }
+
+  private async commitAcceptedE2EConfig(nextE2EConfig: LocalE2EConfig): Promise<void> {
+    await withLocalE2EStateTransaction(this.identity, async ({ setE2EConfig }) => {
+      setE2EConfig(nextE2EConfig);
+    });
+  }
+
+  private async prepareEncryptedSendsWithoutCommit(input: {
+    to: string;
+    protocol: string;
+    payload: Record<string, unknown>;
+    type?: MessageEnvelope['type'];
+    replyTo?: string;
+    threadId?: string;
+    applicationEnvelope?: MessageEnvelope;
+    baseE2EConfig?: LocalE2EConfig;
+  }) {
+    const keyPair = this.getKeyPair();
+
+    if (input.baseE2EConfig) {
+      return prepareEncryptedSends({
+        identity: this.identity,
+        keyPair,
+        relayClient: this.relayClient!,
+        e2eConfig: input.baseE2EConfig,
+        to: input.to,
+        protocol: input.protocol,
+        payload: input.payload,
+        type: input.type,
+        replyTo: input.replyTo,
+        threadId: input.threadId,
+        applicationEnvelope: input.applicationEnvelope,
+      });
+    }
+
+    return withLocalE2EStateTransaction(this.identity, async ({ e2eConfig }) => {
+      return prepareEncryptedSends({
+        identity: this.identity,
+        keyPair,
+        relayClient: this.relayClient!,
+        e2eConfig,
+        to: input.to,
+        protocol: input.protocol,
+        payload: input.payload,
+        type: input.type,
+        replyTo: input.replyTo,
+        threadId: input.threadId,
+        applicationEnvelope: input.applicationEnvelope,
+      });
+    });
+  }
+
+  private async sendEnvelopeAwaitAccepted(
+    to: string,
+    envelopeBytes: Uint8Array,
+  ): Promise<void> {
+    if (!this.relayClient) {
+      throw new Error('Relay client not initialized');
+    }
+
+    if (typeof this.relayClient.sendEnvelopeAwaitAccepted === 'function') {
+      await this.relayClient.sendEnvelopeAwaitAccepted(to, envelopeBytes);
+      return;
+    }
+
+    await this.relayClient.sendEnvelope(to, envelopeBytes);
   }
 
   private async buildSignedAgentCard(cardConfig = getAgentCard()) {
@@ -201,25 +576,62 @@ export class ClawDaemon {
     };
   }
 
-  private async sendSessionReset(to: string, reason: string, timestamp = Date.now()): Promise<void> {
+  private async sendSessionReset(
+    to: string,
+    reason: string,
+    epoch: number,
+    timestamp = Date.now(),
+  ): Promise<void> {
     if (!this.router) {
       throw new Error('Router not initialized');
     }
 
-    const resetEnvelope = createEnvelope(
-      this.identity.did,
-      to,
-      'message',
-      'e2e/session-reset',
-      {
-        from: this.identity.did,
+    await this.withPeerSendLock(to, async () => {
+      const resetEnvelope = createEnvelope(
+        this.identity.did,
         to,
-        reason,
-        timestamp,
-      },
-    );
-    const signedEnvelope = await signEnvelope(resetEnvelope, (data) => sign(data, this.getKeyPair().privateKey));
-    await this.router.sendMessage(signedEnvelope);
+        'message',
+        'e2e/session-reset',
+        {
+          from: this.identity.did,
+          to,
+          reason,
+          epoch,
+          timestamp,
+        },
+      );
+      const signedEnvelope = await signEnvelope(resetEnvelope, (data) => sign(data, this.getKeyPair().privateKey));
+      await this.router!.sendMessage(signedEnvelope);
+    });
+  }
+
+  private async sendSessionResetAck(
+    to: string,
+    epoch: number,
+    reason: string,
+    timestamp = Date.now(),
+  ): Promise<void> {
+    if (!this.router) {
+      throw new Error('Router not initialized');
+    }
+
+    await this.withPeerSendLock(to, async () => {
+      const ackEnvelope = createEnvelope(
+        this.identity.did,
+        to,
+        'message',
+        'e2e/session-reset-ack',
+        {
+          from: this.identity.did,
+          to,
+          reason,
+          epoch,
+          timestamp,
+        },
+      );
+      const signedEnvelope = await signEnvelope(ackEnvelope, (data) => sign(data, this.getKeyPair().privateKey));
+      await this.router!.sendMessage(signedEnvelope);
+    });
   }
 
   private async sendSessionRetry(
@@ -262,96 +674,278 @@ export class ClawDaemon {
     );
   }
 
-  private async replayOutboundMessage(
+  private async lookupOutboundMessageForRecovery(
     peerDid: string,
-    messageId: string,
-    reason: string,
-    requestedAt: number,
-  ): Promise<boolean> {
+    lookupMessageId: string,
+  ): Promise<StoredMessage | null> {
     if (!this.queue || !this.relayClient) {
-      return false;
+      return null;
     }
 
-    const original = await this.queue.getOutboundMessage(messageId);
-    if (!original || original.envelope.to !== peerDid) {
-      logger.info('Ignoring session retry for unknown outbound message', { peerDid, messageId });
-      return false;
+    const directMatch = await this.queue.getOutboundMessage(lookupMessageId);
+    if (directMatch?.envelope.to === peerDid) {
+      return directMatch;
     }
 
-    const replayCount = original.e2e?.retry?.replayCount ?? 0;
-    await this.queue.appendE2ERetry(messageId, {
-      replayCount,
-      lastRequestedAt: requestedAt,
-      lastReason: reason,
-    });
-    if (replayCount > 0) {
-      logger.info('Ignoring repeated session retry for already replayed message', {
-        peerDid,
-        messageId,
-        replayCount,
-      });
-      return false;
-    }
-
-    const keyPair = this.getKeyPair();
-    const applicationEnvelope = original.envelope;
-    const prepared = await withLocalE2EStateTransaction(this.identity, async ({ e2eConfig, setE2EConfig }) => {
-      const cleared = this.clearPeerSessions(e2eConfig, peerDid);
-      const nextE2EConfig = cleared.clearedCount > 0 ? cleared.e2eConfig : e2eConfig;
-      const encrypted = await prepareEncryptedSends({
-        identity: this.identity,
-        keyPair,
-        relayClient: this.relayClient!,
-        e2eConfig: nextE2EConfig,
-        to: applicationEnvelope.to,
-        protocol: applicationEnvelope.protocol,
-        payload: (applicationEnvelope.payload ?? {}) as Record<string, unknown>,
-        type: applicationEnvelope.type,
-        replyTo: applicationEnvelope.replyTo,
-        threadId: applicationEnvelope.threadId,
-        applicationEnvelope,
-      });
-      setE2EConfig(encrypted.e2eConfig);
-      return encrypted;
-    });
-
-    const recordedAt = Date.now();
-    await this.queue.appendE2ERetry(messageId, {
-      replayCount: replayCount + 1,
-      lastRequestedAt: requestedAt,
-      lastReplayedAt: recordedAt,
-      lastReason: reason,
-    });
-
-    for (const target of prepared.targets) {
-      const delivery: E2EDeliveryMetadata = {
-        transport: target.transport,
-        senderDeviceId: target.senderDeviceId,
-        receiverDeviceId: target.recipientDeviceId,
-        sessionId: target.sessionId,
-        state: 'sent',
-        recordedAt,
-      };
-      await this.queue.appendE2EDelivery(messageId, delivery);
-      try {
-        await this.relayClient.sendEnvelope(peerDid, target.outerEnvelopeBytes);
-      } catch (error) {
-        await this.queue.appendE2EDelivery(messageId, {
-          ...delivery,
-          state: 'failed',
-          recordedAt: Date.now(),
-          error: (error as Error).message,
-        });
-        throw error;
+    if (typeof this.queue.getOutboundMessageByTransportMessageId === 'function') {
+      const transportMatch = await this.queue.getOutboundMessageByTransportMessageId(lookupMessageId);
+      if (transportMatch?.envelope.to === peerDid) {
+        return transportMatch;
       }
     }
 
-    logger.info('Replayed outbound message after signed session retry', {
-      peerDid,
-      messageId,
-      targetCount: prepared.targets.length,
+    return null;
+  }
+
+  private schedulePeerReplay(peerDid: string, request: PendingReplayRequest): void {
+    const batch = this.getOrCreatePeerBatch(this.pendingReplayBatches, peerDid);
+    batch.items.set(request.lookupMessageId, request);
+    if (batch.timer) {
+      clearTimeout(batch.timer);
+    }
+    batch.timer = setTimeout(() => {
+      void this.flushPeerReplay(peerDid);
+    }, PEER_RECOVERY_DEBOUNCE_MS);
+  }
+
+  // @ts-ignore TS6133 — reserved for future use in peer recovery flow
+  private schedulePeerRetryNotification(peerDid: string, failure: PendingDecryptFailure): void {
+    const batch = this.getOrCreatePeerBatch(this.pendingRetryNotifications, peerDid);
+    batch.items.set(failure.transportMessageId, failure);
+    if (batch.timer) {
+      clearTimeout(batch.timer);
+    }
+    batch.timer = setTimeout(() => {
+      void this.flushPeerRetryNotification(peerDid);
+    }, PEER_RECOVERY_DEBOUNCE_MS);
+  }
+
+  private async flushPeerReplay(peerDid: string): Promise<void> {
+    const batch = this.pendingReplayBatches.get(peerDid);
+    if (!batch || batch.running) {
+      return;
+    }
+
+    if (batch.timer) {
+      clearTimeout(batch.timer);
+      batch.timer = null;
+    }
+
+    const requests = [...batch.items.values()]
+      .sort((left, right) => left.requestedAt - right.requestedAt);
+    batch.items.clear();
+    batch.running = true;
+
+    try {
+      await this.replayOutboundMessages(peerDid, requests);
+    } catch (error) {
+      logger.warn('Failed to replay outbound batch after session retry', {
+        peerDid,
+        requestCount: requests.length,
+        error: (error as Error).message,
+      });
+    } finally {
+      batch.running = false;
+      if (batch.items.size > 0) {
+        batch.timer = setTimeout(() => {
+          void this.flushPeerReplay(peerDid);
+        }, PEER_RECOVERY_DEBOUNCE_MS);
+      } else if (!batch.timer) {
+        this.pendingReplayBatches.delete(peerDid);
+      }
+    }
+  }
+
+  private async flushPeerRetryNotification(peerDid: string): Promise<void> {
+    const batch = this.pendingRetryNotifications.get(peerDid);
+    if (!batch || batch.running) {
+      return;
+    }
+
+    if (batch.timer) {
+      clearTimeout(batch.timer);
+      batch.timer = null;
+    }
+
+    const failures = [...batch.items.values()]
+      .sort((left, right) => left.requestedAt - right.requestedAt);
+    batch.items.clear();
+    batch.running = true;
+
+    try {
+      await this.sendPeerRetryNotifications(peerDid, failures);
+    } catch (error) {
+      logger.warn('Failed to send batched session retry notifications', {
+        peerDid,
+        failureCount: failures.length,
+        error: (error as Error).message,
+      });
+    } finally {
+      batch.running = false;
+      if (batch.items.size > 0) {
+        batch.timer = setTimeout(() => {
+          void this.flushPeerRetryNotification(peerDid);
+        }, PEER_RECOVERY_DEBOUNCE_MS);
+      } else if (!batch.timer) {
+        this.pendingRetryNotifications.delete(peerDid);
+      }
+    }
+  }
+
+  private async replayOutboundMessages(
+    peerDid: string,
+    requests: PendingReplayRequest[],
+  ): Promise<void> {
+    if (!this.queue || !this.relayClient || requests.length === 0) {
+      return;
+    }
+
+    const queue = this.queue; // Capture for type narrowing in nested callbacks
+
+    await this.withPeerSessionLock(peerDid, async () => {
+      await this.withPeerSendLock(peerDid, async () => {
+        let recoveryBaseE2EConfig = await withLocalE2EStateTransaction(this.identity, async ({ e2eConfig, setE2EConfig }) => {
+          const cleared = this.clearPeerSessions(e2eConfig, peerDid);
+          if (cleared.clearedCount > 0) {
+            setE2EConfig(cleared.e2eConfig);
+          }
+          return cleared.e2eConfig;
+        });
+
+        for (const request of requests) {
+          const original = await this.lookupOutboundMessageForRecovery(peerDid, request.lookupMessageId);
+          if (!original) {
+            logger.info('Ignoring session retry for unknown outbound message', {
+              peerDid,
+              messageId: request.lookupMessageId,
+            });
+            continue;
+          }
+
+          const storedMessageId = original.envelope.id;
+          const replayCount = original.e2e?.retry?.replayCount ?? 0;
+          await queue.appendE2ERetry(storedMessageId, {
+            replayCount,
+            lastRequestedAt: request.requestedAt,
+            lastReason: request.reason,
+          });
+          if (replayCount >= MAX_SESSION_REPLAY_ATTEMPTS) {
+            logger.info('Ignoring repeated session retry for replay budget exhaustion', {
+              peerDid,
+              messageId: storedMessageId,
+              replayCount,
+            });
+            continue;
+          }
+
+          const applicationEnvelope = original.envelope;
+          const prepared = await this.prepareEncryptedSendsWithoutCommit({
+            to: applicationEnvelope.to,
+            protocol: applicationEnvelope.protocol,
+            payload: (applicationEnvelope.payload ?? {}) as Record<string, unknown>,
+            type: applicationEnvelope.type,
+            replyTo: applicationEnvelope.replyTo,
+            threadId: applicationEnvelope.threadId,
+            applicationEnvelope,
+            baseE2EConfig: recoveryBaseE2EConfig,
+          });
+
+          let lastReplayedAt: number | undefined;
+          let sentAny = false;
+
+          for (const target of prepared.targets) {
+            const recordedAt = Date.now();
+            const delivery: E2EDeliveryMetadata = {
+              transport: target.transport,
+              transportMessageId: target.outerEnvelope.id,
+              senderDeviceId: target.senderDeviceId,
+              receiverDeviceId: target.recipientDeviceId,
+              sessionId: target.sessionId,
+              state: 'pending',
+              recordedAt,
+            };
+            await queue.appendE2EDelivery(storedMessageId, delivery);
+            try {
+              await this.sendEnvelopeAwaitAccepted(peerDid, target.outerEnvelopeBytes);
+              if (target.configAfterSend) {
+                await this.commitAcceptedE2EConfig(target.configAfterSend);
+                recoveryBaseE2EConfig = target.configAfterSend;
+              }
+              await queue.appendE2EDelivery(storedMessageId, {
+                ...delivery,
+                state: 'sent',
+                recordedAt: Date.now(),
+                error: undefined,
+              });
+              lastReplayedAt = recordedAt;
+              sentAny = true;
+            } catch (error) {
+              await queue.appendE2EDelivery(storedMessageId, {
+                ...delivery,
+                state: 'failed',
+                recordedAt: Date.now(),
+                error: (error as Error).message,
+              });
+              throw error;
+            }
+          }
+
+          if (sentAny) {
+            await queue.appendE2ERetry(storedMessageId, {
+              replayCount: replayCount + 1,
+              lastRequestedAt: request.requestedAt,
+              lastReplayedAt,
+              lastReason: request.reason,
+            });
+            recoveryBaseE2EConfig = prepared.e2eConfig;
+          }
+
+          logger.info('Replayed outbound message after signed session retry', {
+            peerDid,
+            messageId: storedMessageId,
+            targetCount: prepared.targets.length,
+          });
+        }
+      });
     });
-    return true;
+  }
+
+  private async sendPeerRetryNotifications(
+    peerDid: string,
+    failures: PendingDecryptFailure[],
+  ): Promise<void> {
+    if (!this.router || failures.length === 0) {
+      return;
+    }
+
+    await this.withPeerSessionLock(peerDid, async () => {
+      await this.withPeerSendLock(peerDid, async () => {
+        const clearedCount = await withLocalE2EStateTransaction(this.identity, async ({ e2eConfig, setE2EConfig }) => {
+          const cleared = this.clearPeerSessions(e2eConfig, peerDid);
+          if (cleared.clearedCount > 0) {
+            setE2EConfig(cleared.e2eConfig);
+          }
+          return cleared.clearedCount;
+        });
+
+        for (const failure of failures) {
+          await this.sendSessionRetry(
+            peerDid,
+            failure.transportMessageId,
+            failure.reason,
+            'session',
+            failure.requestedAt,
+            failure.threadId,
+          );
+        }
+
+        logger.warn('Batched E2E session retry notifications after decrypt failure', {
+          peerDid,
+          clearedCount,
+          failureCount: failures.length,
+        });
+      });
+    });
   }
 
   private async stopRelayStack(): Promise<void> {
@@ -561,23 +1155,105 @@ export class ClawDaemon {
   }
 
   private async handleIncomingMessage(envelope: MessageEnvelope): Promise<MessageEnvelope | void> {
+    if (
+      envelope.protocol === 'e2e/session-reset'
+      || envelope.protocol === 'e2e/session-reset-ack'
+      || envelope.protocol === 'e2e/session-retry'
+      || envelope.protocol === '/agent/e2e/1.0.0'
+    ) {
+      return await this.withPeerSessionLock(envelope.from, async () => {
+        return await this.handleIncomingMessageWithPeerLock(envelope);
+      });
+    }
+
+    return await this.handleIncomingMessageWithPeerLock(envelope);
+  }
+
+  private async handleIncomingMessageWithPeerLock(envelope: MessageEnvelope): Promise<MessageEnvelope | void> {
     if (!this.defense || !this.queue || !this.trustSystem) return;
 
     if (envelope.protocol === 'e2e/session-reset') {
-      const clearedCount = await withLocalE2EStateTransaction(this.identity, async ({ e2eConfig, setE2EConfig }) => {
-        const cleared = this.clearPeerSessions(e2eConfig, envelope.from);
-        if (cleared.clearedCount > 0) {
-          setE2EConfig(cleared.e2eConfig);
+      const payload = typeof envelope.payload === 'object' && envelope.payload !== null
+        ? envelope.payload as Record<string, unknown>
+        : null;
+      const reason = typeof payload?.reason === 'string' ? payload.reason : 'decrypt-failed';
+      const timestamp = typeof payload?.timestamp === 'number' ? payload.timestamp : Date.now();
+      const epoch = typeof payload?.epoch === 'number'
+        ? payload.epoch
+        : timestamp;
+      const decision = await this.handleRemotePeerRecovery(envelope.from, epoch, reason, timestamp);
+
+      try {
+        if (decision.action === 'resend-reset') {
+          await this.sendSessionReset(
+            envelope.from,
+            decision.state.reason,
+            decision.state.epoch,
+            Date.now(),
+          );
+        } else {
+          await this.sendSessionResetAck(
+            envelope.from,
+            decision.state.epoch,
+            decision.state.reason,
+            Date.now(),
+          );
         }
-        return cleared.clearedCount;
-      });
-      if (clearedCount > 0) {
-        logger.info('E2E session reset by peer', { from: envelope.from, clearedCount });
+        if (decision.clearAfterSend) {
+          this.clearPeerRecoveryState(envelope.from, decision.state.epoch);
+        }
+      } catch (error) {
+        logger.warn('Failed to respond to peer E2E session reset', {
+          from: envelope.from,
+          epoch: decision.state.epoch,
+          error: (error as Error).message,
+        });
+      }
+
+      if (decision.clearedCount > 0 || decision.cancelled.replayRequests > 0 || decision.cancelled.retryNotifications > 0) {
+        logger.info('E2E session reset by peer', {
+          from: envelope.from,
+          epoch: decision.state.epoch,
+          clearedCount: decision.clearedCount,
+          cancelledReplayRequests: decision.cancelled.replayRequests,
+          cancelledRetryNotifications: decision.cancelled.retryNotifications,
+          action: decision.action,
+        });
+      }
+      return;
+    }
+
+    if (envelope.protocol === 'e2e/session-reset-ack') {
+      const payload = typeof envelope.payload === 'object' && envelope.payload !== null
+        ? envelope.payload as Record<string, unknown>
+        : null;
+      const timestamp = typeof payload?.timestamp === 'number' ? payload.timestamp : Date.now();
+      const epoch = typeof payload?.epoch === 'number'
+        ? payload.epoch
+        : timestamp;
+      const cleared = this.clearPeerRecoveryState(envelope.from, epoch);
+      if (cleared) {
+        logger.info('Peer acknowledged E2E session reset', {
+          from: envelope.from,
+          epoch,
+        });
+      } else {
+        logger.info('Ignoring stale E2E session reset acknowledgement', {
+          from: envelope.from,
+          epoch,
+        });
       }
       return;
     }
 
     if (envelope.protocol === 'e2e/session-retry') {
+      if (this.getPeerRecoveryState(envelope.from)) {
+        logger.info('Ignoring session retry while peer recovery barrier is active', {
+          from: envelope.from,
+        });
+        return;
+      }
+
       const payload = typeof envelope.payload === 'object' && envelope.payload !== null
         ? envelope.payload as Record<string, unknown>
         : null;
@@ -593,15 +1269,11 @@ export class ClawDaemon {
         return;
       }
 
-      try {
-        await this.replayOutboundMessage(envelope.from, messageId, reason, timestamp);
-      } catch (error) {
-        logger.warn('Failed to replay outbound message after session retry', {
-          from: envelope.from,
-          messageId,
-          error: (error as Error).message,
-        });
-      }
+      this.schedulePeerReplay(envelope.from, {
+        lookupMessageId: messageId,
+        reason,
+        requestedAt: timestamp,
+      });
       return;
     }
 
@@ -609,6 +1281,17 @@ export class ClawDaemon {
     let decryptedEnvelope = envelope;
     let inboundE2EDelivery: E2EDeliveryMetadata | undefined;
     if (envelope.protocol === '/agent/e2e/1.0.0') {
+      const recovery = this.getPeerRecoveryState(envelope.from);
+      if (recovery) {
+        logger.warn('Dropping inbound E2E transport while peer recovery barrier is active', {
+          id: envelope.id,
+          from: envelope.from,
+          epoch: recovery.epoch,
+          awaitingAck: recovery.awaitingAck,
+        });
+        return;
+      }
+
       try {
         const result = await withLocalE2EStateTransaction(this.identity, async ({ e2eConfig, setE2EConfig }) => {
           const decrypted = await prepareEncryptedReceive({
@@ -635,49 +1318,58 @@ export class ClawDaemon {
           transport: result.transport,
         });
       } catch (error) {
-        await withLocalE2EStateTransaction(this.identity, async ({ e2eConfig, setE2EConfig }) => {
-          const cleared = this.clearPeerSessions(e2eConfig, envelope.from);
-          if (cleared.clearedCount > 0) {
-            setE2EConfig(cleared.e2eConfig);
-          }
-        });
-
-        try {
-          await this.sendSessionRetry(
-            envelope.from,
-            envelope.id,
-            'decrypt-failed',
-            'session',
-            Date.now(),
-          );
-        } catch (retryError) {
-          logger.warn('Failed to send E2E session retry', {
-            to: envelope.from,
-            messageId: envelope.id,
-            error: (retryError as Error).message,
-          });
-        }
+        const requestedAt = Date.now();
+        const recovery = await this.beginLocalPeerRecovery(
+          envelope.from,
+          'decrypt-failed',
+          requestedAt,
+        );
         await this.queue.enqueueInbound(
           this.buildLocalDiagnosticEnvelope(
             envelope.from,
             'e2e/decrypt-failed',
             {
               error: (error as Error).message,
-              hint: 'Session cleared. Sender was asked to replay the message once.',
+              epoch: recovery.state.epoch,
+              hint: 'Peer moved to explicit session recovery. Normal sends are blocked until reset-ack arrives.',
             },
           ),
         );
 
-        logger.warn('E2E decrypt failed, cleared stale session', {
+        if (recovery.started) {
+          try {
+            await this.sendSessionReset(
+              envelope.from,
+              recovery.state.reason,
+              recovery.state.epoch,
+              requestedAt,
+            );
+          } catch (sendError) {
+            logger.warn('Failed to send E2E session reset after decrypt failure', {
+              from: envelope.from,
+              epoch: recovery.state.epoch,
+              error: (sendError as Error).message,
+            });
+          }
+        }
+
+        logger.warn('E2E decrypt failed, entered explicit recovery barrier', {
           id: envelope.id,
           from: envelope.from,
+          epoch: recovery.state.epoch,
+          startedRecovery: recovery.started,
           error: (error as Error).message,
         });
         return;
       }
     }
 
-    const result = await this.defense.checkMessage(decryptedEnvelope);
+    const solicitedReply = await this.isSolicitedReply(decryptedEnvelope);
+    const checkMessage = this.defense.checkMessage.bind(this.defense) as (
+      envelope: MessageEnvelope,
+      options?: { solicitedReply?: boolean },
+    ) => ReturnType<DefenseMiddleware['checkMessage']>;
+    const result = await checkMessage(decryptedEnvelope, { solicitedReply });
     if (!result.allowed) {
       if (result.reason === 'duplicate' && inboundE2EDelivery) {
         const merged = await this.queue.appendE2EDelivery(decryptedEnvelope.id, inboundE2EDelivery);
@@ -704,7 +1396,12 @@ export class ClawDaemon {
         return;
       }
 
-      logger.warn('Message rejected by defense', { id: envelope.id, reason: result.reason });
+      logger.warn('Message rejected by defense', {
+        id: envelope.id,
+        reason: result.reason,
+        solicitedReply,
+        replyTo: decryptedEnvelope.replyTo,
+      });
 
       // Record interaction failures for all meaningful rejection reasons
       if (result.reason === 'rate_limited' || result.reason === 'blocked' || result.reason === 'trust_too_low') {
@@ -736,6 +1433,19 @@ export class ClawDaemon {
     });
 
     logger.info('Message queued', { id: decryptedEnvelope.id, from: decryptedEnvelope.from });
+  }
+
+  private async isSolicitedReply(envelope: MessageEnvelope): Promise<boolean> {
+    if (!this.queue || !envelope.replyTo) {
+      return false;
+    }
+
+    const outbound = await this.queue.getOutboundMessage(envelope.replyTo);
+    if (!outbound) {
+      return false;
+    }
+
+    return outbound.envelope.to === envelope.from;
   }
 
   private handleConnection(socket: Socket): void {
@@ -801,9 +1511,12 @@ export class ClawDaemon {
         case 'messages':   return await this.handleMessages(req);
         case 'get_card':   return this.handleGetCard(req);
         case 'query_agent_card': return await this.handleQueryAgentCard(req);
+        case 'query-card': return await this.handleQueryCard(req);
         case 'publish_card': return await this.handlePublishCard(req);
         case 'list_peers': return await this.handleListPeers(req);
+        case 'peers': return await this.handlePeers(req);
         case 'shutdown':
+        case 'stop':
           await this.shutdown();
           return { id: req.id, success: true };
 
@@ -816,6 +1529,7 @@ export class ClawDaemon {
 
         case 'block':      return await this.handleBlock(req);
         case 'unblock':    return await this.handleUnblock(req);
+        case 'block_agent': return await this.handleBlockAgent(req);
         case 'allowlist':  return await this.handleAllowlist(req);
 
         case 'queue_stats': return await this.handleQueueStats(req);
@@ -833,6 +1547,7 @@ export class ClawDaemon {
         case 'trust_score': return await this.handleTrustScore(req);
         case 'create_endorsement': return await this.handleCreateEndorsement(req);
         case 'query_endorsements': return await this.handleQueryEndorsements(req);
+        case 'endorsements': return await this.handleQueryEndorsements(req);
         case 'get_reachability_policy': return this.handleGetReachabilityPolicy(req);
         case 'set_reachability_policy': return await this.handleSetReachabilityPolicy(req);
         case 'reset_reachability_policy': return await this.handleResetReachabilityPolicy(req);
@@ -860,101 +1575,153 @@ export class ClawDaemon {
     const keyPair = this.getKeyPair();
 
     try {
-      const encrypted = await withLocalE2EStateTransaction(this.identity, async ({ e2eConfig, setE2EConfig }) => {
-        const prepared = await prepareEncryptedSends({
-          identity: this.identity,
-          keyPair,
-          relayClient: this.relayClient!,
-          e2eConfig,
-          to,
-          protocol: protocol ?? '/agent/msg/1.0.0',
-          payload,
-          type: type || 'message',
-          replyTo,
-          threadId,
+      return await this.withPeerSessionLock(to, async () => {
+        return await this.withPeerSendLock(to, async () => {
+          const recovery = this.getPeerRecoveryState(to);
+          if (recovery) {
+            return {
+              id: req.id,
+              success: false,
+              error: this.formatPeerRecoveryError(to, recovery),
+            };
+          }
+
+          try {
+            const encrypted = await this.prepareEncryptedSendsWithoutCommit({
+              to,
+              protocol: protocol ?? '/agent/msg/1.0.0',
+              payload,
+              type: type || 'message',
+              replyTo,
+              threadId,
+            });
+
+            const applicationEnvelope = encrypted.applicationEnvelope;
+
+            const e2eDeliveries: E2EDeliveryMetadata[] = encrypted.targets.map((target) => ({
+              transport: target.transport,
+              transportMessageId: target.outerEnvelope.id,
+              senderDeviceId: target.senderDeviceId,
+              receiverDeviceId: target.recipientDeviceId,
+              sessionId: target.sessionId,
+              state: 'pending',
+              recordedAt: Date.now(),
+            }));
+
+            if (this.queue) {
+              await this.queue.enqueueOutbound(applicationEnvelope, e2eDeliveries);
+            }
+
+            for (const target of encrypted.targets) {
+              const pendingDelivery: E2EDeliveryMetadata = {
+                transport: target.transport,
+                transportMessageId: target.outerEnvelope.id,
+                senderDeviceId: target.senderDeviceId,
+                receiverDeviceId: target.recipientDeviceId,
+                sessionId: target.sessionId,
+                state: 'pending',
+                recordedAt: Date.now(),
+              };
+
+              try {
+                await this.sendEnvelopeAwaitAccepted(to, target.outerEnvelopeBytes);
+                if (target.configAfterSend) {
+                  await this.commitAcceptedE2EConfig(target.configAfterSend);
+                }
+                if (this.queue) {
+                  await this.queue.appendE2EDelivery(applicationEnvelope.id, {
+                    ...pendingDelivery,
+                    state: 'sent',
+                    recordedAt: Date.now(),
+                    error: undefined,
+                  });
+                }
+              } catch (error) {
+                if (this.queue) {
+                  await this.queue.appendE2EDelivery(applicationEnvelope.id, {
+                    ...pendingDelivery,
+                    state: 'failed',
+                    recordedAt: Date.now(),
+                    error: (error as Error).message,
+                  });
+                  await this.queue.markOutboundFailed(applicationEnvelope.id, (error as Error).message);
+                }
+                throw error;
+              }
+            }
+
+            if (this.queue) {
+              await this.queue.markOutboundDelivered(applicationEnvelope.id);
+            }
+
+            return {
+              id: req.id,
+              success: true,
+              data: { id: applicationEnvelope.id },
+            };
+          } catch (e2eError) {
+            if (!this.shouldFallbackToPlaintext(e2eError)) {
+              return {
+                id: req.id,
+                success: false,
+                error: (e2eError as Error).message,
+              };
+            }
+
+            const envelope = createEnvelope(
+              this.identity.did,
+              to,
+              type || 'message',
+              protocol,
+              payload,
+              replyTo,
+              threadId,
+            );
+
+            const signedEnvelope = await signEnvelope(envelope, (data) =>
+              sign(data, keyPair.privateKey)
+            );
+
+            if (this.queue) {
+              await this.queue.enqueueOutbound(signedEnvelope);
+            }
+
+            if (this.router) {
+              await this.router.sendMessage(signedEnvelope);
+            }
+
+            if (this.queue) {
+              await this.queue.markOutboundDelivered(signedEnvelope.id);
+            }
+
+            return {
+              id: req.id,
+              success: true,
+              data: { id: signedEnvelope.id },
+            };
+          }
         });
-        setE2EConfig(prepared.e2eConfig);
-        return prepared;
       });
-
-      const applicationEnvelope = encrypted.applicationEnvelope;
-
-      const e2eDeliveries: E2EDeliveryMetadata[] = encrypted.targets.map((target) => ({
-          transport: target.transport,
-          senderDeviceId: target.senderDeviceId,
-          receiverDeviceId: target.recipientDeviceId,
-          sessionId: target.sessionId,
-          state: 'sent',
-          recordedAt: Date.now(),
-      }));
-
-      if (this.queue) {
-        await this.queue.enqueueOutbound(applicationEnvelope, e2eDeliveries);
-      }
-
-      for (const target of encrypted.targets) {
-        await this.relayClient.sendEnvelope(to, target.outerEnvelopeBytes);
-      }
-
-      if (this.queue) {
-        await this.queue.markOutboundDelivered(applicationEnvelope.id);
-      }
-
-      return {
-        id: req.id,
-        success: true,
-        data: { id: applicationEnvelope.id },
-      };
     } catch (e2eError) {
-      if (!this.shouldFallbackToPlaintext(e2eError)) {
-        return {
-          id: req.id,
-          success: false,
-          error: (e2eError as Error).message,
-        };
-      }
-
-      // Fallback: send without E2E if encryption fails (e.g. no card/devices)
-      const envelope = createEnvelope(
-        this.identity.did,
-        to,
-        type || 'message',
-        protocol,
-        payload,
-        replyTo,
-        threadId,
-      );
-
-      const signedEnvelope = await signEnvelope(envelope, (data) =>
-        sign(data, keyPair.privateKey)
-      );
-
-      if (this.queue) {
-        await this.queue.enqueueOutbound(signedEnvelope);
-      }
-
-      if (this.router) {
-        await this.router.sendMessage(signedEnvelope);
-      }
-
-      if (this.queue) {
-        await this.queue.markOutboundDelivered(signedEnvelope.id);
-      }
-
       return {
         id: req.id,
-        success: true,
-        data: { id: signedEnvelope.id },
+        success: false,
+        error: (e2eError as Error).message,
       };
     }
   }
 
   private async handleReloadE2E(req: DaemonRequest): Promise<DaemonResponse> {
+    const cancelled = this.clearAllPendingRecovery();
+    const clearedRecoveringPeers = this.clearAllPeerRecoveryStates();
     const result = await withLocalE2EStateTransaction(this.identity, async ({ e2eConfig }) => {
       const currentDevice = e2eConfig.devices[e2eConfig.currentDeviceId];
       return {
         deviceId: e2eConfig.currentDeviceId,
         sessionCount: Object.keys(currentDevice?.sessions ?? {}).length,
+        cancelledReplayPeers: cancelled.replayPeers,
+        cancelledRetryPeers: cancelled.retryPeers,
+        clearedRecoveringPeers,
       };
     });
 
@@ -975,15 +1742,18 @@ export class ClawDaemon {
     const failed: Array<{ peer: string; error: string }> = [];
 
     for (const peer of peers) {
-      try {
-        await this.sendSessionReset(peer, 'manual-reset');
-        notified.push(peer);
-      } catch (error) {
-        failed.push({
-          peer,
-          error: (error as Error).message,
-        });
-      }
+      await this.withPeerSessionLock(peer, async () => {
+        const recovery = await this.beginLocalPeerRecovery(peer, 'manual-reset');
+        try {
+          await this.sendSessionReset(peer, 'manual-reset', recovery.state.epoch);
+          notified.push(peer);
+        } catch (error) {
+          failed.push({
+            peer,
+            error: (error as Error).message,
+          });
+        }
+      });
     }
 
     return {
@@ -1024,6 +1794,21 @@ export class ClawDaemon {
       id: req.id,
       success: true,
       data: card,
+    };
+  }
+
+  private async handleQueryCard(req: DaemonRequest): Promise<DaemonResponse> {
+    const response = await this.handleQueryAgentCard(req);
+    if (!response.success) {
+      return response;
+    }
+
+    return {
+      id: req.id,
+      success: true,
+      data: {
+        card: response.data ?? null,
+      },
     };
   }
 
@@ -1073,6 +1858,21 @@ export class ClawDaemon {
       id: req.id,
       success: true,
       data: results.slice(0, limit),
+    };
+  }
+
+  private async handlePeers(req: DaemonRequest<ListPeersParams>): Promise<DaemonResponse> {
+    const response = await this.handleListPeers(req);
+    if (!response.success) {
+      return response;
+    }
+
+    return {
+      id: req.id,
+      success: true,
+      data: {
+        peers: response.data ?? [],
+      },
     };
   }
 
@@ -1245,6 +2045,39 @@ export class ClawDaemon {
     }
 
     return { id: req.id, success: true };
+  }
+
+  private async handleBlockAgent(req: DaemonRequest): Promise<DaemonResponse> {
+    const did = typeof req.params?.did === 'string'
+      ? req.params.did
+      : typeof req.params?.targetDid === 'string'
+        ? req.params.targetDid
+        : undefined;
+    if (!did) {
+      return { id: req.id, success: false, error: 'Missing did parameter' };
+    }
+
+    const action = req.params?.action === 'unblock' ? 'unblock' : 'block';
+    const normalized = {
+      ...req.params,
+      did,
+    };
+
+    const response = action === 'unblock'
+      ? await this.handleUnblock({ ...req, params: normalized })
+      : await this.handleBlock({ ...req, params: normalized });
+    if (!response.success) {
+      return response;
+    }
+
+    return {
+      id: req.id,
+      success: true,
+      data: {
+        blocked: action === 'block',
+        targetDid: did,
+      },
+    };
   }
 
   private async handleAllowlist(req: DaemonRequest): Promise<DaemonResponse> {
@@ -1493,8 +2326,15 @@ export class ClawDaemon {
       if (!did) {
         return { id: req.id, success: false, error: 'Missing did parameter' };
       }
-      const result = await getTrustScore(did);
-      return { id: req.id, success: true, data: result };
+      if (!this.trustSystem) {
+        return { id: req.id, success: false, error: 'Trust system not initialized' };
+      }
+
+      const [score, endorsements] = await Promise.all([
+        this.trustSystem.getTrustScore(did),
+        this.trustSystem.getEndorsements(did),
+      ]);
+      return { id: req.id, success: true, data: { score, endorsements } };
     } catch (error) {
       return { id: req.id, success: false, error: (error as Error).message };
     }
@@ -1506,7 +2346,18 @@ export class ClawDaemon {
       if (!did || typeof score !== 'number') {
         return { id: req.id, success: false, error: 'Missing did or score parameter' };
       }
-      const result = await endorseAgent(did, score, reason || '');
+      if (!this.trustSystem) {
+        return { id: req.id, success: false, error: 'Trust system not initialized' };
+      }
+
+      const keyPair = this.getKeyPair();
+      const result = await this.trustSystem.endorse(
+        this.identity.did,
+        did,
+        score,
+        reason || '',
+        (data) => sign(data, keyPair.privateKey),
+      );
       return { id: req.id, success: true, data: result };
     } catch (error) {
       return { id: req.id, success: false, error: (error as Error).message };
@@ -1515,12 +2366,45 @@ export class ClawDaemon {
 
   private async handleQueryEndorsements(req: DaemonRequest): Promise<DaemonResponse> {
     try {
-      const { did, options } = req.params;
+      const did = typeof req.params?.did === 'string'
+        ? req.params.did
+        : typeof req.params?.targetDid === 'string'
+          ? req.params.targetDid
+          : undefined;
       if (!did) {
         return { id: req.id, success: false, error: 'Missing did parameter' };
       }
-      const result = await queryNetworkEndorsements(did, options || {});
-      return { id: req.id, success: true, data: result };
+      if (!this.relayClient) {
+        return { id: req.id, success: false, error: 'Relay client not initialized' };
+      }
+
+      const domain = typeof req.params?.domain === 'string'
+        ? req.params.domain
+        : typeof req.params?.options?.domain === 'string'
+          ? req.params.options.domain
+          : undefined;
+      const createdBy = typeof req.params?.createdBy === 'string'
+        ? req.params.createdBy
+        : typeof req.params?.endorser === 'string'
+          ? req.params.endorser
+          : undefined;
+      const limit = typeof req.params?.limit === 'number' ? req.params.limit : undefined;
+
+      const result = await this.relayClient.queryTrust(did, domain);
+      const endorsements = createdBy
+        ? result.endorsements.filter((endorsement) => endorsement.from === createdBy)
+        : result.endorsements;
+      const page = typeof limit === 'number' ? endorsements.slice(0, limit) : endorsements;
+
+      return {
+        id: req.id,
+        success: true,
+        data: {
+          ...result,
+          endorsements: page,
+          endorsementCount: page.length,
+        },
+      };
     } catch (error) {
       return { id: req.id, success: false, error: (error as Error).message };
     }

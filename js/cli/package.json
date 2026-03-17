@@ -27,6 +27,7 @@
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
+    "test": "pnpm build && node --test test/*.test.mjs",
     "clean": "rm -rf dist"
   },
   "dependencies": {

@@ -21,7 +21,9 @@ export function registerPeersCommand(program: Command): void {
     .option('--min-trust <score>', 'Minimum trust score (0-1)')
     .option('--limit <n>', 'Max results', '20')
     .option('--format <fmt>', 'Output format: text|json', 'text')
+    .option('--json', 'Output as JSON (alias for --format json)')
     .action(async (options) => {
+      if (options.json) options.format = 'json';
       const client = new DaemonClient();
       if (!(await client.isDaemonRunning())) {
         console.error('Daemon not running. Start with: agent listen --background');

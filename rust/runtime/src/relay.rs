@@ -615,6 +615,11 @@ impl RelaySession {
     }
 
     pub async fn wait_delivery_report(&mut self) -> Result<String> {
+        let (_, status) = self.wait_delivery_report_with_id().await?;
+        Ok(status)
+    }
+
+    pub async fn wait_delivery_report_with_id(&mut self) -> Result<(String, String)> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         let mut deferred = VecDeque::new();
         loop {
@@ -631,13 +636,18 @@ impl RelaySession {
 
             match msg.get("type").and_then(|v| v.as_str()) {
                 Some("DELIVERY_REPORT") => {
+                    let message_id = msg
+                        .get("messageId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     let status = msg
                         .get("status")
                         .and_then(|v| v.as_str())
                         .unwrap_or("unknown")
                         .to_string();
                     self.restore_pending_messages(deferred);
-                    return Ok(status);
+                    return Ok((message_id, status));
                 }
                 Some("PING") => {
                     self.send_pong().await?;

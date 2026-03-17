@@ -44,6 +44,12 @@ export interface RelayClientConfig {
 export type MessageDeliveryHandler = (msg: DeliverMessage) => Promise<void>;
 export type DeliveryReportHandler = (msg: DeliveryReportMessage) => void;
 
+export interface RelaySendOutcome {
+  messageId: string;
+  status: DeliveryReportMessage['status'];
+  reportedAt: number;
+}
+
 export interface RelayReachabilityFailure {
   provider: string;
   attempts: number;
@@ -64,6 +70,7 @@ export interface RelayClient {
   start(): Promise<void>;
   stop(): Promise<void>;
   sendEnvelope(toDid: string, envelopeBytes: Uint8Array): Promise<void>;
+  sendEnvelopeAwaitAccepted?(toDid: string, envelopeBytes: Uint8Array, timeoutMs?: number): Promise<RelaySendOutcome>;
   discover(input: string | { query?: string; capability?: string }, minTrust?: number, limit?: number): Promise<DiscoveredAgent[]>;
   fetchCard(did: string): Promise<AgentCard | null>;
   publishPreKeyBundles(bundles: PublishedPreKeyBundle[]): Promise<void>;
@@ -90,6 +97,13 @@ interface PendingControlRequest {
   allowOutOfBandResponse: boolean;
 }
 
+interface PendingDeliveryAcceptance {
+  timeout: NodeJS.Timeout;
+  envelopeId: string;
+  resolve: (outcome: RelaySendOutcome) => void;
+  reject: (error: TransportError) => void;
+}
+
 interface RelayConnection {
   url: string;
   ws: WebSocket | null;
@@ -102,9 +116,12 @@ interface RelayConnection {
   pingTimer: NodeJS.Timeout | null;
   peerCount: number;
   pendingRequest: PendingControlRequest | null;
+  pendingDeliveryAcceptance: PendingDeliveryAcceptance | null;
+  sendAcceptanceChain: Promise<void>;
   inboundDispatchChain: Promise<void>;
   deliveryHandlerDepth: number;
   relayId: string | null;
+  acceptanceWaitDegraded: boolean;
 }
 
 const DEFAULT_RECONNECT = {
@@ -243,6 +260,207 @@ export function createRelayClient(config: RelayClientConfig): RelayClient {
     clearPendingRequest(conn)?.reject(error);
   }
 
+  function clearPendingDeliveryAcceptance(conn: RelayConnection): PendingDeliveryAcceptance | null {
+    const pending = conn.pendingDeliveryAcceptance;
+    if (!pending) {
+      return null;
+    }
+
+    clearTimeout(pending.timeout);
+    conn.pendingDeliveryAcceptance = null;
+    return pending;
+  }
+
+  function rejectPendingDeliveryAcceptance(conn: RelayConnection, error: TransportError): void {
+    const pending = clearPendingDeliveryAcceptance(conn);
+    pending?.reject(error);
+  }
+
+  function extractEnvelopeId(envelopeBytes: Uint8Array): string {
+    const decoded = decodeCBOR(envelopeBytes);
+    if (!decoded || typeof decoded !== 'object' || typeof (decoded as { id?: unknown }).id !== 'string') {
+      throw new TransportError('Outgoing envelope is missing an id');
+    }
+
+    return (decoded as { id: string }).id;
+  }
+
+  function deliveryReportError(conn: RelayConnection, report: DeliveryReportMessage): TransportError {
+    const detail = {
+      relayUrl: conn.url,
+      messageId: report.messageId,
+      status: report.status,
+      reportedAt: report.timestamp,
+    };
+
+    switch (report.status) {
+      case 'queue_full':
+        return new TransportError('Relay queue full for recipient', detail);
+      case 'unknown_recipient':
+        return new TransportError('Recipient not found on relay', detail);
+      case 'expired':
+        return new TransportError('Relay delivery expired before acceptance', detail);
+      default:
+        return new TransportError(`Unexpected relay delivery report: ${report.status}`, detail);
+    }
+  }
+
+  function settlePendingDeliveryAcceptance(conn: RelayConnection, report: DeliveryReportMessage): boolean {
+    const pending = conn.pendingDeliveryAcceptance;
+    if (!pending) {
+      return false;
+    }
+
+    if (report.status === 'delivered') {
+      return false;
+    }
+
+    clearPendingDeliveryAcceptance(conn);
+    if (report.status === 'accepted') {
+      pending.resolve({
+        messageId: report.messageId,
+        status: report.status,
+        reportedAt: report.timestamp,
+      });
+      return true;
+    }
+
+    pending.reject(deliveryReportError(conn, report));
+    return true;
+  }
+
+  function serializeAcceptedSend<T>(
+    conn: RelayConnection,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const next = conn.sendAcceptanceChain
+      .catch(() => undefined)
+      .then(operation);
+    conn.sendAcceptanceChain = next
+      .then(() => undefined)
+      .catch(() => undefined);
+    return next;
+  }
+
+  function syntheticAcceptedOutcome(envelopeId: string): RelaySendOutcome {
+    return {
+      messageId: envelopeId,
+      status: 'accepted',
+      reportedAt: Date.now(),
+    };
+  }
+
+  function isAcceptanceTimeoutError(error: unknown): error is TransportError {
+    return error instanceof TransportError && error.message === 'Timed out waiting for relay acceptance';
+  }
+
+  async function sendEnvelopeWithoutAcceptanceWait(
+    conn: RelayConnection,
+    toDid: string,
+    envelopeBytes: Uint8Array,
+    envelopeId: string,
+  ): Promise<RelaySendOutcome> {
+    return serializeAcceptedSend(conn, async () => {
+      const ws = conn.ws;
+      if (!conn.connected || !ws) {
+        throw new TransportError('No connected relay');
+      }
+
+      try {
+        ws.send(encodeCBOR({
+          type: 'SEND',
+          to: toDid,
+          envelope: envelopeBytes,
+        }));
+        logger.debug('Sent envelope', {
+          to: toDid,
+          size: envelopeBytes.length,
+          envelopeId,
+          awaitAccepted: false,
+          degradedAcceptanceWait: true,
+        });
+        return syntheticAcceptedOutcome(envelopeId);
+      } catch (error) {
+        throw new TransportError('Failed to send envelope', {
+          relayUrl: conn.url,
+          envelopeId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    });
+  }
+
+  function awaitDeliveryAcceptance(
+    conn: RelayConnection,
+    toDid: string,
+    envelopeBytes: Uint8Array,
+    timeoutMs = 5000,
+  ): Promise<RelaySendOutcome> {
+    const ws = conn.ws;
+    if (!conn.connected || !ws) {
+      throw new TransportError('No connected relay');
+    }
+
+    const envelopeId = extractEnvelopeId(envelopeBytes);
+
+    if (conn.acceptanceWaitDegraded) {
+      return sendEnvelopeWithoutAcceptanceWait(conn, toDid, envelopeBytes, envelopeId);
+    }
+
+    return serializeAcceptedSend(conn, () => new Promise<RelaySendOutcome>((resolve, reject) => {
+      const pending: PendingDeliveryAcceptance = {
+        timeout: setTimeout(() => {
+          if (conn.pendingDeliveryAcceptance === pending) {
+            conn.pendingDeliveryAcceptance = null;
+          }
+          reject(new TransportError('Timed out waiting for relay acceptance', {
+            relayUrl: conn.url,
+            envelopeId,
+          }));
+        }, timeoutMs),
+        envelopeId,
+        resolve,
+        reject,
+      };
+
+      conn.pendingDeliveryAcceptance = pending;
+
+      try {
+        ws.send(encodeCBOR({
+          type: 'SEND',
+          to: toDid,
+          envelope: envelopeBytes,
+        }));
+        logger.debug('Sent envelope', {
+          to: toDid,
+          size: envelopeBytes.length,
+          envelopeId,
+          awaitAccepted: true,
+        });
+      } catch (error) {
+        clearPendingDeliveryAcceptance(conn);
+        reject(new TransportError('Failed to send envelope', {
+          relayUrl: conn.url,
+          envelopeId,
+          error: error instanceof Error ? error.message : String(error),
+        }));
+      }
+    })).catch((error) => {
+      if (isAcceptanceTimeoutError(error)) {
+        conn.acceptanceWaitDegraded = true;
+        logger.warn('Relay delivery acceptance timed out; degrading to optimistic send semantics', {
+          relayUrl: conn.url,
+          to: toDid,
+          envelopeId,
+          timeoutMs,
+        });
+        return syntheticAcceptedOutcome(envelopeId);
+      }
+
+      throw error;
+    });
+  }
+
   function queueInboundRelayMessage(conn: RelayConnection, msg: RelayMessage): void {
     const processMessage = async (): Promise<void> => {
       try {
@@ -335,9 +553,12 @@ export function createRelayClient(config: RelayClientConfig): RelayClient {
       pingTimer: null,
       peerCount: 0,
       pendingRequest: null,
+      pendingDeliveryAcceptance: null,
+      sendAcceptanceChain: Promise.resolve(),
       inboundDispatchChain: Promise.resolve(),
       deliveryHandlerDepth: 0,
       relayId: null,
+      acceptanceWaitDegraded: false,
     };
 
     connections.push(connection);
@@ -481,6 +702,7 @@ export function createRelayClient(config: RelayClientConfig): RelayClient {
         conn.connected = false;
         conn.connecting = false;
         conn.ws = null;
+        conn.acceptanceWaitDegraded = false;
 
         if (conn.stableTimer) {
           clearTimeout(conn.stableTimer);
@@ -492,6 +714,11 @@ export function createRelayClient(config: RelayClientConfig): RelayClient {
         }
 
         rejectPendingRequest(conn, new TransportError('Relay connection closed before response', {
+          relayUrl: conn.url,
+          closeCode: code,
+          closeReason: reason,
+        }));
+        rejectPendingDeliveryAcceptance(conn, new TransportError('Relay connection closed before delivery report', {
           relayUrl: conn.url,
           closeCode: code,
           closeReason: reason,
@@ -578,6 +805,7 @@ export function createRelayClient(config: RelayClientConfig): RelayClient {
         conn.connecting = false;
         conn.peerCount = welcome.peers;
         conn.reconnectAttempt = 0;
+        conn.acceptanceWaitDegraded = false;
         clearFailure(conn.url);
 
         if (conn.stableTimer) {
@@ -622,6 +850,7 @@ export function createRelayClient(config: RelayClientConfig): RelayClient {
       case 'DELIVERY_REPORT': {
         const report = msg as DeliveryReportMessage;
         logger.info('Received DELIVERY_REPORT', { messageId: report.messageId, status: report.status });
+        settlePendingDeliveryAcceptance(conn, report);
         if (deliveryReportHandler) {
           deliveryReportHandler(report);
         }
@@ -817,6 +1046,9 @@ export function createRelayClient(config: RelayClientConfig): RelayClient {
         rejectPendingRequest(conn, new TransportError('Relay client stopped before response', {
           relayUrl: conn.url,
         }), true);
+        rejectPendingDeliveryAcceptance(conn, new TransportError('Relay client stopped before delivery report', {
+          relayUrl: conn.url,
+        }));
         if (conn.ws) {
           conn.ws.close();
           conn.ws = null;
@@ -837,6 +1069,19 @@ export function createRelayClient(config: RelayClientConfig): RelayClient {
 
       await sendToRelay(msg);
       logger.debug('Sent envelope', { to: toDid, size: envelopeBytes.length });
+    },
+
+    async sendEnvelopeAwaitAccepted(
+      toDid: string,
+      envelopeBytes: Uint8Array,
+      timeoutMs = 5000,
+    ): Promise<RelaySendOutcome> {
+      const conn = getConnectedConnection();
+      if (!conn) {
+        throw new TransportError('No connected relay');
+      }
+
+      return await awaitDeliveryAcceptance(conn, toDid, envelopeBytes, timeoutMs);
     },
 
     async discover(input: string | { query?: string; capability?: string }, minTrust?: number, limit?: number): Promise<DiscoveredAgent[]> {

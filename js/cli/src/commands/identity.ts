@@ -11,8 +11,10 @@ export function registerIdentityCommand(program: Command): void {
     .command('show')
     .description('Show current identity information')
     .option('--format <fmt>', 'Output format: text|json', 'text')
+    .option('--json', 'Output as JSON (alias for --format json)')
     .action(async (options) => {
       try {
+        if (options.json) options.format = 'json';
         const currentIdentity = getIdentity();
 
         if (!currentIdentity) {

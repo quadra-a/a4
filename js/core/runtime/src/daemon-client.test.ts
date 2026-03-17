@@ -76,6 +76,42 @@ describe('DaemonClient', () => {
 
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   });
+
+  it('retries while the daemon socket is not available yet', async () => {
+    const socketPath = createSocketPath();
+
+    const server = createServer((socket) => {
+      socket.on('data', (data) => {
+        const [line] = data.toString().trim().split('\n');
+        const request = JSON.parse(line) as { id: string; command: string };
+
+        expect(request.command).toBe('status');
+
+        socket.write(JSON.stringify({
+          id: request.id,
+          success: true,
+          data: { running: true, did: 'did:agent:delayed' },
+        }) + '\n');
+      });
+    });
+
+    const startServer = new Promise<boolean>((resolve, reject) => {
+      setTimeout(() => {
+        listenIfPermitted(server, socketPath).then(resolve, reject);
+      }, 60);
+    });
+
+    const client = new DaemonClient(socketPath);
+    await expect(client.send('status', {})).resolves.toEqual({
+      running: true,
+      did: 'did:agent:delayed',
+    });
+
+    const listeningSupported = await startServer;
+    if (listeningSupported) {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+  });
 });
 
 describe('DaemonSubscriptionClient', () => {
@@ -147,5 +183,64 @@ describe('DaemonSubscriptionClient', () => {
     expect(receivedCommands).toContain('unsubscribe');
 
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  });
+
+  it('retries subscription connection while the socket is appearing', async () => {
+    const socketPath = createSocketPath();
+    const receivedCommands: string[] = [];
+
+    const server = createServer((socket) => {
+      let buffer = '';
+
+      socket.on('data', (data) => {
+        buffer += data.toString();
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (!line.trim()) {
+            continue;
+          }
+
+          const request = JSON.parse(line) as { id: string; command: string };
+          receivedCommands.push(request.command);
+
+          if (request.command === 'subscribe_inbox') {
+            socket.write(JSON.stringify({
+              id: request.id,
+              success: true,
+              data: { subscriptionId: 'sub_delayed' },
+            }) + '\n');
+          }
+
+          if (request.command === 'unsubscribe') {
+            socket.write(JSON.stringify({
+              id: request.id,
+              success: true,
+            }) + '\n');
+          }
+        }
+      });
+    });
+
+    const startServer = new Promise<boolean>((resolve, reject) => {
+      setTimeout(() => {
+        listenIfPermitted(server, socketPath).then(resolve, reject);
+      }, 60);
+    });
+
+    const subscriptionClient = new DaemonSubscriptionClient<{ envelope: { id: string } }>(socketPath);
+    const subscriptionId = await subscriptionClient.subscribeInbox({}, () => undefined);
+    expect(subscriptionId).toBe('sub_delayed');
+
+    await subscriptionClient.close();
+
+    expect(receivedCommands).toContain('subscribe_inbox');
+    expect(receivedCommands).toContain('unsubscribe');
+
+    const listeningSupported = await startServer;
+    if (listeningSupported) {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
   });
 });

@@ -12,6 +12,14 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::env;
 
+const SERVE_AFTER_HELP: &str = "\
+Handler contract:
+  stdin  receives the incoming message payload JSON (not the full envelope)
+  stdout JSON object becomes the reply payload as-is
+  stdout non-JSON is wrapped as {\"result\":\"<stdout>\"}
+  exit!=0 sends a HANDLER_ERROR reply
+  timeout sends a TIMEOUT reply";
+
 #[derive(Parser)]
 #[command(
     name = "a4",
@@ -372,6 +380,7 @@ enum Commands {
     },
 
     /// Register handlers for incoming requests
+    #[command(after_help = SERVE_AFTER_HELP)]
     Serve {
         /// Capability name to handle
         #[arg(long)]
@@ -397,6 +406,9 @@ enum Commands {
         /// Output format: text|json
         #[arg(long, default_value = "text")]
         format: String,
+        /// Arguments passed to the handler after `--`
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        exec_args: Vec<String>,
     },
 
     /// Stop the local daemon
@@ -870,6 +882,7 @@ async fn main() -> Result<()> {
             max_concurrency,
             timeout,
             format,
+            exec_args,
         } => {
             commands::serve::run(commands::serve::ServeOptions {
                 on,
@@ -880,6 +893,7 @@ async fn main() -> Result<()> {
                 max_concurrency,
                 timeout_secs: timeout,
                 format,
+                exec_args,
             })
             .await?;
         }
@@ -942,4 +956,15 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cli;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_definition_passes_clap_debug_assertions() {
+        Cli::command().debug_assert();
+    }
 }

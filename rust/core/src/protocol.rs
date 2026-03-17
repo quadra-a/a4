@@ -11,6 +11,24 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+const MAX_SAFE_JSON_INTEGER: f64 = 9_007_199_254_740_991.0;
+
+fn normalize_json_number(number: serde_json::Number) -> Value {
+    let Some(float) = number.as_f64() else {
+        return Value::Number(number);
+    };
+
+    if !float.is_finite() || float.fract() != 0.0 || float.abs() > MAX_SAFE_JSON_INTEGER {
+        return Value::Number(number);
+    }
+
+    if float >= 0.0 {
+        Value::Number(serde_json::Number::from(float as u64))
+    } else {
+        Value::Number(serde_json::Number::from(float as i64))
+    }
+}
+
 fn canonicalize_json_value(value: Value) -> Value {
     match value {
         Value::Array(entries) => {
@@ -25,6 +43,7 @@ fn canonicalize_json_value(value: Value) -> Value {
             }
             Value::Object(canonical)
         }
+        Value::Number(number) => normalize_json_number(number),
         other => other,
     }
 }
@@ -620,12 +639,57 @@ pub struct TrustResultMessage {
     pub next_cursor: Option<String>,
 }
 
+const ENDORSEMENT_TYPE_PREFIX: &str = "[type:";
+
+fn parse_relay_endorsement_reason(reason: &str) -> (String, Option<String>) {
+    let trimmed = reason.trim();
+    if let Some(rest) = trimmed.strip_prefix(ENDORSEMENT_TYPE_PREFIX) {
+        if let Some((endorsement_type, comment)) = rest.split_once(']') {
+            let endorsement_type = endorsement_type.trim();
+            if !endorsement_type.is_empty() {
+                let comment = comment.trim();
+                let default_comment = format!("{} endorsement", endorsement_type);
+                return (
+                    endorsement_type.to_string(),
+                    if comment.is_empty() || comment == default_comment {
+                        None
+                    } else {
+                        Some(comment.to_string())
+                    },
+                );
+            }
+        }
+    }
+
+    if let Some(endorsement_type) = trimmed.strip_suffix(" endorsement") {
+        let endorsement_type = endorsement_type.trim();
+        if !endorsement_type.is_empty() {
+            return (endorsement_type.to_string(), None);
+        }
+    }
+
+    ("general".to_string(), normalize_optional_comment(trimmed))
+}
+
+fn normalize_optional_comment(comment: &str) -> Option<String> {
+    let comment = comment.trim();
+    if comment.is_empty() {
+        None
+    } else {
+        Some(comment.to_string())
+    }
+}
+
 pub fn relay_endorsement_reason(endorsement: &crate::config::EndorsementV2) -> String {
-    endorsement
+    let comment = endorsement
         .comment
         .clone()
         .filter(|comment| !comment.trim().is_empty())
-        .unwrap_or_else(|| format!("{} endorsement", endorsement.endorsement_type))
+        .unwrap_or_else(|| format!("{} endorsement", endorsement.endorsement_type));
+    format!(
+        "{}{}] {}",
+        ENDORSEMENT_TYPE_PREFIX, endorsement.endorsement_type, comment
+    )
 }
 
 pub fn relay_unsigned_endorsement_value(endorsement: &crate::config::EndorsementV2) -> Value {
@@ -642,17 +706,14 @@ pub fn relay_unsigned_endorsement_value(endorsement: &crate::config::Endorsement
 }
 
 pub fn relay_endorsement_to_local(endorsement: RelayEndorsement) -> crate::config::EndorsementV2 {
+    let (endorsement_type, comment) = parse_relay_endorsement_reason(&endorsement.reason);
     crate::config::EndorsementV2 {
         endorser: endorsement.from,
         endorsee: endorsement.to,
         domain: endorsement.domain,
-        endorsement_type: "general".to_string(),
+        endorsement_type,
         strength: endorsement.score,
-        comment: if endorsement.reason.trim().is_empty() {
-            None
-        } else {
-            Some(endorsement.reason)
-        },
+        comment,
         timestamp: endorsement.timestamp,
         expires: endorsement.expires,
         version: endorsement.version.to_string(),
@@ -698,9 +759,11 @@ pub fn build_trust_query_message(
 mod tests {
     use super::{
         build_hello_message, build_hello_signature_payload, canonical_json_string,
-        cbor_decode_value, cbor_value_to_json, legacy_json_string, AgentCard, AgentCardUnsigned,
-        Capability, Envelope, EnvelopeUnsigned,
+        cbor_decode_value, cbor_value_to_json, legacy_json_string, relay_endorsement_reason,
+        relay_endorsement_to_local, AgentCard, AgentCardUnsigned, Capability, Envelope,
+        EnvelopeUnsigned, RelayEndorsement,
     };
+    use crate::config::EndorsementV2;
     use crate::identity::{derive_did, KeyPair};
     use ciborium::Value as CborValue;
     use serde_json::json;
@@ -792,6 +855,17 @@ mod tests {
     }
 
     #[test]
+    fn canonical_json_normalizes_integral_json_floats_to_integers() {
+        let value = json!({
+            "checksum": 335042067.0,
+            "elapsed_s": 0.289,
+        });
+
+        let canonical = canonical_json_string(&value).expect("canonical JSON builds");
+        assert_eq!(canonical, r#"{"checksum":335042067,"elapsed_s":0.289}"#);
+    }
+
+    #[test]
     fn envelope_verify_signature_accepts_legacy_payload_with_group_id() {
         let keypair = KeyPair::generate();
         let did = derive_did(keypair.verifying_key.as_bytes());
@@ -870,5 +944,59 @@ mod tests {
         assert!(card
             .verify_signature()
             .expect("legacy card signature verifies"));
+    }
+
+    #[test]
+    fn relay_endorsement_reason_encodes_type_prefix() {
+        let reason = relay_endorsement_reason(&EndorsementV2 {
+            endorser: "did:agent:alice".to_string(),
+            endorsee: "did:agent:bob".to_string(),
+            domain: None,
+            endorsement_type: "capability".to_string(),
+            strength: 0.9,
+            comment: Some("Great at GPUs".to_string()),
+            timestamp: 10,
+            expires: None,
+            version: "2.0".to_string(),
+            signature: "sig".to_string(),
+        });
+
+        assert_eq!(reason, "[type:capability] Great at GPUs");
+    }
+
+    #[test]
+    fn relay_endorsement_to_local_recovers_prefixed_type_and_comment() {
+        let local = relay_endorsement_to_local(RelayEndorsement {
+            version: 2,
+            from: "did:agent:alice".to_string(),
+            to: "did:agent:bob".to_string(),
+            domain: Some("gpu-compute".to_string()),
+            score: 0.9,
+            reason: "[type:capability] Great at GPUs".to_string(),
+            timestamp: 10,
+            expires: None,
+            signature: "sig".to_string(),
+        });
+
+        assert_eq!(local.endorsement_type, "capability");
+        assert_eq!(local.comment.as_deref(), Some("Great at GPUs"));
+    }
+
+    #[test]
+    fn relay_endorsement_to_local_infers_legacy_type_from_reason() {
+        let local = relay_endorsement_to_local(RelayEndorsement {
+            version: 2,
+            from: "did:agent:alice".to_string(),
+            to: "did:agent:bob".to_string(),
+            domain: None,
+            score: 0.9,
+            reason: "capability endorsement".to_string(),
+            timestamp: 10,
+            expires: None,
+            signature: "sig".to_string(),
+        });
+
+        assert_eq!(local.endorsement_type, "capability");
+        assert_eq!(local.comment, None);
     }
 }

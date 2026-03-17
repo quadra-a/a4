@@ -206,7 +206,88 @@ async fn try_daemon_trust_score(
 
     let data = client.send_command("trust_score", request).await?;
 
-    // Parse daemon response into TrustScore
+    parse_daemon_trust_score(&data)
+}
+
+fn parse_activity_level(value: &str) -> ActivityLevel {
+    match value {
+        "Low" => ActivityLevel::Low,
+        "High" => ActivityLevel::High,
+        _ => ActivityLevel::Medium,
+    }
+}
+
+fn parse_network_position(value: &str) -> NetworkPosition {
+    match value {
+        "Isolated" => NetworkPosition::Isolated,
+        "WellConnected" => NetworkPosition::WellConnected,
+        "Central" => NetworkPosition::Central,
+        _ => NetworkPosition::Connected,
+    }
+}
+
+fn parse_daemon_trust_score(data: &serde_json::Value) -> Result<crate::trust::TrustScore> {
+    if let Some(score_data) = data.get("score").and_then(|value| value.as_object()) {
+        let score = score_data
+            .get("interactionScore")
+            .and_then(|value| value.as_f64())
+            .ok_or_else(|| anyhow::anyhow!("Invalid JS daemon trust score response"))?;
+        let endorsement_count = score_data
+            .get("endorsements")
+            .and_then(|value| value.as_u64())
+            .unwrap_or_else(|| {
+                data.get("endorsements")
+                    .and_then(|value| value.as_array())
+                    .map(|endorsements| endorsements.len() as u64)
+                    .unwrap_or(0)
+            }) as u32;
+        let interaction_count = score_data
+            .get("totalInteractions")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0) as u32;
+        let local_trust = score_data
+            .get("completionRate")
+            .and_then(|value| value.as_f64())
+            .unwrap_or(score);
+        let network_trust = score_data
+            .get("endorsementScore")
+            .and_then(|value| value.as_f64())
+            .unwrap_or(score);
+        let recent_success_rate = score_data
+            .get("recentSuccessRate")
+            .and_then(|value| value.as_f64())
+            .unwrap_or(local_trust);
+        let alpha = (interaction_count as f64 / 20.0).min(0.8);
+        let breakdown = crate::trust::TrustBreakdown {
+            capability_endorsements: 0,
+            reliability_endorsements: 0,
+            general_endorsements: endorsement_count,
+            recent_activity: if recent_success_rate >= 0.8 {
+                ActivityLevel::High
+            } else if recent_success_rate <= 0.4 {
+                ActivityLevel::Low
+            } else {
+                ActivityLevel::Medium
+            },
+            network_position: match endorsement_count {
+                0 => NetworkPosition::Isolated,
+                1..=4 => NetworkPosition::Connected,
+                5..=9 => NetworkPosition::WellConnected,
+                _ => NetworkPosition::Central,
+            },
+        };
+
+        return Ok(crate::trust::TrustScore {
+            score,
+            local_trust,
+            network_trust,
+            alpha,
+            endorsement_count,
+            interaction_count,
+            breakdown,
+        });
+    }
+
     let score = data["score"].as_f64().unwrap_or(0.5);
     let local_trust = data["localTrust"].as_f64().unwrap_or(0.5);
     let network_trust = data["networkTrust"].as_f64().unwrap_or(0.5);
@@ -223,23 +304,14 @@ async fn try_daemon_trust_score(
             .as_u64()
             .unwrap_or(0) as u32,
         general_endorsements: breakdown_data["generalEndorsements"].as_u64().unwrap_or(0) as u32,
-        recent_activity: match breakdown_data["recentActivity"]
-            .as_str()
-            .unwrap_or("Medium")
-        {
-            "Low" => ActivityLevel::Low,
-            "High" => ActivityLevel::High,
-            _ => ActivityLevel::Medium,
-        },
-        network_position: match breakdown_data["networkPosition"]
-            .as_str()
-            .unwrap_or("Connected")
-        {
-            "Isolated" => NetworkPosition::Isolated,
-            "WellConnected" => NetworkPosition::WellConnected,
-            "Central" => NetworkPosition::Central,
-            _ => NetworkPosition::Connected,
-        },
+        recent_activity: parse_activity_level(
+            breakdown_data["recentActivity"].as_str().unwrap_or("Medium"),
+        ),
+        network_position: parse_network_position(
+            breakdown_data["networkPosition"]
+                .as_str()
+                .unwrap_or("Connected"),
+        ),
     };
 
     Ok(crate::trust::TrustScore {
@@ -283,4 +355,66 @@ async fn compute_trust_score_via_relay(
         engine.compute_trust_score(target_did, observer_did, &trust_result.endorsements)?;
 
     Ok(trust_score)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_daemon_trust_score;
+    use crate::trust::{ActivityLevel, NetworkPosition};
+    use serde_json::json;
+
+    #[test]
+    fn parses_rust_daemon_trust_score_shape() {
+        let parsed = parse_daemon_trust_score(&json!({
+            "score": 0.91,
+            "localTrust": 0.8,
+            "networkTrust": 0.95,
+            "alpha": 0.3,
+            "endorsementCount": 4,
+            "interactionCount": 7,
+            "breakdown": {
+                "capabilityEndorsements": 1,
+                "reliabilityEndorsements": 1,
+                "generalEndorsements": 2,
+                "recentActivity": "High",
+                "networkPosition": "WellConnected"
+            }
+        }))
+        .expect("parses rust daemon response");
+
+        assert_eq!(parsed.score, 0.91);
+        assert_eq!(parsed.endorsement_count, 4);
+        assert_eq!(parsed.interaction_count, 7);
+        assert!(matches!(parsed.breakdown.recent_activity, ActivityLevel::High));
+        assert!(matches!(
+            parsed.breakdown.network_position,
+            NetworkPosition::WellConnected
+        ));
+    }
+
+    #[test]
+    fn parses_js_daemon_trust_score_shape() {
+        let parsed = parse_daemon_trust_score(&json!({
+            "score": {
+                "interactionScore": 0.72,
+                "endorsements": 3,
+                "endorsementScore": 0.66,
+                "completionRate": 0.8,
+                "totalInteractions": 12,
+                "recentSuccessRate": 0.9
+            },
+            "endorsements": [
+                { "from": "did:a", "to": "did:b", "score": 0.7, "reason": "solid", "timestamp": 1 }
+            ]
+        }))
+        .expect("parses js daemon response");
+
+        assert_eq!(parsed.score, 0.72);
+        assert_eq!(parsed.local_trust, 0.8);
+        assert_eq!(parsed.network_trust, 0.66);
+        assert_eq!(parsed.endorsement_count, 3);
+        assert_eq!(parsed.interaction_count, 12);
+        assert!(matches!(parsed.breakdown.recent_activity, ActivityLevel::High));
+        assert!(matches!(parsed.breakdown.network_position, NetworkPosition::Connected));
+    }
 }

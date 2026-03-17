@@ -100,7 +100,7 @@ pub async fn run(opts: SendOptions) -> Result<()> {
                     .and_then(|value| value.as_str())
                     .unwrap_or("unknown");
                 if opts.human {
-                    println!("Message accepted locally via daemon ({})", message_id);
+                    println!("Relay accepted message via daemon ({})", message_id);
                     if let Some(tid) = &thread_id {
                         println!("Thread: {}", tid);
                     }
@@ -115,7 +115,7 @@ pub async fn run(opts: SendOptions) -> Result<()> {
                     if let Some(tid) = &thread_id {
                         LlmFormatter::key_value("Thread ID", tid);
                     }
-                    LlmFormatter::key_value("Lifecycle", "accepted_locally");
+                    LlmFormatter::key_value("Lifecycle", "accepted");
                     LlmFormatter::key_value("Trace Hint", &format!("agent trace {}", message_id));
                     println!();
                 }

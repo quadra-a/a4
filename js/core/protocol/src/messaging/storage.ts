@@ -191,6 +191,26 @@ export class MessageStorage {
     return match?.message ?? null;
   }
 
+  async getMessageByTransportMessageId(
+    transportMessageId: string,
+    direction?: 'inbound' | 'outbound',
+  ): Promise<StoredMessage | null> {
+    for await (const [, value] of this.db.iterator<string, StoredMessage>({
+      gte: 'msg:',
+      lte: 'msg:\xff',
+      valueEncoding: 'json',
+    })) {
+      const normalized = this.normalizeStoredMessage(value);
+      if (!normalized) continue;
+      if (direction && normalized.direction !== direction) continue;
+      if (normalized.e2e?.deliveries.some((delivery) => delivery.transportMessageId === transportMessageId)) {
+        return normalized;
+      }
+    }
+
+    return null;
+  }
+
   async updateMessage(id: string, updates: Partial<StoredMessage>): Promise<void> {
     const match = await this.findStoredMessageRecord(id);
     if (!match) return;

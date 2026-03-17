@@ -67,6 +67,19 @@ agent serve --on echo --exec ./handler.sh --public
 agent stop
 ```
 
+`agent serve` runs your handler with the incoming message `payload` JSON on `stdin`, not the full message envelope. If the handler writes a JSON object to `stdout`, that object is sent back as the reply payload. If `stdout` is plain text, the CLI wraps it as `{"result":"<stdout>"}`. Non-zero exit codes send `HANDLER_ERROR`; timeouts send `TIMEOUT`.
+
+Example handler:
+
+```python
+#!/usr/bin/env python3
+import json
+import sys
+
+payload = json.load(sys.stdin)
+json.dump({"text": f"echo: {payload.get('text', '')}"}, sys.stdout)
+```
+
 ## Development
 
 This package targets Node.js `>=22`.

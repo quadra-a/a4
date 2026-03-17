@@ -18,8 +18,46 @@ interface PendingRequest {
   reject: (reason?: unknown) => void;
 }
 
+interface SocketAttemptError {
+  socketPath: string;
+  error: Error;
+}
+
+const MAX_DAEMON_CONNECT_ATTEMPTS = 4;
+const DAEMON_CONNECT_RETRY_BASE_MS = 40;
+
 function createRequestId(): string {
   return `req_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRetriableSocketError(error: Error): boolean {
+  const code = (error as NodeJS.ErrnoException).code;
+  return code === 'ENOENT'
+    || code === 'ECONNREFUSED'
+    || code === 'ECONNRESET'
+    || code === 'EPIPE'
+    || code === 'ETIMEDOUT';
+}
+
+function summarizeSocketAttemptErrors(errors: SocketAttemptError[]): string {
+  return errors
+    .map(({ socketPath, error }) => {
+      const code = (error as NodeJS.ErrnoException).code;
+      return `${socketPath}${code ? ` (${code})` : ''}: ${error.message}`;
+    })
+    .join('; ');
+}
+
+function buildDaemonConnectionError(errors: SocketAttemptError[]): Error {
+  if (errors.length === 0) {
+    return new Error('Failed to connect to daemon');
+  }
+
+  return new Error(`Failed to connect to daemon. Tried: ${summarizeSocketAttemptErrors(errors)}`);
 }
 
 export class DaemonClient {
@@ -35,17 +73,30 @@ export class DaemonClient {
     command: DaemonCommand,
     params: TParams,
   ): Promise<TData> {
-    let lastError: Error | null = null;
+    const errors: SocketAttemptError[] = [];
 
-    for (const socketPath of this.socketPaths) {
-      try {
-        return await this.sendViaSocketPath<TData, TParams>(socketPath, command, params);
-      } catch (error) {
-        lastError = error as Error;
+    for (let attempt = 0; attempt < MAX_DAEMON_CONNECT_ATTEMPTS; attempt += 1) {
+      errors.length = 0;
+
+      for (const socketPath of this.socketPaths) {
+        try {
+          return await this.sendViaSocketPath<TData, TParams>(socketPath, command, params);
+        } catch (error) {
+          errors.push({ socketPath, error: error as Error });
+        }
       }
+
+      const shouldRetry = attempt < MAX_DAEMON_CONNECT_ATTEMPTS - 1
+        && errors.length > 0
+        && errors.every(({ error }) => isRetriableSocketError(error));
+      if (!shouldRetry) {
+        break;
+      }
+
+      await sleep(DAEMON_CONNECT_RETRY_BASE_MS * (attempt + 1));
     }
 
-    throw lastError ?? new Error('Failed to connect to daemon');
+    throw buildDaemonConnectionError(errors);
   }
 
   async isDaemonRunning(): Promise<boolean> {
@@ -241,23 +292,36 @@ export class DaemonSubscriptionClient<TData = unknown> {
   }
 
   private async connectToFirstAvailableSocket(): Promise<Socket> {
-    let lastError: Error | null = null;
+    const errors: SocketAttemptError[] = [];
 
-    for (const socketPath of this.socketPaths) {
-      try {
-        return await new Promise<Socket>((resolve, reject) => {
-          const socket = connect(socketPath);
-          socket.once('connect', () => resolve(socket));
-          socket.once('error', (error) => {
-            socket.destroy();
-            reject(error);
+    for (let attempt = 0; attempt < MAX_DAEMON_CONNECT_ATTEMPTS; attempt += 1) {
+      errors.length = 0;
+
+      for (const socketPath of this.socketPaths) {
+        try {
+          return await new Promise<Socket>((resolve, reject) => {
+            const socket = connect(socketPath);
+            socket.once('connect', () => resolve(socket));
+            socket.once('error', (error) => {
+              socket.destroy();
+              reject(error);
+            });
           });
-        });
-      } catch (error) {
-        lastError = error as Error;
+        } catch (error) {
+          errors.push({ socketPath, error: error as Error });
+        }
       }
+
+      const shouldRetry = attempt < MAX_DAEMON_CONNECT_ATTEMPTS - 1
+        && errors.length > 0
+        && errors.every(({ error }) => isRetriableSocketError(error));
+      if (!shouldRetry) {
+        break;
+      }
+
+      await sleep(DAEMON_CONNECT_RETRY_BASE_MS * (attempt + 1));
     }
 
-    throw lastError ?? new Error('Failed to connect to daemon');
+    throw buildDaemonConnectionError(errors);
   }
 }

@@ -28,9 +28,16 @@ pub enum RelayWorkerCommand {
     SendEnvelope {
         to: String,
         envelope_bytes: Vec<u8>,
-        response: oneshot::Sender<Result<()>>,
+        response: oneshot::Sender<Result<RelaySendOutcome>>,
     },
     Stop,
+}
+
+#[derive(Clone, Debug)]
+pub struct RelaySendOutcome {
+    pub relay_message_id: String,
+    pub status: String,
+    pub reported_at: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -259,6 +266,79 @@ async fn maintain_relay_set(
     Ok(())
 }
 
+enum RelaySendError {
+    Recoverable(anyhow::Error),
+    Fatal(anyhow::Error),
+}
+
+impl RelaySendError {
+    fn into_anyhow(self) -> anyhow::Error {
+        match self {
+            Self::Recoverable(error) | Self::Fatal(error) => error,
+        }
+    }
+
+    fn is_fatal(&self) -> bool {
+        matches!(self, Self::Fatal(_))
+    }
+}
+
+async fn wait_for_send_acceptance(
+    session: &mut RelaySession,
+    relay_url: &str,
+    event_tx: &mpsc::Sender<RelayWorkerEvent>,
+) -> std::result::Result<RelaySendOutcome, RelaySendError> {
+    loop {
+        let (message_id, status) = session
+            .wait_delivery_report_with_id()
+            .await
+            .map_err(RelaySendError::Fatal)?;
+        let reported_at = now_ms();
+        match status.as_str() {
+            "accepted" => {
+                return Ok(RelaySendOutcome {
+                    relay_message_id: message_id,
+                    status,
+                    reported_at,
+                });
+            }
+            "queue_full" => {
+                return Err(RelaySendError::Recoverable(anyhow::anyhow!(
+                    "Relay queue full for recipient"
+                )));
+            }
+            "unknown_recipient" => {
+                return Err(RelaySendError::Recoverable(anyhow::anyhow!(
+                    "Recipient not found on relay"
+                )));
+            }
+            "expired" => {
+                return Err(RelaySendError::Recoverable(anyhow::anyhow!(
+                    "Relay delivery expired before acceptance"
+                )));
+            }
+            "delivered" => {
+                emit_event(
+                    event_tx,
+                    RelayWorkerEvent::DeliveryReported {
+                        relay_url: relay_url.to_string(),
+                        message_id,
+                        status,
+                        received_at: reported_at,
+                    },
+                )
+                .await;
+            }
+            other => {
+                return Err(RelaySendError::Fatal(anyhow::anyhow!(
+                    "Unexpected relay delivery report while waiting for acceptance: {}",
+                    other
+                )));
+            }
+        }
+    }
+}
+
 pub async fn run_relay_worker(
     mut relay_state: ManagedRelayState,
     mut relay_rx: mpsc::Receiver<RelayWorkerCommand>,
@@ -305,13 +385,26 @@ pub async fn run_relay_worker(
                 maybe_command = relay_rx.recv() => {
                     match maybe_command {
                         Some(RelayWorkerCommand::SendEnvelope { to, envelope_bytes, response }) => {
-                            let result = session.send_envelope(&to, envelope_bytes).await;
-                            if let Err(error) = &result {
+                            let result = match session.send_envelope(&to, envelope_bytes).await {
+                                Ok(()) => wait_for_send_acceptance(&mut session, &relay_url, &event_tx)
+                                    .await
+                                    .map_err(|error| {
+                                        let should_disconnect = error.is_fatal();
+                                        (error.into_anyhow(), should_disconnect)
+                                    }),
+                                Err(error) => Err((error, true)),
+                            };
+                            if let Err((error, true)) = &result {
                                 record_failure(&mut relay_state, &event_tx, &relay_url, error.to_string()).await;
                             }
-                            let failed = result.is_err();
-                            let _ = response.send(result);
-                            if failed {
+                            let should_disconnect = result
+                                .as_ref()
+                                .err()
+                                .map(|(_, should_disconnect)| *should_disconnect)
+                                .unwrap_or(false);
+                            let response_result = result.map_err(|(error, _)| error);
+                            let _ = response.send(response_result);
+                            if should_disconnect {
                                 break;
                             }
                         }

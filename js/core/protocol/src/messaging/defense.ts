@@ -34,6 +34,11 @@ export interface DefenseConfig {
   seenTtlMs?: number;
 }
 
+export interface DefenseCheckOptions {
+  /** True when the inbound envelope is a reply to a locally queued outbound message. */
+  solicitedReply?: boolean;
+}
+
 export class DefenseMiddleware {
   private readonly trust: TrustSystem;
   private readonly storage: MessageStorage;
@@ -65,8 +70,9 @@ export class DefenseMiddleware {
    * Returns { allowed: true } if the message should be processed,
    * or { allowed: false, reason } if it should be dropped.
    */
-  async checkMessage(envelope: MessageEnvelope): Promise<DefenseResult> {
+  async checkMessage(envelope: MessageEnvelope, options: DefenseCheckOptions = {}): Promise<DefenseResult> {
     const did = envelope.from;
+    const solicitedReply = options.solicitedReply === true;
 
     // 1. Allowlist bypass — skip all other checks
     if (await this.isAllowed(did)) {
@@ -75,13 +81,26 @@ export class DefenseMiddleware {
     }
 
     // 2. Blocklist check
-    if (await this.isBlocked(did)) {
+    const blockEntry = await this.storage.getBlock(did);
+    const bypassAutoBlockForSolicitedReply = Boolean(
+      solicitedReply
+      && blockEntry
+      && blockEntry.reason.startsWith('Auto-blocked: '),
+    );
+    if (blockEntry && !bypassAutoBlockForSolicitedReply) {
       logger.debug('Message rejected: blocked', { id: envelope.id, from: did });
       return { allowed: false, reason: 'blocked' };
     }
+    if (bypassAutoBlockForSolicitedReply) {
+      logger.info('Bypassing auto-block for solicited reply', {
+        id: envelope.id,
+        from: did,
+        replyTo: envelope.replyTo,
+      });
+    }
 
     // 2.5. Sybil / rate-limit check (in-memory, resets on daemon restart)
-    if (this.trust.isRateLimited(did)) {
+    if (!solicitedReply && this.trust.isRateLimited(did)) {
       logger.debug('Message rejected: sybil rate limited', { id: envelope.id, from: did });
       return { allowed: false, reason: 'rate_limited' };
     }
@@ -104,8 +123,9 @@ export class DefenseMiddleware {
       const recentFailureRate = 1 - (score.recentSuccessRate ?? 1);
 
       // Suspicious: ≥10 interactions, recent failure rate > 50%
-      // Don't auto-block yet, but force strictest rate limit tier
-      if (totalInteractions >= 10 && recentFailureRate > 0.5) {
+      // Don't auto-block yet, but force strictest rate limit tier.
+      // Solicited replies should not be penalized by the receiver's ingress defenses.
+      if (!solicitedReply && totalInteractions >= 10 && recentFailureRate > 0.5) {
         logger.warn('Suspicious agent detected', { did, recentFailureRate: recentFailureRate.toFixed(2), totalInteractions });
         trustScore = 0; // Force strictest rate limit tier
       }
@@ -115,13 +135,13 @@ export class DefenseMiddleware {
       const unblockTime = this.recentlyUnblocked.get(did);
       const inGracePeriod = unblockTime && (Date.now() - unblockTime) < this.UNBLOCK_GRACE_PERIOD_MS;
 
-      if (totalInteractions >= 20 && recentFailureRate > 0.7 && !inGracePeriod) {
+      if (!solicitedReply && totalInteractions >= 20 && recentFailureRate > 0.7 && !inGracePeriod) {
         logger.warn('Auto-blocking high-failure-rate agent', { did, recentFailureRate: recentFailureRate.toFixed(2), totalInteractions });
         await this.blockAgent(did, `Auto-blocked: ${(recentFailureRate * 100).toFixed(0)}% failure rate over last 20 interactions`);
         return { allowed: false, reason: 'blocked' };
       }
 
-      if (trustScore < this.minTrustScore) {
+      if (!solicitedReply && trustScore < this.minTrustScore) {
         logger.debug('Message rejected: trust too low', { id: envelope.id, trustScore });
         return { allowed: false, reason: 'trust_too_low', trustScore };
       }
@@ -130,24 +150,33 @@ export class DefenseMiddleware {
     }
 
     // 5. Rate limiting (tiered by trust)
-    const rateLimitResult = await this.checkRateLimit(did, trustScore);
-    if (!rateLimitResult.allowed) {
-      logger.debug('Message rejected: rate limited', {
-        id: envelope.id,
-        from: did,
-        resetTime: rateLimitResult.resetTime,
-      });
-      return {
-        allowed: false,
-        reason: 'rate_limited',
-        remainingTokens: rateLimitResult.remaining,
-        resetTime: rateLimitResult.resetTime,
-      };
+    let rateLimitResult: RateLimitResult | undefined;
+    if (!solicitedReply) {
+      rateLimitResult = await this.checkRateLimit(did, trustScore);
+      if (!rateLimitResult.allowed) {
+        logger.debug('Message rejected: rate limited', {
+          id: envelope.id,
+          from: did,
+          resetTime: rateLimitResult.resetTime,
+        });
+        return {
+          allowed: false,
+          reason: 'rate_limited',
+          remainingTokens: rateLimitResult.remaining,
+          resetTime: rateLimitResult.resetTime,
+        };
+      }
     }
 
     // All checks passed
     this.markAsSeen(envelope.id);
-    return { allowed: true, trustScore, trustStatus, remainingTokens: rateLimitResult.remaining };
+    return {
+      allowed: true,
+      trustScore,
+      trustStatus,
+      remainingTokens: rateLimitResult?.remaining,
+      resetTime: rateLimitResult?.resetTime,
+    };
   }
 
   // ─── Blocklist ────────────────────────────────────────────────────────────

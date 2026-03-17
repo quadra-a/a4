@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
 
 pub const DEFAULT_MAX_STORED_MESSAGES: usize = 1000;
 
@@ -16,7 +18,8 @@ pub enum MessageDirection {
 #[serde(rename_all = "lowercase")]
 pub enum E2EDeliveryState {
     Pending,
-    Sent,
+    Accepted,
+    Delivered,
     Received,
     Failed,
 }
@@ -24,6 +27,12 @@ pub enum E2EDeliveryState {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct E2EDeliveryMetadata {
     pub transport: String,
+    #[serde(
+        default,
+        rename = "transportMessageId",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub transport_message_id: Option<String>,
     #[serde(rename = "senderDeviceId")]
     pub sender_device_id: String,
     #[serde(rename = "receiverDeviceId")]
@@ -165,6 +174,29 @@ fn build_e2e_delivery_key(delivery: &E2EDeliveryMetadata) -> String {
     )
 }
 
+fn delivery_state_rank(state: &E2EDeliveryState) -> u8 {
+    match state {
+        E2EDeliveryState::Pending => 0,
+        E2EDeliveryState::Accepted => 1,
+        E2EDeliveryState::Delivered => 2,
+        E2EDeliveryState::Received => 3,
+        E2EDeliveryState::Failed => 4,
+    }
+}
+
+fn merge_delivery_state(
+    current: &E2EDeliveryState,
+    incoming: &E2EDeliveryState,
+) -> E2EDeliveryState {
+    match (current, incoming) {
+        (E2EDeliveryState::Delivered | E2EDeliveryState::Received, E2EDeliveryState::Failed) => {
+            current.clone()
+        }
+        _ if delivery_state_rank(incoming) >= delivery_state_rank(current) => incoming.clone(),
+        _ => current.clone(),
+    }
+}
+
 fn merge_e2e_deliveries(
     existing: &[E2EDeliveryMetadata],
     incoming: &[E2EDeliveryMetadata],
@@ -179,15 +211,19 @@ fn merge_e2e_deliveries(
         let key = build_e2e_delivery_key(delivery);
         if let Some(current) = merged.get_mut(&key) {
             current.transport = delivery.transport.clone();
-            current.state = delivery.state.clone();
+            if delivery.transport_message_id.is_some() {
+                current.transport_message_id = delivery.transport_message_id.clone();
+            }
+            current.state = merge_delivery_state(&current.state, &delivery.state);
             current.recorded_at = delivery.recorded_at;
             if delivery.used_skipped_message_key.is_some() {
                 current.used_skipped_message_key = delivery.used_skipped_message_key;
             }
-            current.error = match (&delivery.error, &delivery.state) {
+            current.error = match (&delivery.error, &current.state) {
+                (_, E2EDeliveryState::Delivered | E2EDeliveryState::Received) => None,
                 (Some(error), _) => Some(error.clone()),
                 (None, E2EDeliveryState::Failed) => current.error.clone(),
-                (None, _) => None,
+                (None, _) => current.error.take(),
             };
         } else {
             merged.insert(key, delivery.clone());
@@ -245,6 +281,13 @@ pub struct MessageStore {
     max_messages: usize,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedMessageStore {
+    messages: Vec<StoredMessage>,
+    #[serde(rename = "maxMessages")]
+    max_messages: usize,
+}
+
 impl Default for MessageStore {
     fn default() -> Self {
         Self::new(DEFAULT_MAX_STORED_MESSAGES)
@@ -265,6 +308,10 @@ impl MessageStore {
 
     pub fn is_empty(&self) -> bool {
         self.messages.is_empty()
+    }
+
+    pub fn all_messages(&self) -> &[StoredMessage] {
+        &self.messages
     }
 
     pub fn store(&mut self, message: StoredMessage) {
@@ -332,6 +379,13 @@ impl MessageStore {
         }
 
         marked
+    }
+
+    pub fn remove_inbound_from(&mut self, did: &str) -> usize {
+        let before = self.messages.len();
+        self.messages
+            .retain(|message| !(message.direction == MessageDirection::Inbound && message.from == did));
+        before.saturating_sub(self.messages.len())
     }
 
     pub fn session_summaries(&self, peer_filter: Option<&str>) -> Vec<SessionSummary> {
@@ -442,6 +496,36 @@ impl MessageStore {
         true
     }
 
+    pub fn update_e2e_delivery_by_transport_message_id(
+        &mut self,
+        transport_message_id: &str,
+        state: E2EDeliveryState,
+        recorded_at: u64,
+        error: Option<String>,
+    ) -> bool {
+        for message in &mut self.messages {
+            let Some(e2e) = message.e2e.as_mut() else {
+                continue;
+            };
+            let Some(delivery) = e2e.deliveries.iter_mut().find(|delivery| {
+                delivery.transport_message_id.as_deref() == Some(transport_message_id)
+            }) else {
+                continue;
+            };
+
+            delivery.state = merge_delivery_state(&delivery.state, &state);
+            delivery.recorded_at = recorded_at;
+            delivery.error = match (&error, &delivery.state) {
+                (_, E2EDeliveryState::Delivered | E2EDeliveryState::Received) => None,
+                (Some(error), _) => Some(error.clone()),
+                (None, _) => delivery.error.take(),
+            };
+            return true;
+        }
+
+        false
+    }
+
     pub fn get_message(
         &self,
         message_id: &str,
@@ -452,6 +536,68 @@ impl MessageStore {
             .find(|message| message.id == message_id && message.direction == direction)
             .cloned()
     }
+
+    pub fn get_message_by_transport_message_id(
+        &self,
+        transport_message_id: &str,
+        direction: MessageDirection,
+    ) -> Option<StoredMessage> {
+        self.messages
+            .iter()
+            .find(|message| {
+                message.direction == direction
+                    && message
+                        .e2e
+                        .as_ref()
+                        .map(|metadata| {
+                            metadata.deliveries.iter().any(|delivery| {
+                                delivery.transport_message_id.as_deref()
+                                    == Some(transport_message_id)
+                            })
+                        })
+                        .unwrap_or(false)
+            })
+            .cloned()
+    }
+
+    pub fn save_to_path(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create {}", parent.display()))?;
+        }
+
+        let payload = PersistedMessageStore {
+            messages: self.messages.clone(),
+            max_messages: self.max_messages,
+        };
+        let bytes = serde_json::to_vec_pretty(&payload)?;
+        let temp_path = path.with_extension("tmp");
+        fs::write(&temp_path, bytes)
+            .with_context(|| format!("Failed to write {}", temp_path.display()))?;
+        fs::rename(&temp_path, path).with_context(|| {
+            format!(
+                "Failed to rename {} to {}",
+                temp_path.display(),
+                path.display()
+            )
+        })?;
+        Ok(())
+    }
+
+    pub fn load_from_path(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+
+        let bytes = fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?;
+        let persisted: PersistedMessageStore = serde_json::from_slice(&bytes)
+            .with_context(|| format!("Failed to parse {}", path.display()))?;
+        let mut store = Self::new(persisted.max_messages);
+        for message in persisted.messages {
+            store.store(message);
+        }
+        Ok(store)
+    }
 }
 
 #[cfg(test)]
@@ -461,6 +607,7 @@ mod tests {
         E2ERetryMetadata, MessageDirection, MessageStore, StoredMessage, StoredMessageE2EMetadata,
     };
     use serde_json::json;
+    use std::fs;
 
     #[test]
     fn groups_direct_messages_into_synthetic_sessions() {
@@ -606,6 +753,7 @@ mod tests {
             e2e: Some(StoredMessageE2EMetadata {
                 deliveries: vec![E2EDeliveryMetadata {
                     transport: "prekey".to_string(),
+                    transport_message_id: None,
                     sender_device_id: "device-alice".to_string(),
                     receiver_device_id: "device-me-primary".to_string(),
                     session_id: "session-a".to_string(),
@@ -629,6 +777,7 @@ mod tests {
             e2e: Some(StoredMessageE2EMetadata {
                 deliveries: vec![E2EDeliveryMetadata {
                     transport: "session".to_string(),
+                    transport_message_id: None,
                     sender_device_id: "device-alice".to_string(),
                     receiver_device_id: "device-me-secondary".to_string(),
                     session_id: "session-b".to_string(),
@@ -704,6 +853,87 @@ mod tests {
     }
 
     #[test]
+    fn update_delivery_by_transport_message_id_preserves_terminal_success() {
+        let mut store = MessageStore::new(10);
+        store.store(StoredMessage {
+            id: "msg-transport".to_string(),
+            from: "did:agent:me".to_string(),
+            to: "did:agent:peer".to_string(),
+            envelope: json!({"payload": {"text": "hello"}}),
+            timestamp: 10,
+            thread_id: None,
+            read: true,
+            direction: MessageDirection::Outbound,
+            e2e: Some(StoredMessageE2EMetadata {
+                deliveries: vec![E2EDeliveryMetadata {
+                    transport: "session".to_string(),
+                    transport_message_id: Some("relay-1".to_string()),
+                    sender_device_id: "device-me".to_string(),
+                    receiver_device_id: "device-peer".to_string(),
+                    session_id: "session-1".to_string(),
+                    state: E2EDeliveryState::Delivered,
+                    recorded_at: 11,
+                    used_skipped_message_key: None,
+                    error: None,
+                }],
+                retry: None,
+            }),
+        });
+
+        assert!(store.update_e2e_delivery_by_transport_message_id(
+            "relay-1",
+            E2EDeliveryState::Failed,
+            12,
+            Some("expired".to_string()),
+        ));
+
+        let stored = store
+            .get_message("msg-transport", MessageDirection::Outbound)
+            .expect("message exists");
+        let delivery = &stored
+            .e2e
+            .expect("e2e metadata")
+            .deliveries[0];
+        assert_eq!(delivery.state, E2EDeliveryState::Delivered);
+        assert_eq!(delivery.error, None);
+        assert_eq!(delivery.transport_message_id.as_deref(), Some("relay-1"));
+    }
+
+    #[test]
+    fn get_message_by_transport_message_id_finds_outbound_message() {
+        let mut store = MessageStore::new(10);
+        store.store(StoredMessage {
+            id: "msg-lookup".to_string(),
+            from: "did:agent:me".to_string(),
+            to: "did:agent:peer".to_string(),
+            envelope: json!({"payload": {"text": "hello"}}),
+            timestamp: 10,
+            thread_id: None,
+            read: true,
+            direction: MessageDirection::Outbound,
+            e2e: Some(StoredMessageE2EMetadata {
+                deliveries: vec![E2EDeliveryMetadata {
+                    transport: "session".to_string(),
+                    transport_message_id: Some("relay-lookup".to_string()),
+                    sender_device_id: "device-me".to_string(),
+                    receiver_device_id: "device-peer".to_string(),
+                    session_id: "session-1".to_string(),
+                    state: E2EDeliveryState::Accepted,
+                    recorded_at: 10,
+                    used_skipped_message_key: None,
+                    error: None,
+                }],
+                retry: None,
+            }),
+        });
+
+        let stored = store
+            .get_message_by_transport_message_id("relay-lookup", MessageDirection::Outbound)
+            .expect("message exists");
+        assert_eq!(stored.id, "msg-lookup");
+    }
+
+    #[test]
     fn parses_json_envelope_payloads() {
         let envelope = parse_envelope_value(br#"{"id":"msg-1","protocol":"highway1/chat/1.0"}"#)
             .expect("json envelope should parse");
@@ -719,5 +949,41 @@ mod tests {
     fn rejects_invalid_envelope_payloads() {
         let err = parse_envelope_value(&[0xff, 0x00]).expect_err("invalid payload should fail");
         assert!(err.to_string().contains("Invalid envelope payload"));
+    }
+
+    #[test]
+    fn persists_messages_to_disk_and_loads_them_back() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be valid")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("a4-message-store-{}.json", unique));
+        let mut store = MessageStore::new(10);
+        store.store(StoredMessage {
+            id: "msg-persist".to_string(),
+            from: "did:agent:alice".to_string(),
+            to: "did:agent:bob".to_string(),
+            envelope: json!({"payload": {"text": "hello"}}),
+            timestamp: 10,
+            thread_id: Some("thread-1".to_string()),
+            read: false,
+            direction: MessageDirection::Inbound,
+            e2e: None,
+        });
+
+        store.save_to_path(&path).expect("store saved");
+        let loaded = MessageStore::load_from_path(&path).expect("store loaded");
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(
+            loaded
+                .get_message("msg-persist", MessageDirection::Inbound)
+                .expect("message present")
+                .thread_id
+                .as_deref(),
+            Some("thread-1")
+        );
+
+        let _ = fs::remove_file(&path);
     }
 }

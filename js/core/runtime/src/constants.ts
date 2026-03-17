@@ -49,7 +49,14 @@ export function getDaemonSocketClientCandidates(runtime: 'js' | 'rs' = 'js'): st
     return [process.env.QUADRA_A_SOCKET_PATH];
   }
 
-  return uniquePaths([getDaemonSocketPath(runtime), getLegacyDaemonSocketPath(runtime)]);
+  const peerRuntime = runtime === 'js' ? 'rs' : 'js';
+
+  return uniquePaths([
+    getDaemonSocketPath(runtime),
+    getDaemonSocketPath(peerRuntime),
+    getLegacyDaemonSocketPath(runtime),
+    getLegacyDaemonSocketPath(peerRuntime),
+  ]);
 }
 
 export function getPeerDaemonSocketPath(runtime: 'js' | 'rs' = 'js'): string {

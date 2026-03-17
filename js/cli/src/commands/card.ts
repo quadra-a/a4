@@ -10,8 +10,10 @@ export function registerCardCommand(program: Command): void {
     .command('show')
     .description('Show current Agent Card')
     .option('--format <fmt>', 'Output format: text|json', 'text')
+    .option('--json', 'Output as JSON (alias for --format json)')
     .action(async (options) => {
       try {
+        if (options.json) options.format = 'json';
         const agentCard = getAgentCard();
 
         if (!agentCard) {

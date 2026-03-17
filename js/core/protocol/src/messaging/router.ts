@@ -34,6 +34,15 @@ export function createMessageRouter(
   const handlers = new Map<string, MessageHandler>();
   let catchAllHandler: MessageHandler | undefined;
 
+  const sendEncodedEnvelope = async (to: string, encoded: Uint8Array): Promise<void> => {
+    if (typeof relayClient.sendEnvelopeAwaitAccepted === 'function') {
+      await relayClient.sendEnvelopeAwaitAccepted(to, encoded);
+      return;
+    }
+
+    await relayClient.sendEnvelope(to, encoded);
+  };
+
   return {
     registerHandler: (protocol: string, handler: MessageHandler) => {
       handlers.set(protocol, handler);
@@ -57,7 +66,7 @@ export function createMessageRouter(
         }
 
         const encoded = encodeMessage(envelope);
-        await relayClient.sendEnvelope(envelope.to, encoded);
+        await sendEncodedEnvelope(envelope.to, encoded);
 
         logger.info('Message sent via relay', {
           id: envelope.id,
@@ -163,7 +172,7 @@ export function createMessageRouter(
 
           if (response) {
             const encoded = encodeMessage(response);
-            await relayClient.sendEnvelope(response.to, encoded);
+            await sendEncodedEnvelope(response.to, encoded);
             logger.info('Sent reply back to sender', {
               responseId: response.id,
               replyTo: response.replyTo,

@@ -22,77 +22,84 @@ async function daemonRunning(): Promise<boolean> {
   return new DaemonClient().isDaemonRunning();
 }
 
+function isUnsupportedDaemonCommand(error: unknown): boolean {
+  return error instanceof Error
+    && (error.message.includes('Unknown command') || error.message.includes('Failed to connect to daemon'));
+}
+
+function buildOfflineStatus(policy: ReachabilityPolicy): ReachabilityStatus {
+  return {
+    connectedProviders: [],
+    knownProviders: policy.bootstrapProviders,
+    lastDiscoveryAt: null,
+    providerFailures: [],
+    targetProviderCount: policy.targetProviderCount,
+    mode: policy.mode,
+    autoDiscoverProviders: policy.autoDiscoverProviders,
+    operatorLock: policy.operatorLock,
+    bootstrapProviders: policy.bootstrapProviders,
+  };
+}
+
 async function readPolicyAndStatus(): Promise<{ policy: ReachabilityPolicy; status: ReachabilityStatus }> {
   if (await daemonRunning()) {
-    const [policyResponse, status] = await Promise.all([
-      getDaemonReachabilityPolicy(),
-      getDaemonReachabilityStatus(),
-    ]);
+    try {
+      const [policyResponse, status] = await Promise.all([
+        getDaemonReachabilityPolicy(),
+        getDaemonReachabilityStatus(),
+      ]);
 
-    return {
-      policy: policyResponse.policy,
-      status,
-    };
+      return {
+        policy: policyResponse.policy,
+        status,
+      };
+    } catch (error) {
+      if (!isUnsupportedDaemonCommand(error)) {
+        throw error;
+      }
+    }
   }
 
   const policy = getReachabilityPolicy();
   return {
     policy,
-    status: {
-      connectedProviders: [],
-      knownProviders: policy.bootstrapProviders,
-      lastDiscoveryAt: null,
-      providerFailures: [],
-      targetProviderCount: policy.targetProviderCount,
-      mode: policy.mode,
-      autoDiscoverProviders: policy.autoDiscoverProviders,
-      operatorLock: policy.operatorLock,
-      bootstrapProviders: policy.bootstrapProviders,
-    },
+    status: buildOfflineStatus(policy),
   };
 }
 
 async function applyPatch(patch: Partial<ReachabilityPolicy>): Promise<{ policy: ReachabilityPolicy; status: ReachabilityStatus }> {
   if (await daemonRunning()) {
-    return setDaemonReachabilityPolicy(patch);
+    try {
+      return await setDaemonReachabilityPolicy(patch);
+    } catch (error) {
+      if (!isUnsupportedDaemonCommand(error)) {
+        throw error;
+      }
+    }
   }
 
   const policy = updateReachabilityPolicy(patch);
   return {
     policy,
-    status: {
-      connectedProviders: [],
-      knownProviders: policy.bootstrapProviders,
-      lastDiscoveryAt: null,
-      providerFailures: [],
-      targetProviderCount: policy.targetProviderCount,
-      mode: policy.mode,
-      autoDiscoverProviders: policy.autoDiscoverProviders,
-      operatorLock: policy.operatorLock,
-      bootstrapProviders: policy.bootstrapProviders,
-    },
+    status: buildOfflineStatus(policy),
   };
 }
 
 async function resetPolicy(): Promise<{ policy: ReachabilityPolicy; status: ReachabilityStatus }> {
   if (await daemonRunning()) {
-    return resetDaemonReachabilityPolicy();
+    try {
+      return await resetDaemonReachabilityPolicy();
+    } catch (error) {
+      if (!isUnsupportedDaemonCommand(error)) {
+        throw error;
+      }
+    }
   }
 
   const policy = resetReachabilityPolicy();
   return {
     policy,
-    status: {
-      connectedProviders: [],
-      knownProviders: policy.bootstrapProviders,
-      lastDiscoveryAt: null,
-      providerFailures: [],
-      targetProviderCount: policy.targetProviderCount,
-      mode: policy.mode,
-      autoDiscoverProviders: policy.autoDiscoverProviders,
-      operatorLock: policy.operatorLock,
-      bootstrapProviders: policy.bootstrapProviders,
-    },
+    status: buildOfflineStatus(policy),
   };
 }
 
@@ -120,8 +127,10 @@ export function registerReachabilityCommand(program: Command): void {
     .command('show')
     .description('Show current reachability policy and runtime status')
     .option('--format <fmt>', 'Output format: text|json', 'text')
+    .option('--json', 'Output as JSON (alias for --format json)')
     .action(async (options) => {
       try {
+        if (options.json) options.format = 'json';
         const { policy, status } = await readPolicyAndStatus();
         if (options.format === 'json') {
           console.log(JSON.stringify({ policy, status }, null, 2));

@@ -7,6 +7,7 @@ import {
   resolveTargetDid,
   resolveThreadId,
   resolveTellBody,
+  validateTellBodyInput,
   type DiscoveryCapability,
 } from '../services/messaging.js';
 import {
@@ -35,17 +36,61 @@ function serializeStoredMessage(message: StoredMessage | null) {
   };
 }
 
-function extractPrimaryProtocol(capabilities?: DiscoveryCapability[]): string | null {
+export function extractPrimaryProtocol(capabilities?: DiscoveryCapability[]): string | null {
   if (!capabilities) return null;
 
+  const declaredProtocols = new Set<string>();
   for (const cap of capabilities) {
-    const capId = typeof cap === 'string' ? cap : cap.id;
-    if (capId === 'shell/exec' || capId === 'gpu/compute') {
-      return '/shell/exec/1.0.0';
+    if (typeof cap === 'string') continue;
+
+    const metadataProtocol = cap.metadata?.protocol;
+    if (typeof metadataProtocol === 'string' && metadataProtocol.trim()) {
+      declaredProtocols.add(metadataProtocol.trim());
     }
   }
 
-  return null;
+  return declaredProtocols.size === 1 ? [...declaredProtocols][0] : null;
+}
+
+function collectDeclaredProtocols(capabilities?: DiscoveryCapability[]): string[] {
+  if (!capabilities) {
+    return [];
+  }
+
+  return [...new Set(
+    capabilities.flatMap((cap) => {
+      if (typeof cap === 'string') {
+        return [];
+      }
+
+      const metadataProtocol = cap.metadata?.protocol;
+      return typeof metadataProtocol === 'string' && metadataProtocol.trim()
+        ? [metadataProtocol.trim()]
+        : [];
+    }),
+  )];
+}
+
+function describeDeclaredProtocols(protocols: string[]): string {
+  return protocols.map((protocol) => `"${protocol}"`).join(', ');
+}
+
+function unwrapQueriedCapabilities(
+  response: { capabilities?: DiscoveryCapability[] } | { card?: { capabilities?: DiscoveryCapability[] } } | null | undefined,
+): DiscoveryCapability[] | undefined {
+  if (!response) {
+    return undefined;
+  }
+
+  if (Array.isArray(response.capabilities)) {
+    return response.capabilities;
+  }
+
+  if ('card' in response && Array.isArray(response.card?.capabilities)) {
+    return response.card.capabilities;
+  }
+
+  return undefined;
 }
 
 export function registerTellCommand(program: Command): void {
@@ -72,6 +117,13 @@ export function registerTellCommand(program: Command): void {
         }
 
         const isHuman = Boolean(options.human) && options.format !== 'json';
+        validateTellBodyInput({
+          message,
+          body: options.body,
+          bodyFile: options.bodyFile,
+          bodyStdin: options.bodyStdin,
+          bodyFormat: options.bodyFormat,
+        });
         const waitTimeoutMs = parseWaitTimeoutMs(options.wait);
         const replyTo = options.replyTo
           ? ((await resolveQueuedMessageId(options.replyTo)) ?? options.replyTo)
@@ -94,15 +146,18 @@ export function registerTellCommand(program: Command): void {
           : 'default';
         let protocolSelectionReason: string | null = null;
         if (protocolSelection !== 'explicit' && effectiveProtocol === '/agent/msg/1.0.0') {
-          let detectedProtocol = resolved.agent ? extractPrimaryProtocol(resolved.agent.capabilities) : null;
+          let declaredProtocols = resolved.agent ? collectDeclaredProtocols(resolved.agent.capabilities) : [];
 
-          if (!detectedProtocol) {
+          if (declaredProtocols.length === 0) {
             try {
               const client = new DaemonClient();
               if (await client.isDaemonRunning()) {
-                const response = await client.send<{ card?: { capabilities?: DiscoveryCapability[] } }>('query_agent_card', { did: resolved.did });
-                if (response.card?.capabilities) {
-                  detectedProtocol = extractPrimaryProtocol(response.card.capabilities);
+                const response = await client.send<
+                  { capabilities?: DiscoveryCapability[] } | { card?: { capabilities?: DiscoveryCapability[] } } | null
+                >('query_agent_card', { did: resolved.did });
+                const queriedCapabilities = unwrapQueriedCapabilities(response);
+                if (queriedCapabilities) {
+                  declaredProtocols = collectDeclaredProtocols(queriedCapabilities);
                 }
               }
             } catch {
@@ -110,8 +165,14 @@ export function registerTellCommand(program: Command): void {
             }
           }
 
-          if (detectedProtocol) {
-            effectiveProtocol = detectedProtocol;
+          if (declaredProtocols.length > 1) {
+            throw new Error(
+              `Target advertises multiple protocols (${describeDeclaredProtocols(declaredProtocols)}). Pass --protocol explicitly.`
+            );
+          }
+
+          if (declaredProtocols.length === 1) {
+            effectiveProtocol = declaredProtocols[0];
             protocolSelection = 'auto';
             protocolSelectionReason = 'auto-selected from target capabilities';
           }

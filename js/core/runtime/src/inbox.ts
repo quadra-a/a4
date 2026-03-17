@@ -279,6 +279,15 @@ async function waitForMessageOutcomeViaSubscription(
       }
     }
 
+    const pollingPromise = waitForMessageOutcomeViaPolling(client, messageId, timeoutMs)
+      .then((outcome) => {
+        if (!outcome || settled) {
+          return null;
+        }
+        settled = true;
+        return outcome;
+      });
+
     const timeoutPromise = new Promise<null>((resolve) => {
       timeoutHandle = setTimeout(() => {
         if (settled) return;
@@ -287,7 +296,7 @@ async function waitForMessageOutcomeViaSubscription(
       }, timeoutMs);
     });
 
-    return await Promise.race([eventPromise, timeoutPromise]);
+    return await Promise.race([eventPromise, pollingPromise, timeoutPromise]);
   } finally {
     clearTimeout(timeoutHandle);
     await subscriptionClient.close().catch(() => undefined);
@@ -356,6 +365,15 @@ async function waitForInboxMessageViaSubscription(
       return existing.messages[0];
     }
 
+    const pollingPromise = waitForInboxMessageViaPolling(client, filter, timeoutMs)
+      .then((message) => {
+        if (!message || settled) {
+          return null;
+        }
+        settled = true;
+        return message;
+      });
+
     const timeoutPromise = new Promise<null>((resolve) => {
       timeoutHandle = setTimeout(() => {
         if (settled) return;
@@ -364,7 +382,7 @@ async function waitForInboxMessageViaSubscription(
       }, timeoutMs);
     });
 
-    return await Promise.race([eventPromise, timeoutPromise]);
+    return await Promise.race([eventPromise, pollingPromise, timeoutPromise]);
   } finally {
     clearTimeout(timeoutHandle);
     await subscriptionClient.close().catch(() => undefined);

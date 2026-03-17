@@ -6,7 +6,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 use crate::commands::message_lifecycle::{
-    envelope_payload, MessageOutcome, MessageOutcomeKind, MessageOutcomeTracker,
+    envelope_payload, envelope_type, message_id, message_timestamp, protocol, reply_to,
+    source_did, MessageOutcome, MessageOutcomeKind, MessageOutcomeTracker,
 };
 use crate::config::load_config;
 use crate::daemon::{daemon_socket_path, DaemonClient};
@@ -121,7 +122,7 @@ fn read_stdin_body() -> Result<String> {
     Ok(body)
 }
 
-fn resolve_tell_body(opts: &TellOptions, effective_protocol: &str) -> Result<ResolvedTellBody> {
+fn validate_tell_body_input(opts: &TellOptions) -> Result<()> {
     let mut source_count = 0;
     if opts.message.is_some() {
         source_count += 1;
@@ -142,13 +143,26 @@ fn resolve_tell_body(opts: &TellOptions, effective_protocol: &str) -> Result<Res
         );
     }
 
-    if let Some(message) = &opts.message {
+    if opts.message.is_some() {
         if let Some(body_format) = opts.body_format.as_deref() {
             if body_format.trim() != "text" {
                 bail!("Positional message always uses --body-format text");
             }
         }
+        return Ok(());
+    }
 
+    if opts.body_format.is_none() {
+        bail!("Body format is required with --body, --body-file, and --body-stdin");
+    }
+
+    Ok(())
+}
+
+fn resolve_tell_body(opts: &TellOptions, effective_protocol: &str) -> Result<ResolvedTellBody> {
+    validate_tell_body_input(opts)?;
+
+    if let Some(message) = &opts.message {
         return Ok(ResolvedTellBody {
             format: TellBodyFormat::Text,
             payload: wrap_text_body(effective_protocol, message),
@@ -180,6 +194,7 @@ fn resolve_tell_body(opts: &TellOptions, effective_protocol: &str) -> Result<Res
 }
 
 pub async fn run(opts: TellOptions) -> Result<()> {
+    validate_tell_body_input(&opts)?;
     let mut config = load_config()?;
 
     let identity = config
@@ -207,10 +222,9 @@ pub async fn run(opts: TellOptions) -> Result<()> {
     };
     let mut protocol_selection_reason: Option<&str> = None;
     let effective_protocol = if !opts.protocol_explicit && opts.protocol == "/agent/msg/1.0.0" {
-        let detected = if let Some(card) = &resolved_target.agent {
-            extract_primary_protocol(card)
+        let mut declared_protocols = if let Some(card) = &resolved_target.agent {
+            collect_declared_protocols(card)
         } else if daemon_status.is_some() {
-            // Try querying the card via daemon
             match daemon
                 .send_command("query-card", json!({"did": &recipient_did}))
                 .await
@@ -220,21 +234,28 @@ pub async fn run(opts: TellOptions) -> Result<()> {
                         if let Ok(card) =
                             serde_json::from_value::<crate::protocol::AgentCard>(card_value.clone())
                         {
-                            extract_primary_protocol(&card)
+                            collect_declared_protocols(&card)
                         } else {
-                            None
+                            Vec::new()
                         }
                     } else {
-                        None
+                        Vec::new()
                     }
                 }
-                Err(_) => None,
+                Err(_) => Vec::new(),
             }
         } else {
-            None
+            Vec::new()
         };
 
-        if let Some(protocol) = detected {
+        if declared_protocols.len() > 1 {
+            bail!(
+                "Target advertises multiple protocols ({}). Pass --protocol explicitly.",
+                describe_protocols(&declared_protocols)
+            );
+        }
+
+        if let Some(protocol) = declared_protocols.pop() {
             protocol_selection = ProtocolSelection::Auto;
             protocol_selection_reason = Some("auto-selected from target capabilities");
             protocol
@@ -318,24 +339,18 @@ pub async fn run(opts: TellOptions) -> Result<()> {
                     if opts.json {
                         println!(
                             "{}",
-                            serde_json::to_string_pretty(&json!({
-                                "messageId": message_id,
-                                "to": recipient_did,
-                                "protocol": effective_protocol,
-                                "protocolSelection": protocol_selection.as_str(),
-                                "protocolSelectionReason": protocol_selection_reason,
-                                "bodyFormat": body_format.as_str(),
-                                "payload": payload,
-                                "threadId": thread_id,
-                                "waitSeconds": timeout_secs,
-                                "result": outcome.as_ref().map(|o| json!({
-                                    "kind": o.kind.as_str(),
-                                    "status": o.status,
-                                    "jobId": o.job_id,
-                                    "terminal": o.terminal,
-                                })),
-                                "timedOut": outcome.is_none(),
-                            }))?
+                            serde_json::to_string_pretty(&build_wait_json_response(
+                                message_id,
+                                &recipient_did,
+                                &effective_protocol,
+                                protocol_selection,
+                                protocol_selection_reason,
+                                body_format,
+                                &payload,
+                                thread_id.as_deref(),
+                                timeout_secs,
+                                outcome.as_ref(),
+                            ))?
                         );
                         if outcome.is_none() {
                             std::process::exit(1);
@@ -373,11 +388,11 @@ pub async fn run(opts: TellOptions) -> Result<()> {
                             "bodyFormat": body_format.as_str(),
                             "payload": payload,
                             "threadId": thread_id,
-                            "status": "accepted_locally",
+                            "status": "accepted",
                         }))?
                     );
                 } else if opts.human {
-                    println!("Message accepted locally via daemon ({})", message_id);
+                    println!("Relay accepted message via daemon ({})", message_id);
                     println!(
                         "Protocol: {} ({})",
                         effective_protocol,
@@ -402,7 +417,7 @@ pub async fn run(opts: TellOptions) -> Result<()> {
                     if let Some(thread_id) = &thread_id {
                         LlmFormatter::key_value("Thread ID", thread_id);
                     }
-                    LlmFormatter::key_value("Lifecycle", "accepted_locally");
+                    LlmFormatter::key_value("Lifecycle", "accepted");
                     LlmFormatter::key_value("Trace Hint", &format!("agent trace {}", message_id));
                     println!();
                 }
@@ -514,24 +529,18 @@ pub async fn run(opts: TellOptions) -> Result<()> {
         if opts.json {
             println!(
                 "{}",
-                serde_json::to_string_pretty(&json!({
-                    "messageId": prepared.application_envelope.id,
-                    "to": recipient_did,
-                    "protocol": effective_protocol,
-                    "protocolSelection": protocol_selection.as_str(),
-                    "protocolSelectionReason": protocol_selection_reason,
-                    "bodyFormat": body_format.as_str(),
-                    "payload": payload,
-                    "threadId": thread_id,
-                    "waitSeconds": timeout_secs,
-                    "result": outcome.as_ref().map(|o| json!({
-                        "kind": o.kind.as_str(),
-                        "status": o.status,
-                        "jobId": o.job_id,
-                        "terminal": o.terminal,
-                    })),
-                    "timedOut": outcome.is_none(),
-                }))?
+                serde_json::to_string_pretty(&build_wait_json_response(
+                    &prepared.application_envelope.id,
+                    &recipient_did,
+                    &effective_protocol,
+                    protocol_selection,
+                    protocol_selection_reason,
+                    body_format,
+                    &payload,
+                    thread_id.as_deref(),
+                    timeout_secs,
+                    outcome.as_ref(),
+                ))?
             );
             if outcome.is_none() {
                 std::process::exit(1);
@@ -868,6 +877,54 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+fn serialize_stored_message(message: &Value) -> Value {
+    json!({
+        "id": message_id(message),
+        "timestamp": message_timestamp(message),
+        "from": source_did(message),
+        "protocol": protocol(message),
+        "type": envelope_type(message),
+        "replyTo": reply_to(message),
+        "payload": envelope_payload(message).cloned(),
+    })
+}
+
+fn build_wait_json_response(
+    message_id: &str,
+    recipient_did: &str,
+    effective_protocol: &str,
+    protocol_selection: ProtocolSelection,
+    protocol_selection_reason: Option<&str>,
+    body_format: TellBodyFormat,
+    payload: &Value,
+    thread_id: Option<&str>,
+    timeout_secs: u64,
+    outcome: Option<&MessageOutcome>,
+) -> Value {
+    json!({
+        "messageId": message_id,
+        "to": recipient_did,
+        "protocol": effective_protocol,
+        "protocolSelection": protocol_selection.as_str(),
+        "protocolSelectionReason": protocol_selection_reason,
+        "bodyFormat": body_format.as_str(),
+        "payload": payload,
+        "threadId": thread_id,
+        "waitSeconds": timeout_secs,
+        "reply": outcome
+            .filter(|outcome| outcome.kind == MessageOutcomeKind::Reply)
+            .map(|outcome| serialize_stored_message(&outcome.message)),
+        "result": outcome.map(|outcome| json!({
+            "kind": outcome.kind.as_str(),
+            "status": outcome.status,
+            "jobId": outcome.job_id,
+            "terminal": outcome.terminal,
+            "message": serialize_stored_message(&outcome.message),
+        })),
+        "timedOut": outcome.is_none(),
+    })
+}
+
 fn render_wait_outcome(
     human: bool,
     outcome: Option<&MessageOutcome>,
@@ -972,23 +1029,206 @@ fn outcome_payload(outcome: &MessageOutcome) -> Option<&Value> {
 }
 
 fn extract_primary_protocol(card: &crate::protocol::AgentCard) -> Option<String> {
-    // 1) Check capabilities for explicit metadata.protocol
+    let mut declared_protocols = collect_declared_protocols(card);
+    if declared_protocols.len() == 1 {
+        declared_protocols.pop()
+    } else {
+        None
+    }
+}
+
+fn collect_declared_protocols(card: &crate::protocol::AgentCard) -> Vec<String> {
+    let mut declared_protocols = Vec::new();
     for capability in &card.capabilities {
         if let Some(metadata) = &capability.metadata {
-            if let Some(protocol) = metadata.get("protocol").and_then(|v| v.as_str()) {
-                return Some(protocol.to_string());
+            if let Some(protocol) = metadata.get("protocol").and_then(|value| value.as_str()) {
+                let protocol = protocol.trim();
+                if !protocol.is_empty()
+                    && !declared_protocols.iter().any(|entry| entry == protocol)
+                {
+                    declared_protocols.push(protocol.to_string());
+                }
             }
         }
     }
+    declared_protocols
+}
 
-    // 2) Infer protocol from well-known capability IDs
-    for capability in &card.capabilities {
-        match capability.id.as_str() {
-            "shell/exec" => return Some("/shell/exec/1.0.0".to_string()),
-            "gpu/compute" => return Some("/shell/exec/1.0.0".to_string()),
-            _ => {}
+fn describe_protocols(protocols: &[String]) -> String {
+    protocols
+        .iter()
+        .map(|protocol| format!("\"{}\"", protocol))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_wait_json_response, extract_primary_protocol, validate_tell_body_input,
+        ProtocolSelection, TellBodyFormat, TellOptions,
+    };
+    use crate::commands::message_lifecycle::{MessageOutcome, MessageOutcomeKind};
+    use crate::protocol::{AgentCard, Capability};
+    use serde_json::{json, Value};
+
+    fn sample_card(capabilities: Vec<Capability>) -> AgentCard {
+        AgentCard {
+            did: "did:agent:test".to_string(),
+            name: "Test".to_string(),
+            description: "Test card".to_string(),
+            version: "1.0.0".to_string(),
+            capabilities,
+            endpoints: vec![],
+            devices: None,
+            peer_id: None,
+            trust: None,
+            metadata: None,
+            timestamp: 1,
+            signature: String::new(),
         }
     }
 
-    None
+    fn sample_message(msg_type: &str, reply_to: Option<&str>, payload: Value) -> Value {
+        json!({
+            "direction": "inbound",
+            "receivedAt": 42,
+            "sentAt": Value::Null,
+            "envelope": {
+                "id": "msg_reply",
+                "from": "did:agent:worker",
+                "to": "did:agent:sender",
+                "type": msg_type,
+                "protocol": "/agent/msg/1.0.0",
+                "payload": payload,
+                "timestamp": 42,
+                "replyTo": reply_to,
+            }
+        })
+    }
+
+    #[test]
+    fn wait_json_response_includes_reply_and_result_message_for_replies() {
+        let outcome = MessageOutcome {
+            kind: MessageOutcomeKind::Reply,
+            message: sample_message("reply", Some("msg_origin"), json!({ "text": "done" })),
+            status: None,
+            job_id: None,
+            terminal: true,
+        };
+
+        let value = build_wait_json_response(
+            "msg_origin",
+            "did:agent:target",
+            "/agent/msg/1.0.0",
+            ProtocolSelection::Auto,
+            Some("auto-selected from target capabilities"),
+            TellBodyFormat::Text,
+            &json!({ "text": "hello" }),
+            Some("thread_123"),
+            30,
+            Some(&outcome),
+        );
+
+        assert_eq!(value["reply"]["payload"]["text"], "done");
+        assert_eq!(value["result"]["message"]["payload"]["text"], "done");
+        assert_eq!(value["result"]["message"]["replyTo"], "msg_origin");
+        assert_eq!(value["timedOut"], false);
+    }
+
+    #[test]
+    fn wait_json_response_keeps_reply_null_for_non_reply_results() {
+        let outcome = MessageOutcome {
+            kind: MessageOutcomeKind::Result,
+            message: sample_message(
+                "message",
+                Some("msg_origin"),
+                json!({ "status": "success", "jobId": "job-1", "value": 42 }),
+            ),
+            status: Some("success".to_string()),
+            job_id: Some("job-1".to_string()),
+            terminal: true,
+        };
+
+        let value = build_wait_json_response(
+            "msg_origin",
+            "did:agent:target",
+            "/jobs/1.0.0",
+            ProtocolSelection::Default,
+            None,
+            TellBodyFormat::Json,
+            &json!({ "task": "compute" }),
+            None,
+            15,
+            Some(&outcome),
+        );
+
+        assert!(value["reply"].is_null());
+        assert_eq!(value["result"]["message"]["payload"]["status"], "success");
+        assert_eq!(value["result"]["message"]["payload"]["jobId"], "job-1");
+    }
+
+    #[test]
+    fn extract_primary_protocol_prefers_metadata_protocol() {
+        let card = sample_card(vec![
+            Capability {
+                id: "custom/echo".to_string(),
+                name: "Echo".to_string(),
+                description: "Echo protocol".to_string(),
+                parameters: None,
+                metadata: Some(json!({ "protocol": "/echo/1.0.0" })),
+            },
+            Capability {
+                id: "shell/exec".to_string(),
+                name: "Shell".to_string(),
+                description: "Shell execution".to_string(),
+                parameters: None,
+                metadata: None,
+            },
+        ]);
+
+        assert_eq!(
+            extract_primary_protocol(&card).as_deref(),
+            Some("/echo/1.0.0")
+        );
+    }
+
+    #[test]
+    fn extract_primary_protocol_returns_none_without_unique_protocol() {
+        let card = sample_card(vec![Capability {
+            id: "gpu/compute".to_string(),
+            name: "GPU".to_string(),
+            description: "GPU compute".to_string(),
+            parameters: None,
+            metadata: None,
+        }]);
+
+        assert_eq!(extract_primary_protocol(&card), None);
+    }
+
+    #[test]
+    fn validate_tell_body_rejects_positional_json_format() {
+        let error = validate_tell_body_input(&TellOptions {
+            target: "gpu".to_string(),
+            message: Some("hello".to_string()),
+            body: None,
+            body_file: None,
+            body_stdin: false,
+            body_format: Some("json".to_string()),
+            protocol: "/agent/msg/1.0.0".to_string(),
+            protocol_explicit: false,
+            reply_to: None,
+            thread: None,
+            new_thread: false,
+            wait: None,
+            relay: None,
+            json: false,
+            human: false,
+        })
+        .expect_err("positional json body should fail");
+
+        assert!(error
+            .to_string()
+            .contains("Positional message always uses --body-format text"));
+    }
 }

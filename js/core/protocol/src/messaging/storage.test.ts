@@ -123,6 +123,7 @@ describe('MessageStorage - Thread Operations', () => {
       const threadId = generateThreadId();
       const initialDelivery: E2EDeliveryMetadata = {
         transport: 'prekey',
+        transportMessageId: 'transport-a',
         senderDeviceId: 'device-alice',
         receiverDeviceId: 'device-bob-primary',
         sessionId: 'session-a',
@@ -138,6 +139,7 @@ describe('MessageStorage - Thread Operations', () => {
       const merged = await storage.upsertE2EDeliveries('msg1', [
         {
           transport: 'session',
+          transportMessageId: 'transport-b',
           senderDeviceId: 'device-alice',
           receiverDeviceId: 'device-bob-secondary',
           sessionId: 'session-b',
@@ -147,6 +149,7 @@ describe('MessageStorage - Thread Operations', () => {
         },
         {
           transport: 'session',
+          transportMessageId: 'transport-a-2',
           senderDeviceId: 'device-alice',
           receiverDeviceId: 'device-bob-primary',
           sessionId: 'session-a',
@@ -159,6 +162,7 @@ describe('MessageStorage - Thread Operations', () => {
       expect(merged?.e2e?.deliveries).toEqual([
         {
           transport: 'session',
+          transportMessageId: 'transport-a-2',
           senderDeviceId: 'device-alice',
           receiverDeviceId: 'device-bob-primary',
           sessionId: 'session-a',
@@ -168,6 +172,7 @@ describe('MessageStorage - Thread Operations', () => {
         },
         {
           transport: 'session',
+          transportMessageId: 'transport-b',
           senderDeviceId: 'device-alice',
           receiverDeviceId: 'device-bob-secondary',
           sessionId: 'session-b',
@@ -227,6 +232,7 @@ describe('MessageStorage - Thread Operations', () => {
       message.e2e = {
         deliveries: [{
           transport: 'prekey',
+          transportMessageId: 'transport-a',
           senderDeviceId: 'device-alice',
           receiverDeviceId: 'device-bob-primary',
           sessionId: 'session-a',
@@ -243,6 +249,7 @@ describe('MessageStorage - Thread Operations', () => {
         e2e: {
           deliveries: [{
             transport: 'session',
+            transportMessageId: 'transport-b',
             senderDeviceId: 'device-alice',
             receiverDeviceId: 'device-bob-secondary',
             sessionId: 'session-b',
@@ -258,6 +265,7 @@ describe('MessageStorage - Thread Operations', () => {
       expect(stored?.e2e?.deliveries).toEqual([
         {
           transport: 'prekey',
+          transportMessageId: 'transport-a',
           senderDeviceId: 'device-alice',
           receiverDeviceId: 'device-bob-primary',
           sessionId: 'session-a',
@@ -267,6 +275,7 @@ describe('MessageStorage - Thread Operations', () => {
         },
         {
           transport: 'session',
+          transportMessageId: 'transport-b',
           senderDeviceId: 'device-alice',
           receiverDeviceId: 'device-bob-secondary',
           sessionId: 'session-b',
@@ -295,6 +304,33 @@ describe('MessageStorage - Thread Operations', () => {
       const retrieved = await storage.getMessage('msg-legacy');
       expect(retrieved).toBeDefined();
       expect(retrieved?.envelope.type).toBe('message');
+    });
+
+    it('should find outbound message by transport message id', async () => {
+      const message = createTestMessage(
+        'msg-transport',
+        'did:agent:me',
+        'did:agent:peer',
+        'thread-transport',
+        'Hello transport',
+        { direction: 'outbound', envelopeTimestamp: 1000, sentAt: 1000 },
+      );
+      message.e2e = {
+        deliveries: [{
+          transport: 'session',
+          transportMessageId: 'transport-lookup',
+          senderDeviceId: 'device-me',
+          receiverDeviceId: 'device-peer',
+          sessionId: 'session-1',
+          state: 'sent',
+          recordedAt: 1001,
+        }],
+      };
+
+      await storage.putMessage(message);
+
+      const retrieved = await storage.getMessageByTransportMessageId('transport-lookup', 'outbound');
+      expect(retrieved?.envelope.id).toBe('msg-transport');
     });
 
     it('should create session metadata when storing message with thread ID', async () => {

@@ -108,10 +108,7 @@ function parseJsonBody(raw: string): Record<string, unknown> {
   return parsed as Record<string, unknown>;
 }
 
-export async function resolveTellBody(
-  input: TellBodyInput,
-  protocol: string,
-): Promise<ResolvedTellBody> {
+export function validateTellBodyInput(input: TellBodyInput): TellBodySource {
   const sources = [
     input.message !== undefined ? 'positional' : null,
     input.body !== undefined ? 'inline' : null,
@@ -124,22 +121,33 @@ export async function resolveTellBody(
   }
 
   const source = sources[0];
-
   if (source === 'positional') {
     if (input.bodyFormat && input.bodyFormat !== 'text') {
       throw new Error('Positional message always uses --body-format text.');
     }
+    return source;
+  }
 
+  if (!input.bodyFormat) {
+    throw new Error('Body format is required with --body, --body-file, and --body-stdin.');
+  }
+
+  return source;
+}
+
+export async function resolveTellBody(
+  input: TellBodyInput,
+  protocol: string,
+): Promise<ResolvedTellBody> {
+  const source = validateTellBodyInput(input);
+
+  if (source === 'positional') {
     return {
       source,
       format: 'text',
       payload: wrapTextBody(protocol, input.message ?? ''),
       rawText: input.message ?? '',
     };
-  }
-
-  if (!input.bodyFormat) {
-    throw new Error('Body format is required with --body, --body-file, and --body-stdin.');
   }
 
   const format = normalizeBodyFormat(input.bodyFormat);
@@ -301,7 +309,7 @@ export async function dispatchMessage(input: DispatchMessageInput): Promise<Disp
       identity,
     },
     async ({ keyPair, relayClient }) => {
-      const encrypted = await withLocalE2EStateTransaction(identity, async ({ e2eConfig, setE2EConfig }) => {
+      const encrypted = await withLocalE2EStateTransaction(identity, async ({ e2eConfig }) => {
         const prepared = await prepareEncryptedSends({
           identity,
           keyPair,
@@ -314,11 +322,19 @@ export async function dispatchMessage(input: DispatchMessageInput): Promise<Disp
           replyTo: input.replyTo,
           threadId: input.threadId,
         });
-        setE2EConfig(prepared.e2eConfig);
         return prepared;
       });
       for (const target of encrypted.targets) {
-        await relayClient.sendEnvelope(input.to, target.outerEnvelopeBytes);
+        if (typeof relayClient.sendEnvelopeAwaitAccepted === 'function') {
+          await relayClient.sendEnvelopeAwaitAccepted(input.to, target.outerEnvelopeBytes);
+        } else {
+          await relayClient.sendEnvelope(input.to, target.outerEnvelopeBytes);
+        }
+        if (target.configAfterSend) {
+          await withLocalE2EStateTransaction(identity, async ({ setE2EConfig }) => {
+            setE2EConfig(target.configAfterSend!);
+          });
+        }
       }
 
       return {

@@ -10,8 +10,10 @@ export function registerEndorsementsCommand(program: Command): void {
     .option('--domain <domain>', 'Filter by capability domain')
     .option('--relay <url>', 'Relay URL')
     .option('--format <fmt>', 'Output format: text|json', 'text')
+    .option('--json', 'Output as JSON (alias for --format json)')
     .action(async (target: string, options) => {
       try {
+        if (options.json) options.format = 'json';
         const resolved = await resolveTargetDid(target, options.relay);
         const result = await queryNetworkEndorsements(resolved.did, {
           relay: options.relay,

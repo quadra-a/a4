@@ -143,6 +143,99 @@ async function waitFor(condition: () => boolean, timeoutMs = 5000): Promise<void
 }
 
 describe('relay client control-plane dispatch', () => {
+  it('waits for accepted delivery reports on outbound envelopes', async () => {
+    const relayUrl = await startFakeRelay(async (socket, msg) => {
+      if (msg.type === 'SEND') {
+        socket.send(encode({
+          type: 'DELIVERY_REPORT',
+          messageId: 'relay-send-1',
+          status: 'accepted',
+          timestamp: Date.now(),
+        }));
+      }
+    });
+
+    await withClient(relayUrl, async (client) => {
+      const outcome = await client.sendEnvelopeAwaitAccepted!(
+        'did:agent:zPeer',
+        encode({ id: 'accepted-send-1', payload: { text: 'hello' } }),
+      );
+
+      expect(outcome).toEqual(expect.objectContaining({
+        messageId: 'relay-send-1',
+        status: 'accepted',
+      }));
+    });
+  }, 15000);
+
+  it('ignores out-of-band delivered reports while waiting for accepted delivery', async () => {
+    const relayUrl = await startFakeRelay(async (socket, msg) => {
+      if (msg.type === 'SEND') {
+        socket.send(encode({
+          type: 'DELIVERY_REPORT',
+          messageId: 'previous-relay-message',
+          status: 'delivered',
+          timestamp: Date.now(),
+        }));
+        socket.send(encode({
+          type: 'DELIVERY_REPORT',
+          messageId: 'relay-send-2',
+          status: 'accepted',
+          timestamp: Date.now(),
+        }));
+      }
+    });
+
+    await withClient(relayUrl, async (client) => {
+      const outcome = await client.sendEnvelopeAwaitAccepted!(
+        'did:agent:zPeer',
+        encode({ id: 'accepted-send-2', payload: { text: 'hello again' } }),
+      );
+
+      expect(outcome).toEqual(expect.objectContaining({
+        messageId: 'relay-send-2',
+        status: 'accepted',
+      }));
+    });
+  }, 15000);
+
+  it('treats acceptance timeout as ambiguous success and degrades future waits on the connection', async () => {
+    let sendCount = 0;
+    const relayUrl = await startFakeRelay(async (_socket, msg) => {
+      if (msg.type === 'SEND') {
+        sendCount += 1;
+      }
+    });
+
+    await withClient(relayUrl, async (client) => {
+      const firstOutcome = await client.sendEnvelopeAwaitAccepted!(
+        'did:agent:zPeer',
+        encode({ id: 'accepted-timeout-1', payload: { text: 'first' } }),
+        25,
+      );
+
+      expect(firstOutcome).toEqual(expect.objectContaining({
+        messageId: 'accepted-timeout-1',
+        status: 'accepted',
+      }));
+
+      const startedAt = Date.now();
+      const secondOutcome = await client.sendEnvelopeAwaitAccepted!(
+        'did:agent:zPeer',
+        encode({ id: 'accepted-timeout-2', payload: { text: 'second' } }),
+        500,
+      );
+      const elapsedMs = Date.now() - startedAt;
+
+      expect(secondOutcome).toEqual(expect.objectContaining({
+        messageId: 'accepted-timeout-2',
+        status: 'accepted',
+      }));
+      expect(elapsedMs).toBeLessThan(200);
+      await waitFor(() => sendCount === 2);
+    });
+  }, 15000);
+
   it('surfaces accepted delivery reports without blocking control responses', async () => {
     const reports: string[] = [];
     const relayUrl = await startFakeRelay(async (socket, msg) => {

@@ -18,6 +18,7 @@ pub struct PreparedEncryptedSendTarget {
     pub sender_device_id: String,
     pub recipient_device_id: String,
     pub session_id: String,
+    pub config_after_send: Config,
 }
 
 pub struct PreparedEncryptedSendBatch {
@@ -158,6 +159,7 @@ pub async fn prepare_encrypted_sends_with_session(
             sender_device_id,
             recipient_device_id: recipient_device.device_id,
             session_id,
+            config_after_send: next_config.clone(),
         });
     }
 

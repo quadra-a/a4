@@ -52,6 +52,7 @@ export interface PreparedEncryptedSendTarget {
   senderDeviceId: string;
   recipientDeviceId: string;
   sessionId: string;
+  configAfterSend?: LocalE2EConfig;
 }
 
 export interface PrepareEncryptedSendsResult {
@@ -190,6 +191,7 @@ export async function prepareEncryptedSends(
       senderDeviceId: encrypted.payload.senderDeviceId,
       recipientDeviceId: recipientDevice.deviceId,
       sessionId: encrypted.payload.sessionId,
+      configAfterSend: structuredClone(nextE2EConfig),
     });
   }
 

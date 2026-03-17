@@ -35,7 +35,7 @@
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
-    "test": "vitest",
+    "test": "vitest run",
     "clean": "rm -rf dist",
     "start": "node dist/index.js",
     "smoke:local": "node --experimental-strip-types scripts/smoke-relay.ts"

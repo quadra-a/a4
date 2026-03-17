@@ -7,9 +7,11 @@ export function registerTraceCommand(program: Command): void {
     .command('trace <messageId>')
     .description('Trace one message through local queue and result lifecycle')
     .option('--format <fmt>', 'Output format: text|json', 'text')
+    .option('--json', 'Output as JSON (alias for --format json)')
     .option('--human', 'Human-friendly output with colors')
     .action(async (messageId: string, options) => {
       try {
+        if (options.json) options.format = 'json';
         const trace = await buildMessageTrace(messageId);
 
         if (options.format === 'json') {
