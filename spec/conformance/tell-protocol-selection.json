@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "subject": "tell-protocol-selection",
+  "cases": [
+    {
+      "id": "TELLPROTO-001",
+      "description": "Positional text messages do not trigger automatic protocol selection.",
+      "input": {
+        "message": "hello"
+      },
+      "expected": {
+        "autoSelect": false
+      }
+    },
+    {
+      "id": "TELLPROTO-002",
+      "description": "Explicit text body format does not trigger automatic protocol selection.",
+      "input": {
+        "bodyFormat": "text"
+      },
+      "expected": {
+        "autoSelect": false
+      }
+    },
+    {
+      "id": "TELLPROTO-003",
+      "description": "Structured JSON bodies trigger automatic protocol selection.",
+      "input": {
+        "bodyFormat": "json"
+      },
+      "expected": {
+        "autoSelect": true
+      }
+    },
+    {
+      "id": "TELLPROTO-004",
+      "description": "A positional message still disables auto-selection even if body format is json.",
+      "input": {
+        "message": "hello",
+        "bodyFormat": "json"
+      },
+      "expected": {
+        "autoSelect": false
+      }
+    }
+  ]
+}

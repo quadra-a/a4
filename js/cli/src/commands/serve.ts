@@ -9,7 +9,7 @@
  */
 
 import { Command } from 'commander';
-import { DaemonClient } from '../daemon/client.js';
+import { DaemonClient, DaemonSubscriptionClient } from '../daemon/client.js';
 import { getAgentCard } from '../config.js';
 import { createLogger } from '@quadra-a/protocol';
 import { spawn } from 'child_process';
@@ -19,6 +19,12 @@ import { join, resolve, basename } from 'node:path';
 const logger = createLogger('cli:serve');
 
 const MAX_PAYLOAD_BYTES = 256 * 1024; // 256 KiB
+const SERVE_INBOX_FILTER = {
+  direction: 'inbound',
+  unreadOnly: true,
+  status: 'pending',
+  type: 'message',
+};
 
 interface HandlerEntry {
   capability: string;
@@ -342,7 +348,10 @@ Handler contract:
       const timeoutMs = parseInt(options.timeout, 10) * 1000;
       const activeCountRef = { value: 0 };
       const claimedMessageIds = new Set<string>();
+      const subscriptionClient = new DaemonSubscriptionClient();
       let pollInFlight = false;
+      let pollInterval: NodeJS.Timeout | null = null;
+      let shuttingDown = false;
 
       // Apply allowlist if --allow-from specified
       if (options.allowFrom && !options.public) {
@@ -373,7 +382,7 @@ Handler contract:
         pollInFlight = true;
         try {
           const page = await client.send('inbox', {
-            filter: { unreadOnly: true, status: 'pending', type: 'message' },
+            filter: SERVE_INBOX_FILTER,
             pagination: { limit: 10 },
           });
           await processServeInboxPage(page as ServeMessagePage, {
@@ -392,17 +401,65 @@ Handler contract:
         }
       };
 
-      // Poll every 500ms
-      const interval = setInterval(poll, 500);
+      const startPollingFallback = () => {
+        if (pollInterval) {
+          return;
+        }
+
+        pollInterval = setInterval(() => {
+          void poll();
+        }, 500);
+      };
+
+      try {
+        await subscriptionClient.subscribeInbox(
+          { filter: SERVE_INBOX_FILTER },
+          (event) => {
+            void processServeInboxPage(
+              { messages: [event.data as ServeMessagePage['messages'][number]] },
+              {
+                client,
+                handlers,
+                claimedMessageIds,
+                activeCountRef,
+                maxConcurrency,
+                timeoutMs,
+                format: options.format,
+              },
+            ).catch((err) => {
+              logger.warn('Serve subscription event processing error', err);
+            });
+          },
+        );
+      } catch (error) {
+        logger.warn('Inbox subscription unavailable, falling back to polling', error);
+        startPollingFallback();
+      }
+
+      await poll();
 
       // Graceful shutdown
-      const shutdown = () => {
-        clearInterval(interval);
+      const shutdown = async () => {
+        if (shuttingDown) {
+          return;
+        }
+        shuttingDown = true;
+
+        if (pollInterval) {
+          clearInterval(pollInterval);
+          pollInterval = null;
+        }
+
+        await subscriptionClient.close().catch(() => undefined);
         if (options.format !== 'json') console.log('\nStopped serving.');
         process.exit(0);
       };
-      process.on('SIGINT', shutdown);
-      process.on('SIGTERM', shutdown);
+      process.on('SIGINT', () => {
+        void shutdown();
+      });
+      process.on('SIGTERM', () => {
+        void shutdown();
+      });
     });
 }
 

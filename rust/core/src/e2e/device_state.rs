@@ -193,6 +193,37 @@ pub fn rotate_local_device_signed_pre_key(
     Ok(next_config)
 }
 
+pub fn resupply_local_device_one_time_pre_keys(
+    e2e: &LocalE2EConfig,
+    device_id: &str,
+    one_time_pre_key_count: Option<usize>,
+    created_at: Option<u64>,
+) -> Result<LocalE2EConfig> {
+    let existing_device = e2e
+        .devices
+        .get(device_id)
+        .ok_or_else(|| anyhow!("Missing local E2E device {}", device_id))?;
+
+    let mut next_config = e2e.clone();
+    let created_at = created_at.unwrap_or_else(now_ms);
+    let available_otks = existing_device
+        .one_time_pre_keys
+        .iter()
+        .filter(|key| key.claimed_at.is_none())
+        .count();
+    let next_one_time_pre_key_count = one_time_pre_key_count
+        .unwrap_or_else(|| available_otks.max(DEFAULT_ONE_TIME_PRE_KEY_COUNT));
+    let next_device = next_config
+        .devices
+        .get_mut(device_id)
+        .ok_or_else(|| anyhow!("Missing local E2E device {}", device_id))?;
+    next_device.one_time_pre_keys =
+        build_one_time_pre_keys(next_one_time_pre_key_count, created_at);
+    next_device.last_resupply_at = created_at;
+
+    Ok(next_config)
+}
+
 pub fn create_initial_local_e2e_config(signing_keypair: &KeyPair) -> Result<LocalE2EConfig> {
     create_initial_local_e2e_config_with_device_id(signing_keypair, generate_device_id())
 }
@@ -327,7 +358,8 @@ pub fn current_device_state(e2e: &LocalE2EConfig) -> Result<&LocalDeviceState> {
 mod tests {
     use super::{
         create_initial_local_e2e_config, create_initial_local_e2e_config_with_device_id,
-        derive_device_id, rotate_local_device_signed_pre_key,
+        derive_device_id, resupply_local_device_one_time_pre_keys,
+        rotate_local_device_signed_pre_key,
     };
     use crate::identity::KeyPair;
 
@@ -386,6 +418,39 @@ mod tests {
 
         assert_eq!(e2e.current_device_id, "device-stable");
         assert!(e2e.devices.contains_key("device-stable"));
+    }
+
+    #[test]
+    fn resupplies_one_device_one_time_prekeys_without_rotating_signed_prekey() {
+        let signing_keypair = KeyPair::generate();
+        let mut e2e =
+            create_initial_local_e2e_config(&signing_keypair).expect("create initial e2e");
+        let device_id = e2e.current_device_id.clone();
+        let original = e2e
+            .devices
+            .get_mut(&device_id)
+            .expect("current device exists");
+        original.sessions.insert(
+            "did:agent:zpeer:device-peer".to_string(),
+            serde_json::json!({"sessionId": "session-existing"}),
+        );
+        original.one_time_pre_keys.truncate(2);
+        original.one_time_pre_keys[0].claimed_at = Some(111);
+        let original = original.clone();
+
+        let resupplied =
+            resupply_local_device_one_time_pre_keys(&e2e, &device_id, None, Some(456789))
+                .expect("resupply one-time pre-keys");
+        let resupplied_device = resupplied
+            .devices
+            .get(&device_id)
+            .expect("resupplied device exists");
+
+        assert_eq!(resupplied_device.identity_key, original.identity_key);
+        assert_eq!(resupplied_device.sessions, original.sessions);
+        assert_eq!(resupplied_device.signed_pre_key, original.signed_pre_key);
+        assert_eq!(resupplied_device.last_resupply_at, 456789);
+        assert_eq!(resupplied_device.one_time_pre_keys.len(), 16);
     }
 
     #[test]

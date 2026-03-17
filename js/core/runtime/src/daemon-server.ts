@@ -6,6 +6,9 @@ import {
   createRelayIndexOperations,
   importKeyPair,
   createMessageRouter,
+  bytesToHex,
+  generateX25519KeyPair,
+  hexToBytes,
   sign,
   verify,
   extractPublicKey,
@@ -26,6 +29,7 @@ import {
   type MessageEnvelope,
   type SemanticQuery,
   type StoredMessage,
+  rotateLocalDeviceSignedPreKey,
 } from '@quadra-a/protocol';
 import { createLogger } from '@quadra-a/protocol';
 import type {
@@ -47,6 +51,7 @@ import {
 } from './constants.js';
 import {
   getAgentCard,
+  getE2EConfig,
   getIdentity,
   getReachabilityPolicy,
   getRelayInviteToken,
@@ -65,6 +70,103 @@ import { paginateVisibleInboxMessages } from './inbox-visibility.js';
 const logger = createLogger('daemon');
 const PEER_RECOVERY_DEBOUNCE_MS = 500;
 const MAX_SESSION_REPLAY_ATTEMPTS = 3;
+const LOW_ONE_TIME_PREKEY_THRESHOLD = 4;
+const STALE_SIGNED_PREKEY_AGE_MS = 14 * 24 * 60 * 60 * 1000;
+const PREKEY_MAINTENANCE_INTERVAL_MS = 60 * 60 * 1000;
+type DeliveryMode = 'required' | 'preferred' | 'disabled';
+
+function normalizeSendDeliveryMode(value: unknown): DeliveryMode {
+  switch (value) {
+    case undefined:
+    case null:
+    case '':
+    case 'required':
+      return 'required';
+    case 'preferred':
+      return 'preferred';
+    case 'disabled':
+      return 'disabled';
+    default:
+      throw new Error('Delivery mode must be one of: required, preferred, disabled.');
+  }
+}
+
+export function shouldFallbackToPlaintextDelivery(error: unknown): boolean {
+  const message = (error as Error)?.message ?? String(error);
+  return (
+    message.startsWith('No Agent Card found for ')
+    || message.includes('does not publish any E2E devices')
+    || message.includes('No claimed pre-key bundle available')
+  );
+}
+
+export function canFallbackToPlaintextDelivery(
+  deliveryMode: DeliveryMode,
+  error: unknown,
+): boolean {
+  return deliveryMode === 'preferred' && shouldFallbackToPlaintextDelivery(error);
+}
+
+function buildE2EHealthSummary(e2eConfig: LocalE2EConfig | undefined) {
+  if (!e2eConfig?.currentDeviceId) {
+    return {
+      available: false,
+      currentDeviceId: null,
+      deviceCount: 0,
+      sessionCount: 0,
+      oneTimePreKeysRemaining: 0,
+      signedPreKeyAgeMs: null,
+    };
+  }
+
+  const currentDevice = e2eConfig.devices[e2eConfig.currentDeviceId];
+  if (!currentDevice) {
+    return {
+      available: false,
+      currentDeviceId: e2eConfig.currentDeviceId,
+      deviceCount: Object.keys(e2eConfig.devices ?? {}).length,
+      sessionCount: 0,
+      oneTimePreKeysRemaining: 0,
+      signedPreKeyAgeMs: null,
+    };
+  }
+
+  return {
+    available: true,
+    currentDeviceId: e2eConfig.currentDeviceId,
+    deviceCount: Object.keys(e2eConfig.devices).length,
+    sessionCount: Object.keys(currentDevice.sessions ?? {}).length,
+    oneTimePreKeysRemaining: currentDevice.oneTimePreKeys.filter((key) => !key.claimedAt).length,
+    signedPreKeyAgeMs: Date.now() - currentDevice.signedPreKey.createdAt,
+  };
+}
+
+function resupplyLocalDeviceOneTimePreKeys(
+  e2eConfig: LocalE2EConfig,
+  deviceId: string,
+  now = Date.now(),
+): LocalE2EConfig {
+  const currentDevice = e2eConfig.devices[deviceId];
+  if (!currentDevice) {
+    throw new Error(`Missing current E2E device state for ${deviceId}`);
+  }
+
+  const availableOneTimePreKeys = currentDevice.oneTimePreKeys.filter((key) => !key.claimedAt).length;
+  const oneTimePreKeyCount = Math.max(availableOneTimePreKeys, 16);
+  const nextConfig = structuredClone(e2eConfig);
+  const nextDevice = nextConfig.devices[deviceId];
+  nextDevice.oneTimePreKeys = Array.from({ length: oneTimePreKeyCount }, (_, index) => {
+    const keyPair = generateX25519KeyPair();
+    return {
+      keyId: index + 1,
+      publicKey: bytesToHex(keyPair.publicKey),
+      privateKey: bytesToHex(keyPair.privateKey),
+      createdAt: now,
+    };
+  });
+  nextDevice.lastResupplyAt = now;
+  return nextConfig;
+}
 
 interface PendingReplayRequest {
   lookupMessageId: string;
@@ -83,6 +185,30 @@ interface PendingPeerBatch<T> {
   items: Map<string, T>;
   timer: NodeJS.Timeout | null;
   running: boolean;
+}
+
+interface PreKeyMaintenanceResult {
+  action: 'none' | 'resupply-otks' | 'rotate-signed-prekey';
+  deviceId: string;
+  oneTimePreKeysRemainingBefore: number;
+  signedPreKeyAgeMsBefore: number;
+}
+
+interface PreKeyMaintenanceStatus {
+  enabled: boolean;
+  intervalMs: number;
+  lastCheckedAt: number | null;
+  lastAction: PreKeyMaintenanceResult['action'] | null;
+  lastChangedAt: number | null;
+  lastRepublishedAt: number | null;
+  lastError: string | null;
+}
+
+interface PreKeyMaintenanceExecutionResult {
+  checkedAt: number;
+  maintenance: PreKeyMaintenanceResult;
+  republished: boolean;
+  republishError: string | null;
 }
 
 interface PeerRecoveryState {
@@ -145,6 +271,17 @@ export class ClawDaemon {
   private pendingRetryNotifications = new Map<string, PendingPeerBatch<PendingDecryptFailure>>();
   private peerRecoveryStates = new Map<string, PeerRecoveryState>();
   private peerRecoveryEpochFloors = new Map<string, number>();
+  private preKeyMaintenanceLock = new AsyncMutex();
+  private preKeyMaintenanceTimer: NodeJS.Timeout | null = null;
+  private preKeyMaintenanceStatus: PreKeyMaintenanceStatus = {
+    enabled: true,
+    intervalMs: PREKEY_MAINTENANCE_INTERVAL_MS,
+    lastCheckedAt: null,
+    lastAction: null,
+    lastChangedAt: null,
+    lastRepublishedAt: null,
+    lastError: null,
+  };
 
   constructor(socketPath: string = DAEMON_SOCKET_PATH) {
     this.socketPath = socketPath;
@@ -666,13 +803,121 @@ export class ClawDaemon {
     await this.router.sendMessage(signedEnvelope);
   }
 
-  private shouldFallbackToPlaintext(error: unknown): boolean {
-    const message = (error as Error)?.message ?? String(error);
-    return (
-      message.startsWith('No Agent Card found for ')
-      || message.includes('does not publish any E2E devices')
-      || message.includes('No claimed pre-key bundle available')
+  private async sendPlaintextEnvelope(input: {
+    to: string;
+    protocol: string;
+    payload: Record<string, unknown>;
+    type: MessageEnvelope['type'];
+    replyTo?: string;
+    threadId?: string;
+  }): Promise<{ id: string; deliveryPath: 'plaintext'; transportStatus: 'accepted' }> {
+    const envelope = createEnvelope(
+      this.identity.did,
+      input.to,
+      input.type,
+      input.protocol,
+      input.payload,
+      input.replyTo,
+      input.threadId,
     );
+
+    const signedEnvelope = await signEnvelope(envelope, (data) =>
+      sign(data, this.getKeyPair().privateKey)
+    );
+
+    if (this.queue) {
+      await this.queue.enqueueOutbound(signedEnvelope);
+    }
+
+    if (!this.router) {
+      throw new Error('Message router not initialized');
+    }
+
+    await this.router.sendMessage(signedEnvelope);
+
+    if (this.queue) {
+      await this.queue.markOutboundDelivered(signedEnvelope.id);
+    }
+
+    return {
+      id: signedEnvelope.id,
+      deliveryPath: 'plaintext',
+      transportStatus: 'accepted',
+    };
+  }
+
+  private async sendEncryptedEnvelope(input: {
+    to: string;
+    protocol: string;
+    payload: Record<string, unknown>;
+    type: MessageEnvelope['type'];
+    replyTo?: string;
+    threadId?: string;
+  }): Promise<{ id: string; deliveryPath: 'e2e'; transportStatus: 'accepted' }> {
+    const encrypted = await this.prepareEncryptedSendsWithoutCommit(input);
+    const applicationEnvelope = encrypted.applicationEnvelope;
+
+    const e2eDeliveries: E2EDeliveryMetadata[] = encrypted.targets.map((target) => ({
+      transport: target.transport,
+      transportMessageId: target.outerEnvelope.id,
+      senderDeviceId: target.senderDeviceId,
+      receiverDeviceId: target.recipientDeviceId,
+      sessionId: target.sessionId,
+      state: 'pending',
+      recordedAt: Date.now(),
+    }));
+
+    if (this.queue) {
+      await this.queue.enqueueOutbound(applicationEnvelope, e2eDeliveries);
+    }
+
+    for (const target of encrypted.targets) {
+      const pendingDelivery: E2EDeliveryMetadata = {
+        transport: target.transport,
+        transportMessageId: target.outerEnvelope.id,
+        senderDeviceId: target.senderDeviceId,
+        receiverDeviceId: target.recipientDeviceId,
+        sessionId: target.sessionId,
+        state: 'pending',
+        recordedAt: Date.now(),
+      };
+
+      try {
+        await this.sendEnvelopeAwaitAccepted(input.to, target.outerEnvelopeBytes);
+        if (target.configAfterSend) {
+          await this.commitAcceptedE2EConfig(target.configAfterSend);
+        }
+        if (this.queue) {
+          await this.queue.appendE2EDelivery(applicationEnvelope.id, {
+            ...pendingDelivery,
+            state: 'sent',
+            recordedAt: Date.now(),
+            error: undefined,
+          });
+        }
+      } catch (error) {
+        if (this.queue) {
+          await this.queue.appendE2EDelivery(applicationEnvelope.id, {
+            ...pendingDelivery,
+            state: 'failed',
+            recordedAt: Date.now(),
+            error: (error as Error).message,
+          });
+          await this.queue.markOutboundFailed(applicationEnvelope.id, (error as Error).message);
+        }
+        throw error;
+      }
+    }
+
+    if (this.queue) {
+      await this.queue.markOutboundDelivered(applicationEnvelope.id);
+    }
+
+    return {
+      id: applicationEnvelope.id,
+      deliveryPath: 'e2e',
+      transportStatus: 'accepted',
+    };
   }
 
   private async lookupOutboundMessageForRecovery(
@@ -950,6 +1195,8 @@ export class ClawDaemon {
   }
 
   private async stopRelayStack(): Promise<void> {
+    this.stopPreKeyMaintenanceLoop();
+
     if (this.router) {
       await this.router.stop();
       this.router = null;
@@ -976,7 +1223,147 @@ export class ClawDaemon {
     await this.relayClient.publishCard(signedCard);
   }
 
+  private async maintainCurrentDevicePreKeyHealth(): Promise<PreKeyMaintenanceResult> {
+    return await withLocalE2EStateTransaction(this.identity, async ({ e2eConfig, setE2EConfig }) => {
+      const currentDevice = e2eConfig.devices[e2eConfig.currentDeviceId];
+      if (!currentDevice) {
+        throw new Error(`Missing current E2E device state for ${e2eConfig.currentDeviceId}`);
+      }
+
+      const oneTimePreKeysRemaining = currentDevice.oneTimePreKeys.filter((key) => !key.claimedAt).length;
+      const signedPreKeyAgeMs = Math.max(Date.now() - currentDevice.signedPreKey.createdAt, 0);
+      const baseResult = {
+        deviceId: e2eConfig.currentDeviceId,
+        oneTimePreKeysRemainingBefore: oneTimePreKeysRemaining,
+        signedPreKeyAgeMsBefore: signedPreKeyAgeMs,
+      };
+
+      if (signedPreKeyAgeMs >= STALE_SIGNED_PREKEY_AGE_MS) {
+        const nextConfig = await rotateLocalDeviceSignedPreKey(
+          hexToBytes(this.identity.privateKey),
+          e2eConfig,
+          e2eConfig.currentDeviceId,
+        );
+        setE2EConfig(nextConfig);
+        return {
+          action: 'rotate-signed-prekey' as const,
+          ...baseResult,
+        };
+      }
+
+      if (oneTimePreKeysRemaining <= LOW_ONE_TIME_PREKEY_THRESHOLD) {
+        const nextConfig = resupplyLocalDeviceOneTimePreKeys(e2eConfig, e2eConfig.currentDeviceId);
+        setE2EConfig(nextConfig);
+        return {
+          action: 'resupply-otks' as const,
+          ...baseResult,
+        };
+      }
+
+      return {
+        action: 'none' as const,
+        ...baseResult,
+      };
+    });
+  }
+
+  private recordPreKeyMaintenanceResult(result: PreKeyMaintenanceExecutionResult): void {
+    this.preKeyMaintenanceStatus = {
+      ...this.preKeyMaintenanceStatus,
+      lastCheckedAt: result.checkedAt,
+      lastAction: result.maintenance.action,
+      lastChangedAt: result.maintenance.action === 'none'
+        ? this.preKeyMaintenanceStatus.lastChangedAt
+        : result.checkedAt,
+      lastRepublishedAt: result.republished
+        ? result.checkedAt
+        : this.preKeyMaintenanceStatus.lastRepublishedAt,
+      lastError: result.republishError,
+    };
+  }
+
+  private recordPreKeyMaintenanceFailure(checkedAt: number, error: unknown): void {
+    this.preKeyMaintenanceStatus = {
+      ...this.preKeyMaintenanceStatus,
+      lastCheckedAt: checkedAt,
+      lastError: (error as Error).message,
+    };
+  }
+
+  private async executePreKeyMaintenanceCycle(
+    options: { republishIfPublished: boolean },
+  ): Promise<PreKeyMaintenanceExecutionResult> {
+    return await this.preKeyMaintenanceLock.runExclusive(async () => {
+      const checkedAt = Date.now();
+
+      try {
+        const maintenance = await this.maintainCurrentDevicePreKeyHealth();
+        let republished = false;
+        let republishError: string | null = null;
+
+        if (options.republishIfPublished && maintenance.action !== 'none' && isPublished() && this.relayClient) {
+          try {
+            await this.publishDiscoveryState(await this.buildSignedAgentCard());
+            republished = true;
+          } catch (error) {
+            republishError = (error as Error).message;
+          }
+        }
+
+        const result: PreKeyMaintenanceExecutionResult = {
+          checkedAt,
+          maintenance,
+          republished,
+          republishError,
+        };
+        this.recordPreKeyMaintenanceResult(result);
+        return result;
+      } catch (error) {
+        this.recordPreKeyMaintenanceFailure(checkedAt, error);
+        throw error;
+      }
+    });
+  }
+
+  private startPreKeyMaintenanceLoop(): void {
+    this.stopPreKeyMaintenanceLoop();
+    this.preKeyMaintenanceTimer = setInterval(() => {
+      void this.runPeriodicPreKeyMaintenance();
+    }, this.preKeyMaintenanceStatus.intervalMs);
+    this.preKeyMaintenanceTimer.unref?.();
+  }
+
+  private stopPreKeyMaintenanceLoop(): void {
+    if (this.preKeyMaintenanceTimer) {
+      clearInterval(this.preKeyMaintenanceTimer);
+      this.preKeyMaintenanceTimer = null;
+    }
+  }
+
+  private async runPeriodicPreKeyMaintenance(): Promise<void> {
+    try {
+      const result = await this.executePreKeyMaintenanceCycle({ republishIfPublished: true });
+      if (result.maintenance.action !== 'none') {
+        logger.info('Maintained current device pre-key health in background', result);
+      }
+      if (result.republishError) {
+        logger.warn('Background pre-key maintenance republish failed', {
+          error: result.republishError,
+        });
+      }
+    } catch (error) {
+      logger.warn('Background pre-key maintenance failed', {
+        error: (error as Error).message,
+      });
+    }
+  }
+
   private async startRelayStack(): Promise<void> {
+    const preKeyMaintenance = await this.executePreKeyMaintenanceCycle({ republishIfPublished: false });
+    if (preKeyMaintenance.maintenance.action !== 'none') {
+      logger.info('Maintained current device pre-key health on daemon start', preKeyMaintenance);
+    }
+
     const keyPair = this.getKeyPair();
     const signedCard = await this.buildSignedAgentCard();
     const policy = this.getReachabilityPolicy();
@@ -1023,6 +1410,8 @@ export class ClawDaemon {
     this.router.registerCatchAllHandler(async (envelope) => {
       return await this.handleIncomingMessage(envelope);
     });
+
+    this.startPreKeyMaintenanceLoop();
   }
 
   private async restartRelayStack(): Promise<void> {
@@ -1568,12 +1957,11 @@ export class ClawDaemon {
 
   private async handleSend(req: DaemonRequest): Promise<DaemonResponse> {
     const { to, protocol, payload, type, replyTo, threadId } = req.params;
+    const deliveryMode = normalizeSendDeliveryMode(req.params?.deliveryMode);
 
     if (!this.relayClient) {
       return { id: req.id, success: false, error: 'Relay client not initialized' };
     }
-
-    const keyPair = this.getKeyPair();
 
     try {
       return await this.withPeerSessionLock(to, async () => {
@@ -1588,7 +1976,47 @@ export class ClawDaemon {
           }
 
           try {
-            const encrypted = await this.prepareEncryptedSendsWithoutCommit({
+            const normalizedProtocol = protocol ?? '/agent/msg/1.0.0';
+            const normalizedType = type || 'message';
+            const sendResult = deliveryMode === 'disabled'
+              ? await this.sendPlaintextEnvelope({
+                to,
+                protocol: normalizedProtocol,
+                payload,
+                type: normalizedType,
+                replyTo,
+                threadId,
+              })
+              : await this.sendEncryptedEnvelope({
+                to,
+                protocol: normalizedProtocol,
+                payload,
+                type: normalizedType,
+                replyTo,
+                threadId,
+              });
+
+            return {
+              id: req.id,
+              success: true,
+              data: {
+                id: sendResult.id,
+                messageId: sendResult.id,
+                deliveryMode,
+                deliveryPath: sendResult.deliveryPath,
+                transportStatus: sendResult.transportStatus,
+              },
+            };
+          } catch (e2eError) {
+            if (!canFallbackToPlaintextDelivery(deliveryMode, e2eError)) {
+              return {
+                id: req.id,
+                success: false,
+                error: (e2eError as Error).message,
+              };
+            }
+
+            const sendResult = await this.sendPlaintextEnvelope({
               to,
               protocol: protocol ?? '/agent/msg/1.0.0',
               payload,
@@ -1597,108 +2025,16 @@ export class ClawDaemon {
               threadId,
             });
 
-            const applicationEnvelope = encrypted.applicationEnvelope;
-
-            const e2eDeliveries: E2EDeliveryMetadata[] = encrypted.targets.map((target) => ({
-              transport: target.transport,
-              transportMessageId: target.outerEnvelope.id,
-              senderDeviceId: target.senderDeviceId,
-              receiverDeviceId: target.recipientDeviceId,
-              sessionId: target.sessionId,
-              state: 'pending',
-              recordedAt: Date.now(),
-            }));
-
-            if (this.queue) {
-              await this.queue.enqueueOutbound(applicationEnvelope, e2eDeliveries);
-            }
-
-            for (const target of encrypted.targets) {
-              const pendingDelivery: E2EDeliveryMetadata = {
-                transport: target.transport,
-                transportMessageId: target.outerEnvelope.id,
-                senderDeviceId: target.senderDeviceId,
-                receiverDeviceId: target.recipientDeviceId,
-                sessionId: target.sessionId,
-                state: 'pending',
-                recordedAt: Date.now(),
-              };
-
-              try {
-                await this.sendEnvelopeAwaitAccepted(to, target.outerEnvelopeBytes);
-                if (target.configAfterSend) {
-                  await this.commitAcceptedE2EConfig(target.configAfterSend);
-                }
-                if (this.queue) {
-                  await this.queue.appendE2EDelivery(applicationEnvelope.id, {
-                    ...pendingDelivery,
-                    state: 'sent',
-                    recordedAt: Date.now(),
-                    error: undefined,
-                  });
-                }
-              } catch (error) {
-                if (this.queue) {
-                  await this.queue.appendE2EDelivery(applicationEnvelope.id, {
-                    ...pendingDelivery,
-                    state: 'failed',
-                    recordedAt: Date.now(),
-                    error: (error as Error).message,
-                  });
-                  await this.queue.markOutboundFailed(applicationEnvelope.id, (error as Error).message);
-                }
-                throw error;
-              }
-            }
-
-            if (this.queue) {
-              await this.queue.markOutboundDelivered(applicationEnvelope.id);
-            }
-
             return {
               id: req.id,
               success: true,
-              data: { id: applicationEnvelope.id },
-            };
-          } catch (e2eError) {
-            if (!this.shouldFallbackToPlaintext(e2eError)) {
-              return {
-                id: req.id,
-                success: false,
-                error: (e2eError as Error).message,
-              };
-            }
-
-            const envelope = createEnvelope(
-              this.identity.did,
-              to,
-              type || 'message',
-              protocol,
-              payload,
-              replyTo,
-              threadId,
-            );
-
-            const signedEnvelope = await signEnvelope(envelope, (data) =>
-              sign(data, keyPair.privateKey)
-            );
-
-            if (this.queue) {
-              await this.queue.enqueueOutbound(signedEnvelope);
-            }
-
-            if (this.router) {
-              await this.router.sendMessage(signedEnvelope);
-            }
-
-            if (this.queue) {
-              await this.queue.markOutboundDelivered(signedEnvelope.id);
-            }
-
-            return {
-              id: req.id,
-              success: true,
-              data: { id: signedEnvelope.id },
+              data: {
+                id: sendResult.id,
+                messageId: sendResult.id,
+                deliveryMode,
+                deliveryPath: sendResult.deliveryPath,
+                transportStatus: sendResult.transportStatus,
+              },
             };
           }
         });
@@ -1715,11 +2051,15 @@ export class ClawDaemon {
   private async handleReloadE2E(req: DaemonRequest): Promise<DaemonResponse> {
     const cancelled = this.clearAllPendingRecovery();
     const clearedRecoveringPeers = this.clearAllPeerRecoveryStates();
+    const preKeyMaintenance = await this.executePreKeyMaintenanceCycle({ republishIfPublished: true });
     const result = await withLocalE2EStateTransaction(this.identity, async ({ e2eConfig }) => {
       const currentDevice = e2eConfig.devices[e2eConfig.currentDeviceId];
       return {
         deviceId: e2eConfig.currentDeviceId,
         sessionCount: Object.keys(currentDevice?.sessions ?? {}).length,
+        preKeyMaintenance: preKeyMaintenance.maintenance,
+        republished: preKeyMaintenance.republished,
+        republishError: preKeyMaintenance.republishError,
         cancelledReplayPeers: cancelled.replayPeers,
         cancelledRetryPeers: cancelled.retryPeers,
         clearedRecoveringPeers,
@@ -1831,6 +2171,11 @@ export class ClawDaemon {
 
     setAgentCard(nextCard);
 
+    const preKeyMaintenance = await this.executePreKeyMaintenanceCycle({ republishIfPublished: false });
+    if (preKeyMaintenance.maintenance.action !== 'none') {
+      logger.info('Maintained current device pre-key health before publish', preKeyMaintenance);
+    }
+
     const signedCard = await this.buildSignedAgentCard(nextCard);
     await this.publishDiscoveryState(signedCard);
 
@@ -1883,18 +2228,25 @@ export class ClawDaemon {
     const reachabilityStatus = this.buildReachabilityStatus();
     const connectedRelays = this.relayClient.getConnectedRelays();
     const stats = this.queue ? await this.queue.getStats() : null;
+    const e2eHealth = buildE2EHealthSummary(getE2EConfig());
 
     return {
       id: req.id,
       success: true,
       data: {
         running: true,
+        runtime: 'js',
+        socketPath: this.socketPath,
         connected: connectedRelays.length > 0,
         relay: connectedRelays[0] || null,
         connectedRelays,
         knownRelays: this.relayClient.getKnownRelays(),
         peerCount: this.relayClient.getPeerCount(),
         messages: stats?.inboxTotal ?? 0,
+        messageStoreLoaded: Boolean(this.queue),
+        queueStats: stats,
+        e2eHealth,
+        preKeyMaintenance: this.preKeyMaintenanceStatus,
         did: this.identity.did,
         reachabilityPolicy,
         reachabilityStatus,

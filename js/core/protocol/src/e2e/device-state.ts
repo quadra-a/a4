@@ -10,7 +10,7 @@ import type {
 import { bytesToHex, generateX25519KeyPair, hexToBytes, randomBytes } from './x25519.js';
 import { signSignedPreKeyRecord } from './signed-pre-key.js';
 
-const DEFAULT_ONE_TIME_PRE_KEY_COUNT = 16;
+export const DEFAULT_ONE_TIME_PRE_KEY_COUNT = 16;
 
 function nowMs(): number {
   return Date.now();
@@ -232,6 +232,29 @@ export async function rotateLocalDeviceSignedPreKey(
   nextDevice.oneTimePreKeys = buildOneTimePreKeys(oneTimePreKeyCount, createdAt);
   nextDevice.lastResupplyAt = createdAt;
 
+  return nextConfig;
+}
+
+export function resupplyLocalDeviceOneTimePreKeys(
+  config: LocalE2EConfig,
+  deviceId: string,
+  options: {
+    oneTimePreKeyCount?: number;
+    now?: number;
+  } = {},
+): LocalE2EConfig {
+  const existingDevice = config.devices[deviceId];
+  if (!existingDevice) {
+    throw new Error(`Missing local E2E device state for ${deviceId}`);
+  }
+
+  const createdAt = options.now ?? nowMs();
+  const oneTimePreKeyCount = options.oneTimePreKeyCount
+    ?? Math.max(existingDevice.oneTimePreKeys.filter((key) => !key.claimedAt).length, DEFAULT_ONE_TIME_PRE_KEY_COUNT);
+  const nextConfig = cloneLocalE2EConfig(config);
+  const nextDevice = nextConfig.devices[deviceId];
+  nextDevice.oneTimePreKeys = buildOneTimePreKeys(oneTimePreKeyCount, createdAt);
+  nextDevice.lastResupplyAt = createdAt;
   return nextConfig;
 }
 

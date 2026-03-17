@@ -39,6 +39,7 @@ pub mod e2e;
 
 // Admin commands
 pub mod peers;
+pub mod prekeys;
 pub mod serve;
 
 // Removal stubs (CVP-0020)

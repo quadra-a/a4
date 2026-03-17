@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { extractPrimaryProtocol, resolveTellMessageType } from '../dist/index.js';
+import {
+  extractPrimaryProtocol,
+  resolveTellMessageType,
+  shouldAutoSelectTellProtocol,
+} from '../dist/index.js';
 
 test('extractPrimaryProtocol prefers capability metadata.protocol', () => {
   const protocol = extractPrimaryProtocol([
@@ -55,4 +59,10 @@ test('extractPrimaryProtocol returns null for ambiguous protocol metadata', () =
 test('resolveTellMessageType treats --reply-to as a formal reply', () => {
   assert.equal(resolveTellMessageType('msg-1'), 'reply');
   assert.equal(resolveTellMessageType(undefined), 'message');
+});
+
+test('shouldAutoSelectTellProtocol only enables auto selection for structured bodies', () => {
+  assert.equal(shouldAutoSelectTellProtocol({ message: 'hello', bodyFormat: undefined }), false);
+  assert.equal(shouldAutoSelectTellProtocol({ bodyFormat: 'text' }), false);
+  assert.equal(shouldAutoSelectTellProtocol({ bodyFormat: 'json' }), true);
 });

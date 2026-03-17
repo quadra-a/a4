@@ -45,6 +45,7 @@ import { registerTraceCommand } from './commands/trace.js';
 import { registerWaitCommand } from './commands/wait.js';
 import { registerReachabilityCommand } from './commands/reachability.js';
 import { registerE2ECommand } from './commands/e2e.js';
+import { registerPrekeysCommand } from './commands/prekeys.js';
 
 const require = createRequire(import.meta.url);
 const { version } = require('../package.json');
@@ -76,6 +77,7 @@ registerTraceCommand(program);
 registerWaitCommand(program);
 registerReachabilityCommand(program);
 registerE2ECommand(program);
+registerPrekeysCommand(program);
 registerStopCommand(program);
 registerServeCommand(program);
 registerPeersCommand(program);
@@ -104,7 +106,11 @@ if (isMain) {
   program.parse();
 }
 
-export { extractPrimaryProtocol, resolveTellMessageType } from './commands/tell.js';
+export {
+  extractPrimaryProtocol,
+  resolveTellMessageType,
+  shouldAutoSelectTellProtocol,
+} from './commands/tell.js';
 export {
   buildServeHandlers,
   claimServeMessage,
@@ -114,3 +120,4 @@ export {
   protocolMatchesCapability,
   releaseServeMessage,
 } from './commands/serve.js';
+export { buildPrekeysReport } from './commands/prekeys.js';

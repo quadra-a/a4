@@ -6,8 +6,12 @@ use std::path::{Path, PathBuf};
 
 use crate::commands::message_lifecycle::find_message_outcome;
 use crate::commands::serve::protocol_matches_capability;
+use crate::commands::tell::{should_auto_select_protocol, DeliveryMode, TellOptions};
 use crate::config::Config;
-use crate::daemon::{inbox_message_visible, message_to_inbox_json, stored_message_status};
+use crate::daemon::{
+    can_fallback_to_plaintext_delivery, inbox_message_visible, message_to_inbox_json,
+    stored_message_status,
+};
 use quadra_a_runtime::inbox::{
     E2EDeliveryMetadata, E2EDeliveryState, MessageDirection, MessageStore, StoredMessage,
     StoredMessageE2EMetadata,
@@ -121,6 +125,8 @@ fn evaluate_case(subject: &str, input: &Value) -> Result<Value> {
         "reply-correlation" => evaluate_reply_correlation(input),
         "block-filtering" => evaluate_block_filtering(input),
         "daemon-persistence" => evaluate_daemon_persistence(input),
+        "delivery-mode" => evaluate_delivery_mode(input),
+        "tell-protocol-selection" => evaluate_tell_protocol_selection(input),
         other => bail!("Unknown conformance subject: {}", other),
     }
 }
@@ -236,6 +242,38 @@ fn evaluate_daemon_persistence(input: &Value) -> Result<Value> {
                 .and_then(|value| value.as_str())
         }),
         "status": outcome.as_ref().and_then(|value| value.status.clone()),
+    }))
+}
+
+fn evaluate_delivery_mode(input: &Value) -> Result<Value> {
+    let delivery_mode = DeliveryMode::parse(input.get("mode").and_then(|value| value.as_str()))?;
+    let mut actual = json!({
+        "mode": delivery_mode.as_str(),
+    });
+
+    if let Some(error_message) = input.get("fallbackError").and_then(|value| value.as_str()) {
+        actual["fallbackToPlaintext"] = json!(can_fallback_to_plaintext_delivery(
+            delivery_mode,
+            &anyhow::anyhow!(error_message.to_string()),
+        ));
+    }
+
+    Ok(actual)
+}
+
+fn evaluate_tell_protocol_selection(input: &Value) -> Result<Value> {
+    let mut options = sample_tell_options();
+    options.message = input
+        .get("message")
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned);
+    options.body_format = input
+        .get("bodyFormat")
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned);
+
+    Ok(json!({
+        "autoSelect": should_auto_select_protocol(&options),
     }))
 }
 
@@ -407,4 +445,25 @@ fn required_str<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
         .get(field)
         .and_then(|item| item.as_str())
         .ok_or_else(|| anyhow::anyhow!("Missing string field '{}'", field))
+}
+
+fn sample_tell_options() -> TellOptions {
+    TellOptions {
+        target: "did:agent:peer".to_string(),
+        message: None,
+        body: Some("{}".to_string()),
+        body_file: None,
+        body_stdin: false,
+        body_format: Some("json".to_string()),
+        protocol: "/agent/msg/1.0.0".to_string(),
+        protocol_explicit: false,
+        delivery_mode: "required".to_string(),
+        reply_to: None,
+        thread: None,
+        new_thread: false,
+        wait: None,
+        relay: None,
+        json: false,
+        human: false,
+    }
 }

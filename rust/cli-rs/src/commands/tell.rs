@@ -29,6 +29,7 @@ pub struct TellOptions {
     pub body_format: Option<String>,
     pub protocol: String,
     pub protocol_explicit: bool,
+    pub delivery_mode: String,
     pub reply_to: Option<String>,
     pub thread: Option<String>,
     pub new_thread: bool,
@@ -60,6 +61,35 @@ enum ProtocolSelection {
     Auto,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeliveryMode {
+    Required,
+    Preferred,
+    Disabled,
+}
+
+impl DeliveryMode {
+    pub(crate) fn parse(value: Option<&str>) -> Result<Self> {
+        match value.map(str::trim) {
+            None | Some("") | Some("required") => Ok(Self::Required),
+            Some("preferred") => Ok(Self::Preferred),
+            Some("disabled") => Ok(Self::Disabled),
+            Some(other) => bail!(
+                "Delivery mode must be one of: required, preferred, disabled (got '{}')",
+                other
+            ),
+        }
+    }
+
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::Required => "required",
+            Self::Preferred => "preferred",
+            Self::Disabled => "disabled",
+        }
+    }
+}
+
 impl ProtocolSelection {
     fn as_str(&self) -> &'static str {
         match self {
@@ -73,6 +103,10 @@ impl ProtocolSelection {
 struct ResolvedTellBody {
     format: TellBodyFormat,
     payload: Value,
+}
+
+pub(crate) fn should_auto_select_protocol(opts: &TellOptions) -> bool {
+    opts.message.is_none() && opts.body_format.as_deref() == Some("json")
 }
 
 pub(crate) struct EnvelopeThreading {
@@ -203,6 +237,7 @@ fn resolve_tell_body(opts: &TellOptions, effective_protocol: &str) -> Result<Res
 
 pub async fn run(opts: TellOptions) -> Result<()> {
     validate_tell_body_input(&opts)?;
+    let delivery_mode = DeliveryMode::parse(Some(&opts.delivery_mode))?;
     let mut config = load_config()?;
 
     let identity = config
@@ -212,6 +247,10 @@ pub async fn run(opts: TellOptions) -> Result<()> {
 
     let daemon = DaemonClient::new(&daemon_socket_path());
     let daemon_status = daemon.send_command("status", json!({})).await.ok();
+    let daemon_available = daemon_status.is_some();
+    if !daemon_available {
+        bail!("Daemon not running. Start with: a4 listen --background");
+    }
     let resolution_relay = opts.relay.as_deref().or_else(|| {
         daemon_status
             .as_ref()
@@ -229,10 +268,13 @@ pub async fn run(opts: TellOptions) -> Result<()> {
         ProtocolSelection::Default
     };
     let mut protocol_selection_reason: Option<&str> = None;
-    let effective_protocol = if !opts.protocol_explicit && opts.protocol == "/agent/msg/1.0.0" {
+    let effective_protocol = if !opts.protocol_explicit
+        && opts.protocol == "/agent/msg/1.0.0"
+        && should_auto_select_protocol(&opts)
+    {
         let mut declared_protocols = if let Some(card) = &resolved_target.agent {
             collect_declared_protocols(card)
-        } else if daemon_status.is_some() {
+        } else if daemon_available {
             match daemon
                 .send_command("query-card", json!({"did": &recipient_did}))
                 .await
@@ -302,13 +344,14 @@ pub async fn run(opts: TellOptions) -> Result<()> {
         }
     }
 
-    if daemon_status.is_some() {
+    if daemon_available {
         let message_type = tell_message_type(opts.reply_to.as_deref());
         let mut params = json!({
             "to": recipient_did,
             "type": message_type,
             "protocol": effective_protocol,
             "payload": payload,
+            "deliveryMode": delivery_mode.as_str(),
         });
 
         if let Some(reply_to) = &opts.reply_to {
@@ -326,10 +369,25 @@ pub async fn run(opts: TellOptions) -> Result<()> {
                     .or_else(|| response.get("messageId"))
                     .and_then(|value| value.as_str())
                     .unwrap_or("unknown");
+                let delivery_path = response
+                    .get("deliveryPath")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("e2e");
+                let transport_status = response
+                    .get("transportStatus")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("accepted");
+                let effective_delivery_mode = response
+                    .get("deliveryMode")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(delivery_mode.as_str());
 
                 if let Some(timeout_secs) = wait_timeout_secs {
                     if opts.human {
                         println!("Message ID: {}", message_id);
+                        println!("Path: daemon-backed send ({})", delivery_path);
+                        println!("Delivery Mode: {}", effective_delivery_mode);
+                        println!("Transport Status: {}", transport_status);
                         println!(
                             "Protocol: {} ({})",
                             effective_protocol,
@@ -358,6 +416,9 @@ pub async fn run(opts: TellOptions) -> Result<()> {
                                     body_format,
                                     payload: &payload,
                                     thread_id: thread_id.as_deref(),
+                                    delivery_mode: effective_delivery_mode,
+                                    delivery_path,
+                                    transport_status,
                                     timeout_secs,
                                     outcome: outcome.as_ref(),
                                 },
@@ -394,8 +455,13 @@ pub async fn run(opts: TellOptions) -> Result<()> {
                             "messageId": message_id,
                             "to": recipient_did,
                             "protocol": effective_protocol,
+                            "actualProtocol": effective_protocol,
                             "protocolSelection": protocol_selection.as_str(),
                             "protocolSelectionReason": protocol_selection_reason,
+                            "deliveryMode": effective_delivery_mode,
+                            "deliveryPath": delivery_path,
+                            "transportStatus": transport_status,
+                            "usedDaemon": true,
                             "bodyFormat": body_format.as_str(),
                             "payload": payload,
                             "threadId": thread_id,
@@ -404,6 +470,9 @@ pub async fn run(opts: TellOptions) -> Result<()> {
                     );
                 } else if opts.human {
                     println!("Relay accepted message via daemon ({})", message_id);
+                    println!("Path: daemon-backed send ({})", delivery_path);
+                    println!("Delivery Mode: {}", effective_delivery_mode);
+                    println!("Transport Status: {}", transport_status);
                     println!(
                         "Protocol: {} ({})",
                         effective_protocol,
@@ -417,6 +486,12 @@ pub async fn run(opts: TellOptions) -> Result<()> {
                     LlmFormatter::section("Message Sent");
                     LlmFormatter::key_value("Message ID", message_id);
                     LlmFormatter::key_value("To", &recipient_did);
+                    LlmFormatter::key_value(
+                        "Path",
+                        &format!("daemon-backed send ({})", delivery_path),
+                    );
+                    LlmFormatter::key_value("Delivery Mode", effective_delivery_mode);
+                    LlmFormatter::key_value("Transport Status", transport_status);
                     LlmFormatter::key_value("Protocol", &effective_protocol);
                     LlmFormatter::key_value("Protocol Selection", protocol_selection.as_str());
                     if let Some(reason) = protocol_selection_reason {
@@ -452,10 +527,7 @@ pub async fn run(opts: TellOptions) -> Result<()> {
                     );
                     std::process::exit(1);
                 }
-                bail!(
-                    "Daemon send failed: {}. Stop daemon first for direct relay mode: a4 stop",
-                    error
-                );
+                bail!("Daemon send failed: {}", error);
             }
         }
     }
@@ -549,6 +621,9 @@ pub async fn run(opts: TellOptions) -> Result<()> {
                     body_format,
                     payload: &payload,
                     thread_id: thread_id.as_deref(),
+                    delivery_mode: delivery_mode.as_str(),
+                    delivery_path: "e2e",
+                    transport_status: "accepted",
                     timeout_secs,
                     outcome: outcome.as_ref(),
                 }))?
@@ -923,6 +998,9 @@ struct WaitJsonResponse<'a> {
     body_format: TellBodyFormat,
     payload: &'a Value,
     thread_id: Option<&'a str>,
+    delivery_mode: &'a str,
+    delivery_path: &'a str,
+    transport_status: &'a str,
     timeout_secs: u64,
     outcome: Option<&'a MessageOutcome>,
 }
@@ -932,8 +1010,13 @@ fn build_wait_json_response(args: WaitJsonResponse<'_>) -> Value {
         "messageId": args.message_id,
         "to": args.recipient_did,
         "protocol": args.effective_protocol,
+        "actualProtocol": args.effective_protocol,
         "protocolSelection": args.protocol_selection.as_str(),
         "protocolSelectionReason": args.protocol_selection_reason,
+        "deliveryMode": args.delivery_mode,
+        "deliveryPath": args.delivery_path,
+        "transportStatus": args.transport_status,
+        "usedDaemon": true,
         "bodyFormat": args.body_format.as_str(),
         "payload": args.payload,
         "threadId": args.thread_id,
@@ -1092,9 +1175,9 @@ fn describe_protocols(protocols: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_wait_json_response, extract_primary_protocol, tell_message_type,
-        validate_tell_body_input, ProtocolSelection, TellBodyFormat, TellOptions,
-        WaitJsonResponse,
+        build_wait_json_response, extract_primary_protocol, should_auto_select_protocol,
+        tell_message_type, validate_tell_body_input, DeliveryMode, ProtocolSelection,
+        TellBodyFormat, TellOptions, WaitJsonResponse,
     };
     use crate::commands::message_lifecycle::{MessageOutcome, MessageOutcomeKind};
     use crate::protocol::{AgentCard, Capability};
@@ -1154,6 +1237,9 @@ mod tests {
             body_format: TellBodyFormat::Text,
             payload: &json!({ "text": "hello" }),
             thread_id: Some("thread_123"),
+            delivery_mode: "required",
+            delivery_path: "e2e",
+            transport_status: "accepted",
             timeout_secs: 30,
             outcome: Some(&outcome),
         });
@@ -1187,6 +1273,9 @@ mod tests {
             body_format: TellBodyFormat::Json,
             payload: &json!({ "task": "compute" }),
             thread_id: None,
+            delivery_mode: "required",
+            delivery_path: "e2e",
+            transport_status: "accepted",
             timeout_secs: 15,
             outcome: Some(&outcome),
         });
@@ -1235,6 +1324,66 @@ mod tests {
     }
 
     #[test]
+    fn auto_protocol_selection_only_applies_to_structured_bodies() {
+        assert!(!should_auto_select_protocol(&TellOptions {
+            target: "gpu".to_string(),
+            message: Some("hello".to_string()),
+            body: None,
+            body_file: None,
+            body_stdin: false,
+            body_format: None,
+            protocol: "/agent/msg/1.0.0".to_string(),
+            protocol_explicit: false,
+            delivery_mode: DeliveryMode::Required.as_str().to_string(),
+            reply_to: None,
+            thread: None,
+            new_thread: false,
+            wait: None,
+            relay: None,
+            json: false,
+            human: false,
+        }));
+
+        assert!(!should_auto_select_protocol(&TellOptions {
+            target: "gpu".to_string(),
+            message: None,
+            body: Some("hello".to_string()),
+            body_file: None,
+            body_stdin: false,
+            body_format: Some("text".to_string()),
+            protocol: "/agent/msg/1.0.0".to_string(),
+            protocol_explicit: false,
+            delivery_mode: DeliveryMode::Required.as_str().to_string(),
+            reply_to: None,
+            thread: None,
+            new_thread: false,
+            wait: None,
+            relay: None,
+            json: false,
+            human: false,
+        }));
+
+        assert!(should_auto_select_protocol(&TellOptions {
+            target: "gpu".to_string(),
+            message: None,
+            body: Some("{\"size\":1024}".to_string()),
+            body_file: None,
+            body_stdin: false,
+            body_format: Some("json".to_string()),
+            protocol: "/agent/msg/1.0.0".to_string(),
+            protocol_explicit: false,
+            delivery_mode: DeliveryMode::Required.as_str().to_string(),
+            reply_to: None,
+            thread: None,
+            new_thread: false,
+            wait: None,
+            relay: None,
+            json: false,
+            human: false,
+        }));
+    }
+
+    #[test]
     fn validate_tell_body_rejects_positional_json_format() {
         let error = validate_tell_body_input(&TellOptions {
             target: "gpu".to_string(),
@@ -1245,6 +1394,7 @@ mod tests {
             body_format: Some("json".to_string()),
             protocol: "/agent/msg/1.0.0".to_string(),
             protocol_explicit: false,
+            delivery_mode: "required".to_string(),
             reply_to: None,
             thread: None,
             new_thread: false,

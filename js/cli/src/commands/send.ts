@@ -4,6 +4,7 @@ import {
   buildMessagePayload,
   dispatchMessage,
   formatMessagePayload,
+  normalizeDeliveryMode,
   redactPayloadForDisplay,
   resolveTargetDid,
   resolveThreadId,
@@ -61,6 +62,7 @@ export function registerSendCommand(program: Command): void {
     .option('--file <path>', 'Attach a file as payload attachment')
     .option('--type <type>', 'Message type (request|notification|message|reply|response)', 'request')
     .option('--reply-to <message-id>', 'Reply to an existing message ID')
+    .option('--delivery-mode <mode>', 'Delivery mode: required|preferred|disabled', 'required')
     .option('--wait [seconds]', 'Wait for a result (default: 30s)')
     .option('--relay <url>', 'Relay WebSocket URL')
     .option('--format <fmt>', 'Output format: text|json', 'text')
@@ -73,6 +75,7 @@ export function registerSendCommand(program: Command): void {
         if (options.json) options.format = 'json';
         const isHuman = Boolean(options.human) && options.format !== 'json';
         const normalized = normalizeSendType(options.type);
+        const deliveryMode = normalizeDeliveryMode(options.deliveryMode);
         const explicitWaitMs = parseWaitTimeoutMs(options.wait);
         const waitTimeoutMs = explicitWaitMs ?? (normalized.waitByDefault ? 30_000 : undefined);
         const replyTo = options.replyTo
@@ -107,6 +110,7 @@ export function registerSendCommand(program: Command): void {
           type: normalized.type,
           replyTo,
           threadId,
+          deliveryMode,
           relay: options.relay,
         });
 
@@ -133,6 +137,9 @@ export function registerSendCommand(program: Command): void {
             messageId: result.id,
             type: normalized.type,
             replyTo: replyTo ?? null,
+            deliveryMode: result.deliveryMode,
+            deliveryPath: result.deliveryPath,
+            transportStatus: result.transportStatus,
             payload: redactPayloadForDisplay(payload),
             waitSeconds: waitTimeoutMs != null ? waitTimeoutMs / 1000 : null,
             reply: outcome?.kind === 'reply' ? serializeStoredMessage(outcome.message) : null,
@@ -149,9 +156,7 @@ export function registerSendCommand(program: Command): void {
             notes: waitTimeoutMs !== undefined && !outcome
               ? [
                   'Result timeout does not prove remote failure.',
-                  result.usedDaemon
-                    ? `Inspect local lifecycle with: agent trace ${result.id}`
-                    : 'This send used direct relay mode, so daemon-backed trace data is unavailable.',
+                  `Inspect local lifecycle with: agent trace ${result.id}`,
                 ]
               : [],
           }, null, 2));
@@ -175,10 +180,10 @@ export function registerSendCommand(program: Command): void {
           info(`Thread: ${threadId}`);
         }
         info(`Payload: ${JSON.stringify(redactPayloadForDisplay(payload))}`);
-        info(`Path: ${result.usedDaemon ? 'daemon-backed send' : 'direct relay fallback'}`);
-        if (result.usedDaemon) {
-          info(`Trace with: agent trace ${result.id}`);
-        }
+        info(`Path: daemon-backed send (${result.deliveryPath})`);
+        info(`Delivery Mode: ${result.deliveryMode}`);
+        info(`Transport Status: ${result.transportStatus}`);
+        info(`Trace with: agent trace ${result.id}`);
 
         if (waitTimeoutMs !== undefined) {
           if (!outcome) {

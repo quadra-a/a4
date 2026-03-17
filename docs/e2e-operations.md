@@ -57,17 +57,19 @@ First-contact initiators fetch claimed pre-key material through the relay contro
 
 ## What counts as a health signal today
 
-There is not yet a frozen dedicated `a4 prekeys` operator command. The current operator-facing signals are:
+The current operator-facing signals are:
 
+- `a4 prekeys` for a dedicated local view of device inventory, signed pre-key age, session count, and the published device-directory surface
 - the published device directory fields `oneTimePreKeyCount` and `lastResupplyAt`
+- daemon background maintenance that replenishes low one-time pre-key inventory and rotates stale signed pre-keys
 - daemon-start publication logs showing that pre-key bundles were republished
 - local persisted E2E device state in the runtime configuration
 - retained scenario artifacts from `test-scripts/e2e/test-e2e-cross-lang.sh`, `test-scripts/e2e/test-e2e-negative.sh`, and `test-scripts/e2e/test-e2e-real-machine.sh`
 
 In practice today:
 
-- JS operators inspect the published device directory and the local runtime config that stores the `e2e` object
-- Rust operators can inspect `a4 status --json`, which includes the persisted config payload, plus the published device directory
+- JS and Rust operators can inspect `a4 prekeys` or `a4 prekeys --json` for the local/published pre-key view
+- `a4 status --json` carries the lightweight `e2eHealth` summary plus `preKeyMaintenance` metadata for the daemon's last check, last action, last republish, and last error
 - both runtimes publish `AgentCard.devices[].oneTimePreKeyCount` / `lastResupplyAt`, which is the interoperable low-inventory signal available to peers and operators
 
 ## Operational caveats

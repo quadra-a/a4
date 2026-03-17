@@ -18,11 +18,23 @@ import type { ReachabilityStatus } from './reachability.js';
 
 export interface DaemonStatus {
   did: string;
+  runtime?: 'js' | 'rust';
+  socketPath?: string;
   connectedRelays?: string[];
   knownRelays?: string[];
   reachabilityPolicy?: ReachabilityPolicyResponse['policy'];
   reachabilityStatus?: ReachabilityStatus;
   peerCount?: number;
+  messageStoreLoaded?: boolean;
+  queueStats?: Record<string, unknown> | null;
+  e2eHealth?: {
+    available: boolean;
+    currentDeviceId: string | null;
+    deviceCount: number;
+    sessionCount: number;
+    oneTimePreKeysRemaining: number;
+    signedPreKeyAgeMs: number | null;
+  };
 }
 
 export interface DaemonStartResult {

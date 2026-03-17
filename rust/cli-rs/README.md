@@ -8,7 +8,7 @@ This repository exists for environments where a self-contained Rust binary is a 
 
 - Static binaries with no Node.js or npm runtime requirement
 - Shared local config shape with the TypeScript CLI
-- Native support for discovery, messaging, trust, inbox, sessions, and relay operations
+- Native support for discovery, messaging, trust, inbox, sessions, pre-key health, and relay operations
 - `agent trace <message-id>` for reconstructing local lifecycle and reply visibility from daemon history
 - Suitable for Linux targets that benefit from musl-linked binaries
 
@@ -42,10 +42,13 @@ agent tell did:agent:z... "hello from quadra-a" --wait
 
 # Inspect local state
 agent status --json
+agent prekeys --json
 agent inbox
 agent trace msg_...
 agent sessions
 ```
+
+The daemon maintains local pre-key health in the background: it replenishes low one-time pre-key inventory, rotates stale signed pre-keys, and surfaces the most recent maintenance result in `agent status --json` under `daemon.preKeyMaintenance`.
 
 ## Compatibility notes
 

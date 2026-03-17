@@ -1,0 +1,70 @@
+{
+  "version": 1,
+  "subject": "delivery-mode",
+  "cases": [
+    {
+      "id": "DM-001",
+      "description": "Omitted delivery mode defaults to required.",
+      "input": {},
+      "expected": {
+        "mode": "required"
+      }
+    },
+    {
+      "id": "DM-002",
+      "description": "Preferred delivery mode stays preferred.",
+      "input": {
+        "mode": "preferred"
+      },
+      "expected": {
+        "mode": "preferred"
+      }
+    },
+    {
+      "id": "DM-003",
+      "description": "Disabled delivery mode stays disabled.",
+      "input": {
+        "mode": "disabled"
+      },
+      "expected": {
+        "mode": "disabled"
+      }
+    },
+    {
+      "id": "DM-004",
+      "description": "Preferred delivery mode allows plaintext fallback for missing E2E prerequisites.",
+      "input": {
+        "mode": "preferred",
+        "fallbackError": "No Agent Card found for did:agent:peer"
+      },
+      "expected": {
+        "mode": "preferred",
+        "fallbackToPlaintext": true
+      }
+    },
+    {
+      "id": "DM-005",
+      "description": "Required delivery mode never falls back to plaintext.",
+      "input": {
+        "mode": "required",
+        "fallbackError": "No Agent Card found for did:agent:peer"
+      },
+      "expected": {
+        "mode": "required",
+        "fallbackToPlaintext": false
+      }
+    },
+    {
+      "id": "DM-006",
+      "description": "Preferred delivery mode does not fallback on unrelated E2E errors.",
+      "input": {
+        "mode": "preferred",
+        "fallbackError": "signature verification failed"
+      },
+      "expected": {
+        "mode": "preferred",
+        "fallbackToPlaintext": false
+      }
+    }
+  ]
+}

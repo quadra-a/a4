@@ -7,12 +7,8 @@ import { readFile } from 'node:fs/promises';
 import { basename } from 'node:path';
 import { getAliases } from './config.js';
 import { DaemonClient } from './daemon-client.js';
-import { prepareEncryptedSends } from './e2e-send.js';
-import { withLocalE2EStateTransaction } from './e2e-state.js';
 import {
-  requireIdentity,
   searchAgents,
-  withRelaySession,
   type DiscoveryAgent,
 } from './agent-runtime.js';
 
@@ -59,12 +55,18 @@ export interface DispatchMessageInput {
   type?: MessageEnvelopeType;
   replyTo?: string;
   threadId?: string;
+  deliveryMode?: DeliveryMode;
   relay?: string;
 }
+
+export type DeliveryMode = 'required' | 'preferred' | 'disabled';
 
 export interface DispatchMessageResult {
   id: string;
   usedDaemon: boolean;
+  deliveryMode: DeliveryMode;
+  deliveryPath: 'e2e' | 'plaintext';
+  transportStatus: string;
 }
 
 function normalizeBodyFormat(bodyFormat?: string): TellBodyFormat {
@@ -73,6 +75,21 @@ function normalizeBodyFormat(bodyFormat?: string): TellBodyFormat {
   }
 
   throw new Error('Body format must be either "text" or "json".');
+}
+
+export function normalizeDeliveryMode(deliveryMode?: string): DeliveryMode {
+  switch (deliveryMode?.trim()) {
+    case undefined:
+    case '':
+    case 'required':
+      return 'required';
+    case 'preferred':
+      return 'preferred';
+    case 'disabled':
+      return 'disabled';
+    default:
+      throw new Error('Delivery mode must be one of: required, preferred, disabled.');
+  }
 }
 
 async function readStdinText(): Promise<string> {
@@ -283,66 +300,36 @@ export async function routeCapability(
 export async function dispatchMessage(input: DispatchMessageInput): Promise<DispatchMessageResult> {
   const protocol = input.protocol ?? '/agent/msg/1.0.0';
   const type = input.type ?? 'message';
+  const deliveryMode = normalizeDeliveryMode(input.deliveryMode);
   const client = new DaemonClient();
 
-  if (await client.isDaemonRunning()) {
-    const result = await client.send<{ id: string }>('send', {
-      to: input.to,
-      protocol,
-      payload: input.payload,
-      type,
-      replyTo: input.replyTo,
-      threadId: input.threadId,
-    });
-
-    return {
-      id: result.id,
-      usedDaemon: true,
-    };
+  if (!(await client.isDaemonRunning())) {
+    throw new Error('Daemon not running. Start with: agent listen --background');
   }
 
-  const identity = requireIdentity();
+  const result = await client.send<{
+    id: string;
+    messageId?: string;
+    deliveryMode?: DeliveryMode;
+    deliveryPath?: 'e2e' | 'plaintext';
+    transportStatus?: string;
+  }>('send', {
+    to: input.to,
+    protocol,
+    payload: input.payload,
+    type,
+    replyTo: input.replyTo,
+    threadId: input.threadId,
+    deliveryMode,
+  });
 
-  return withRelaySession(
-    {
-      relay: input.relay,
-      identity,
-    },
-    async ({ keyPair, relayClient }) => {
-      const encrypted = await withLocalE2EStateTransaction(identity, async ({ e2eConfig }) => {
-        const prepared = await prepareEncryptedSends({
-          identity,
-          keyPair,
-          relayClient,
-          e2eConfig,
-          to: input.to,
-          protocol,
-          payload: input.payload,
-          type,
-          replyTo: input.replyTo,
-          threadId: input.threadId,
-        });
-        return prepared;
-      });
-      for (const target of encrypted.targets) {
-        if (typeof relayClient.sendEnvelopeAwaitAccepted === 'function') {
-          await relayClient.sendEnvelopeAwaitAccepted(input.to, target.outerEnvelopeBytes);
-        } else {
-          await relayClient.sendEnvelope(input.to, target.outerEnvelopeBytes);
-        }
-        if (target.configAfterSend) {
-          await withLocalE2EStateTransaction(identity, async ({ setE2EConfig }) => {
-            setE2EConfig(target.configAfterSend!);
-          });
-        }
-      }
-
-      return {
-        id: encrypted.applicationEnvelope.id,
-        usedDaemon: false,
-      };
-    },
-  );
+  return {
+    id: result.id,
+    usedDaemon: true,
+    deliveryMode: result.deliveryMode ?? deliveryMode,
+    deliveryPath: result.deliveryPath ?? 'e2e',
+    transportStatus: result.transportStatus ?? 'accepted',
+  };
 }
 
 export function formatMessagePayload(payload: unknown): string {

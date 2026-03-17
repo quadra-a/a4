@@ -3,6 +3,7 @@ import { Command } from 'commander';
 import {
   dispatchMessage,
   formatMessagePayload,
+  normalizeDeliveryMode,
   redactPayloadForDisplay,
   resolveTargetDid,
   resolveThreadId,
@@ -17,7 +18,6 @@ import {
   resolveQueuedMessageId,
   waitForMessageOutcome,
 } from '../services/inbox.js';
-import { DaemonClient } from '../services/messaging.js';
 import { error, info, printHeader, success, warn } from '../ui.js';
 
 function serializeStoredMessage(message: StoredMessage | null) {
@@ -38,6 +38,13 @@ function serializeStoredMessage(message: StoredMessage | null) {
 
 export function resolveTellMessageType(replyTo?: string | null): 'message' | 'reply' {
   return replyTo ? 'reply' : 'message';
+}
+
+export function shouldAutoSelectTellProtocol(input: {
+  message?: string;
+  bodyFormat?: string;
+}): boolean {
+  return input.message === undefined && input.bodyFormat === 'json';
 }
 
 export function extractPrimaryProtocol(capabilities?: DiscoveryCapability[]): string | null {
@@ -109,6 +116,7 @@ export function registerTellCommand(program: Command): void {
     .option('--thread <id>', 'Continue an existing thread')
     .option('--new-thread', 'Start a new thread')
     .option('--reply-to <message-id>', 'Correlate this message to an existing message ID')
+    .option('--delivery-mode <mode>', 'Delivery mode: required|preferred|disabled', 'required')
     .option('--wait [seconds]', 'Wait for a result (default: 30s)')
     .option('--relay <url>', 'Relay WebSocket URL')
     .option('--format <fmt>', 'Output format: text|json', 'text')
@@ -128,14 +136,12 @@ export function registerTellCommand(program: Command): void {
           bodyStdin: options.bodyStdin,
           bodyFormat: options.bodyFormat,
         });
+        const deliveryMode = normalizeDeliveryMode(options.deliveryMode);
         const waitTimeoutMs = parseWaitTimeoutMs(options.wait);
         const replyTo = options.replyTo
           ? ((await resolveQueuedMessageId(options.replyTo)) ?? options.replyTo)
           : undefined;
-
-        if (waitTimeoutMs !== undefined) {
-          await ensureDaemonInboxAvailable();
-        }
+        const daemonClient = await ensureDaemonInboxAvailable();
 
         if (isHuman) {
           printHeader('Tell Agent');
@@ -149,20 +155,21 @@ export function registerTellCommand(program: Command): void {
           ? 'explicit'
           : 'default';
         let protocolSelectionReason: string | null = null;
-        if (protocolSelection !== 'explicit' && effectiveProtocol === '/agent/msg/1.0.0') {
+        if (
+          protocolSelection !== 'explicit'
+          && effectiveProtocol === '/agent/msg/1.0.0'
+          && shouldAutoSelectTellProtocol({ message, bodyFormat: options.bodyFormat })
+        ) {
           let declaredProtocols = resolved.agent ? collectDeclaredProtocols(resolved.agent.capabilities) : [];
 
           if (declaredProtocols.length === 0) {
             try {
-              const client = new DaemonClient();
-              if (await client.isDaemonRunning()) {
-                const response = await client.send<
-                  { capabilities?: DiscoveryCapability[] } | { card?: { capabilities?: DiscoveryCapability[] } } | null
-                >('query_agent_card', { did: resolved.did });
-                const queriedCapabilities = unwrapQueriedCapabilities(response);
-                if (queriedCapabilities) {
-                  declaredProtocols = collectDeclaredProtocols(queriedCapabilities);
-                }
+              const response = await daemonClient.send<
+                { capabilities?: DiscoveryCapability[] } | { card?: { capabilities?: DiscoveryCapability[] } } | null
+              >('query_agent_card', { did: resolved.did });
+              const queriedCapabilities = unwrapQueriedCapabilities(response);
+              if (queriedCapabilities) {
+                declaredProtocols = collectDeclaredProtocols(queriedCapabilities);
               }
             } catch {
               // Ignore daemon query errors, fall back to default protocol
@@ -197,6 +204,7 @@ export function registerTellCommand(program: Command): void {
           type: resolveTellMessageType(replyTo),
           replyTo,
           threadId,
+          deliveryMode,
           relay: options.relay,
         });
 
@@ -224,8 +232,12 @@ export function registerTellCommand(program: Command): void {
             replyTo: replyTo ?? null,
             bodyFormat,
             protocol: effectiveProtocol,
+            actualProtocol: effectiveProtocol,
             protocolSelection,
             protocolSelectionReason,
+            deliveryMode: result.deliveryMode,
+            deliveryPath: result.deliveryPath,
+            transportStatus: result.transportStatus,
             payload: redactPayloadForDisplay(payload),
             waitSeconds: waitTimeoutMs != null ? waitTimeoutMs / 1000 : null,
             reply: outcome?.kind === 'reply' ? serializeStoredMessage(outcome.message) : null,
@@ -242,9 +254,7 @@ export function registerTellCommand(program: Command): void {
             notes: waitTimeoutMs !== undefined && !outcome
               ? [
                   'Result timeout does not prove remote failure.',
-                  result.usedDaemon
-                    ? `Inspect local lifecycle with: agent trace ${result.id}`
-                    : 'This send used direct relay mode, so daemon-backed trace data is unavailable.',
+                  `Inspect local lifecycle with: agent trace ${result.id}`,
                 ]
               : [],
           }, null, 2));
@@ -259,7 +269,9 @@ export function registerTellCommand(program: Command): void {
           info(`Resolved ${target} to ${resolved.did}`);
         }
         info(`Message ID: ${result.id}`);
-        info(`Path: ${result.usedDaemon ? 'daemon-backed send' : 'direct relay fallback'}`);
+        info(`Path: daemon-backed send (${result.deliveryPath})`);
+        info(`Delivery Mode: ${result.deliveryMode}`);
+        info(`Transport Status: ${result.transportStatus}`);
         info(`Protocol: ${effectiveProtocol} (${protocolSelectionReason ?? protocolSelection})`);
         if (replyTo) {
           info(`Reply To: ${replyTo}`);
@@ -282,9 +294,7 @@ export function registerTellCommand(program: Command): void {
           if (trace) {
             info(`Local sender state: ${trace.summary.localQueueState}`);
           }
-          if (result.usedDaemon) {
-            info(`Trace with: agent trace ${result.id}`);
-          }
+          info(`Trace with: agent trace ${result.id}`);
           process.exit(1);
         }
 

@@ -1,6 +1,7 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  buildPublishedPreKeyBundles,
   createEnvelope,
   createInitialLocalE2EConfig,
   deriveDID,
@@ -19,6 +20,7 @@ const mocks = vi.hoisted(() => {
       privateKey: string;
     };
     e2e?: Awaited<ReturnType<typeof createInitialLocalE2EConfig>>;
+    published?: boolean;
   } = {};
   const setE2EConfigMock = vi.fn((value) => {
     configState.e2e = value;
@@ -63,6 +65,7 @@ const mocks = vi.hoisted(() => {
 vi.mock('./config.js', () => ({
   getIdentity: () => mocks.configState.identity,
   getAgentCard: vi.fn(),
+  getE2EConfig: () => mocks.configState.e2e,
   getReachabilityPolicy: vi.fn(() => ({
     mode: 'adaptive',
     bootstrapProviders: [],
@@ -71,7 +74,7 @@ vi.mock('./config.js', () => ({
     operatorLock: false,
   })),
   getRelayInviteToken: vi.fn(),
-  isPublished: vi.fn(() => false),
+  isPublished: vi.fn(() => Boolean(mocks.configState.published)),
   resetReachabilityPolicy: vi.fn(),
   setAgentCard: vi.fn(),
   setE2EConfig: mocks.setE2EConfigMock,
@@ -115,6 +118,115 @@ describe('ClawDaemon E2E recovery', () => {
       privateKey: Buffer.from(selfKeys.privateKey).toString('hex'),
     };
     mocks.configState.e2e = await createInitialLocalE2EConfig(selfKeys.privateKey);
+    mocks.configState.published = false;
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('keeps required delivery mode on the encrypted path and fails when E2E setup is unavailable', async () => {
+    mocks.prepareEncryptedSendsMock.mockRejectedValueOnce(new Error('No Agent Card found for did:agent:peer'));
+
+    const daemon = new ClawDaemon('/tmp/quadra-a-daemon-send-required-test.sock');
+    const router = { sendMessage: vi.fn(async () => undefined) };
+    (daemon as any).router = router;
+    (daemon as any).relayClient = {};
+    (daemon as any).queue = {
+      enqueueOutbound: vi.fn(async () => undefined),
+      markOutboundDelivered: vi.fn(async () => undefined),
+    };
+
+    const response = await (daemon as any).handleSend({
+      id: 'req-send-required',
+      command: 'send',
+      params: {
+        to: 'did:agent:peer',
+        protocol: '/agent/msg/1.0.0',
+        payload: { text: 'hello' },
+        deliveryMode: 'required',
+      },
+    });
+
+    expect(response).toEqual({
+      id: 'req-send-required',
+      success: false,
+      error: 'No Agent Card found for did:agent:peer',
+    });
+    expect(router.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('falls back to plaintext only in preferred delivery mode', async () => {
+    mocks.prepareEncryptedSendsMock.mockRejectedValueOnce(new Error('No Agent Card found for did:agent:peer'));
+
+    const daemon = new ClawDaemon('/tmp/quadra-a-daemon-send-preferred-test.sock');
+    const router = { sendMessage: vi.fn(async () => undefined) };
+    const queue = {
+      enqueueOutbound: vi.fn(async () => undefined),
+      markOutboundDelivered: vi.fn(async () => undefined),
+    };
+    (daemon as any).router = router;
+    (daemon as any).relayClient = {};
+    (daemon as any).queue = queue;
+
+    const response = await (daemon as any).handleSend({
+      id: 'req-send-preferred',
+      command: 'send',
+      params: {
+        to: 'did:agent:peer',
+        protocol: '/agent/msg/1.0.0',
+        payload: { text: 'hello' },
+        deliveryMode: 'preferred',
+      },
+    });
+
+    expect(response).toEqual({
+      id: 'req-send-preferred',
+      success: true,
+      data: expect.objectContaining({
+        deliveryMode: 'preferred',
+        deliveryPath: 'plaintext',
+        transportStatus: 'accepted',
+      }),
+    });
+    expect(router.sendMessage).toHaveBeenCalledOnce();
+    expect(queue.enqueueOutbound).toHaveBeenCalledOnce();
+    expect(mocks.prepareEncryptedSendsMock).toHaveBeenCalledOnce();
+  });
+
+  it('skips E2E setup entirely when delivery mode is disabled', async () => {
+    const daemon = new ClawDaemon('/tmp/quadra-a-daemon-send-disabled-test.sock');
+    const router = { sendMessage: vi.fn(async () => undefined) };
+    const queue = {
+      enqueueOutbound: vi.fn(async () => undefined),
+      markOutboundDelivered: vi.fn(async () => undefined),
+    };
+    (daemon as any).router = router;
+    (daemon as any).relayClient = {};
+    (daemon as any).queue = queue;
+
+    const response = await (daemon as any).handleSend({
+      id: 'req-send-disabled',
+      command: 'send',
+      params: {
+        to: 'did:agent:peer',
+        protocol: '/agent/msg/1.0.0',
+        payload: { text: 'hello' },
+        deliveryMode: 'disabled',
+      },
+    });
+
+    expect(response).toEqual({
+      id: 'req-send-disabled',
+      success: true,
+      data: expect.objectContaining({
+        deliveryMode: 'disabled',
+        deliveryPath: 'plaintext',
+        transportStatus: 'accepted',
+      }),
+    });
+    expect(mocks.prepareEncryptedSendsMock).not.toHaveBeenCalled();
+    expect(router.sendMessage).toHaveBeenCalledOnce();
   });
 
   it('clears peer sessions on signed e2e/session-reset messages and replies with reset-ack', async () => {
@@ -797,6 +909,91 @@ describe('ClawDaemon E2E recovery', () => {
       },
     });
     expect(mocks.setE2EConfigMock).toHaveBeenCalledWith(mocks.configState.e2e);
+  });
+
+  it('resupplies low one-time pre-key inventory and republishes discovery state on reload', async () => {
+    const daemon = new ClawDaemon('/tmp/quadra-a-daemon-reload-republish-test.sock');
+    const relayClient = {
+      publishPreKeyBundles: vi.fn(async () => undefined),
+      publishCard: vi.fn(async () => undefined),
+    };
+    (daemon as any).relayClient = relayClient;
+    mocks.configState.published = true;
+
+    const currentDevice = mocks.configState.e2e!.devices[mocks.configState.e2e!.currentDeviceId];
+    currentDevice.oneTimePreKeys = currentDevice.oneTimePreKeys.slice(0, 2).map((key, index) => ({
+      ...key,
+      claimedAt: index === 0 ? Date.now() - 1000 : undefined,
+    }));
+    mocks.resolvePublishedPreKeyBundlesMock.mockResolvedValueOnce(
+      buildPublishedPreKeyBundles(mocks.configState.e2e!),
+    );
+
+    const response = await (daemon as any).handleRequest(
+      { id: 'req-reload-resupply', command: 'reload-e2e', params: {} },
+      {} as never,
+    );
+
+    expect(response).toMatchObject({
+      id: 'req-reload-resupply',
+      success: true,
+      data: {
+        deviceId: mocks.configState.e2e!.currentDeviceId,
+        preKeyMaintenance: {
+          action: 'resupply-otks',
+        },
+        republished: true,
+        republishError: null,
+      },
+    });
+    expect(mocks.configState.e2e!.devices[mocks.configState.e2e!.currentDeviceId].oneTimePreKeys).toHaveLength(16);
+    expect(relayClient.publishPreKeyBundles).toHaveBeenCalledOnce();
+    expect(relayClient.publishCard).toHaveBeenCalledOnce();
+  });
+
+  it('runs periodic pre-key maintenance in the background for published daemons', async () => {
+    const daemon = new ClawDaemon('/tmp/quadra-a-daemon-background-prekeys-test.sock');
+    const relayClient = {
+      publishPreKeyBundles: vi.fn(async () => undefined),
+      publishCard: vi.fn(async () => undefined),
+      stop: vi.fn(async () => undefined),
+      getConnectedRelays: vi.fn(() => []),
+      getKnownRelays: vi.fn(() => []),
+      getPeerCount: vi.fn(() => 0),
+    };
+    (daemon as any).relayClient = relayClient;
+    mocks.configState.published = true;
+
+    const currentDevice = mocks.configState.e2e!.devices[mocks.configState.e2e!.currentDeviceId];
+    currentDevice.oneTimePreKeys = currentDevice.oneTimePreKeys.slice(0, 2).map((key, index) => ({
+      ...key,
+      claimedAt: index === 0 ? Date.now() - 1000 : undefined,
+    }));
+    mocks.resolvePublishedPreKeyBundlesMock.mockResolvedValueOnce(
+      buildPublishedPreKeyBundles(mocks.configState.e2e!),
+    );
+
+    try {
+      await (daemon as any).runPeriodicPreKeyMaintenance();
+
+      expect(mocks.configState.e2e!.devices[mocks.configState.e2e!.currentDeviceId].oneTimePreKeys).toHaveLength(16);
+      expect(relayClient.publishCard).toHaveBeenCalledOnce();
+      expect((daemon as any).preKeyMaintenanceStatus).toMatchObject({
+        enabled: true,
+        lastAction: 'resupply-otks',
+        lastError: null,
+      });
+      expect((daemon as any).preKeyMaintenanceStatus.lastCheckedAt).toEqual(expect.any(Number));
+      expect((daemon as any).preKeyMaintenanceStatus.lastChangedAt).toEqual(expect.any(Number));
+      expect((daemon as any).preKeyMaintenanceStatus.lastRepublishedAt).toEqual(expect.any(Number));
+      (daemon as any).startPreKeyMaintenanceLoop();
+      expect((daemon as any).preKeyMaintenanceTimer).not.toBeNull();
+    } finally {
+      await daemon.shutdown();
+    }
+
+    expect((daemon as any).preKeyMaintenanceTimer).toBeNull();
+    expect(relayClient.stop).toHaveBeenCalledOnce();
   });
 
   it('sends signed manual-reset notifications through daemon request dispatch', async () => {

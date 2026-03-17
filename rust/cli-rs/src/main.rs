@@ -101,6 +101,9 @@ enum Commands {
         /// Protocol identifier
         #[arg(long, default_value = "/agent/msg/1.0.0")]
         protocol: String,
+        /// Delivery mode: required, preferred, or disabled
+        #[arg(long, default_value = "required")]
+        delivery_mode: String,
         /// Reply to an earlier message ID
         #[arg(long)]
         reply_to: Option<String>,
@@ -426,6 +429,16 @@ enum Commands {
         #[command(subcommand)]
         action: E2eAction,
     },
+
+    /// Show E2E pre-key and device-directory health
+    Prekeys {
+        /// Output format: text|json
+        #[arg(long, default_value = "text")]
+        format: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -592,6 +605,7 @@ async fn main() -> Result<()> {
             body_stdin,
             body_format,
             protocol,
+            delivery_mode,
             reply_to,
             thread,
             new_thread,
@@ -612,6 +626,7 @@ async fn main() -> Result<()> {
                 body_format,
                 protocol,
                 protocol_explicit,
+                delivery_mode,
                 reply_to,
                 thread,
                 new_thread,
@@ -944,6 +959,10 @@ async fn main() -> Result<()> {
                 commands::e2e::e2e_reset(commands::e2e::E2eResetOptions { peer_did: peer }).await?;
             }
         },
+
+        Commands::Prekeys { format, json } => {
+            commands::prekeys::run(commands::prekeys::PrekeysOptions { json, format }).await?;
+        }
     }
 
     Ok(())

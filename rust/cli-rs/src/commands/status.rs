@@ -111,6 +111,22 @@ pub async fn run(opts: StatusOptions) -> Result<()> {
         if let Some(status) = &daemon_status {
             println!(
                 "  {}: {}",
+                "Runtime".dimmed(),
+                status
+                    .get("runtime")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown")
+            );
+            println!(
+                "  {}: {}",
+                "Socket".dimmed(),
+                status
+                    .get("socketPath")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown")
+            );
+            println!(
+                "  {}: {}",
                 "Relay".dimmed(),
                 status
                     .get("relay")
@@ -135,6 +151,43 @@ pub async fn run(opts: StatusOptions) -> Result<()> {
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "0".to_string())
             );
+            if let Some(e2e_health) = status.get("e2eHealth") {
+                println!(
+                    "  {}: {}",
+                    "Current Device".dimmed(),
+                    e2e_health
+                        .get("currentDeviceId")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("unknown")
+                );
+                println!(
+                    "  {}: {}",
+                    "E2E Sessions".dimmed(),
+                    e2e_health
+                        .get("sessionCount")
+                        .and_then(|value| value.as_u64())
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "0".to_string())
+                );
+                println!(
+                    "  {}: {}",
+                    "One-Time Pre-Keys".dimmed(),
+                    e2e_health
+                        .get("oneTimePreKeysRemaining")
+                        .and_then(|value| value.as_u64())
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "0".to_string())
+                );
+                println!(
+                    "  {}: {}",
+                    "Signed Pre-Key Age".dimmed(),
+                    e2e_health
+                        .get("signedPreKeyAgeMs")
+                        .and_then(|value| value.as_u64())
+                        .map(|value| format!("{}s", value / 1000))
+                        .unwrap_or_else(|| "unknown".to_string())
+                );
+            }
         }
         println!();
     } else {
@@ -185,6 +238,12 @@ pub async fn run(opts: StatusOptions) -> Result<()> {
             &reachability_policy.target_provider_count.to_string(),
         );
         if let Some(status) = &daemon_status {
+            if let Some(runtime) = status.get("runtime").and_then(|value| value.as_str()) {
+                LlmFormatter::key_value("  Runtime", runtime);
+            }
+            if let Some(socket) = status.get("socketPath").and_then(|value| value.as_str()) {
+                LlmFormatter::key_value("  Socket", socket);
+            }
             if let Some(relay) = status.get("relay").and_then(|value| value.as_str()) {
                 LlmFormatter::key_value("  Relay", relay);
             }
@@ -193,6 +252,35 @@ pub async fn run(opts: StatusOptions) -> Result<()> {
             }
             if let Some(messages) = status.get("messages").and_then(|value| value.as_u64()) {
                 LlmFormatter::key_value("  Message Cache", &messages.to_string());
+            }
+            if let Some(e2e_health) = status.get("e2eHealth") {
+                if let Some(device_id) = e2e_health
+                    .get("currentDeviceId")
+                    .and_then(|value| value.as_str())
+                {
+                    LlmFormatter::key_value("  Current Device", device_id);
+                }
+                if let Some(session_count) = e2e_health
+                    .get("sessionCount")
+                    .and_then(|value| value.as_u64())
+                {
+                    LlmFormatter::key_value("  E2E Sessions", &session_count.to_string());
+                }
+                if let Some(otk_count) = e2e_health
+                    .get("oneTimePreKeysRemaining")
+                    .and_then(|value| value.as_u64())
+                {
+                    LlmFormatter::key_value("  One-Time Pre-Keys", &otk_count.to_string());
+                }
+                if let Some(age_ms) = e2e_health
+                    .get("signedPreKeyAgeMs")
+                    .and_then(|value| value.as_u64())
+                {
+                    LlmFormatter::key_value(
+                        "  Signed Pre-Key Age Seconds",
+                        &(age_ms / 1000).to_string(),
+                    );
+                }
             }
         }
         println!();

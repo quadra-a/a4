@@ -11,8 +11,16 @@ import {
   getMessageSortTimestamp,
   storedMessageStatus,
 } from '../../js/core/protocol/dist/index.js';
-import { findMessageOutcome, paginateVisibleInboxMessages } from '../../js/core/runtime/dist/index.js';
-import { protocolMatchesCapability } from '../../js/cli/dist/index.js';
+import {
+  canFallbackToPlaintextDelivery,
+  findMessageOutcome,
+  normalizeDeliveryMode,
+  paginateVisibleInboxMessages,
+} from '../../js/core/runtime/dist/index.js';
+import {
+  protocolMatchesCapability,
+  shouldAutoSelectTellProtocol,
+} from '../../js/cli/dist/index.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_SPEC_ROOT = resolve(__dirname, '../../spec/conformance');
@@ -145,6 +153,26 @@ async function evaluateDaemonPersistence(input) {
   }
 }
 
+async function evaluateDeliveryMode(input) {
+  const deliveryMode = normalizeDeliveryMode(input.mode);
+  const actual = { mode: deliveryMode };
+
+  if (typeof input.fallbackError === 'string') {
+    actual.fallbackToPlaintext = canFallbackToPlaintextDelivery(deliveryMode, new Error(input.fallbackError));
+  }
+
+  return actual;
+}
+
+async function evaluateTellProtocolSelection(input) {
+  return {
+    autoSelect: shouldAutoSelectTellProtocol({
+      message: input.message,
+      bodyFormat: input.bodyFormat,
+    }),
+  };
+}
+
 async function evaluateCase(subject, input) {
   switch (subject) {
     case 'message-status':
@@ -157,6 +185,10 @@ async function evaluateCase(subject, input) {
       return evaluateBlockFiltering(input);
     case 'daemon-persistence':
       return evaluateDaemonPersistence(input);
+    case 'delivery-mode':
+      return evaluateDeliveryMode(input);
+    case 'tell-protocol-selection':
+      return evaluateTellProtocolSelection(input);
     default:
       throw new Error(`Unknown conformance subject: ${subject}`);
   }

@@ -8,16 +8,20 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{unix::OwnedWriteHalf, UnixStream};
 use tokio::process::Command;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tokio::time::{sleep, timeout, Duration};
+use uuid::Uuid;
 
 use crate::config::{build_card, load_config};
 use crate::daemon::{daemon_socket_path, DaemonClient};
 
 const MAX_PAYLOAD_BYTES: usize = 256 * 1024;
 const INBOX_POLL_LIMIT: usize = 100;
+const SERVE_INBOX_FILTER_JSON: &str =
+    r#"{"direction":"inbound","unreadOnly":true,"status":"pending","type":"message"}"#;
 
 pub struct ServeOptions {
     pub on: Option<String>,
@@ -36,6 +40,12 @@ struct HandlerEntry {
     capability: String,
     exec: PathBuf,
     exec_args: Vec<String>,
+}
+
+struct DaemonInboxSubscription {
+    write_half: OwnedWriteHalf,
+    receiver: mpsc::UnboundedReceiver<Value>,
+    reader_task: tokio::task::JoinHandle<()>,
 }
 
 fn normalize_capability_id(capability: &str) -> String {
@@ -104,6 +114,136 @@ fn handler_command_display(handler: &HandlerEntry) -> String {
     }
 }
 
+fn serve_inbox_filter() -> Value {
+    serde_json::from_str(SERVE_INBOX_FILTER_JSON).expect("serve inbox filter JSON is valid")
+}
+
+fn serve_inbox_params(limit: usize) -> Value {
+    json!({
+        "limit": limit,
+        "unread": true,
+        "pagination": { "limit": limit },
+        "filter": serve_inbox_filter(),
+    })
+}
+
+impl DaemonInboxSubscription {
+    async fn connect(socket_path: &str) -> Result<Self> {
+        let request_id = format!("req_{}", Uuid::new_v4().to_string().replace('-', ""));
+        let stream = UnixStream::connect(socket_path)
+            .await
+            .with_context(|| format!("Failed to connect to daemon at {}", socket_path))?;
+        let (read_half, mut write_half) = stream.into_split();
+
+        let request = json!({
+            "id": request_id,
+            "command": "subscribe_inbox",
+            "params": {
+                "filter": serve_inbox_filter(),
+            },
+        });
+        let mut line = serde_json::to_string(&request)?;
+        line.push('\n');
+        write_half.write_all(line.as_bytes()).await?;
+
+        let mut reader = BufReader::new(read_half);
+        let mut buf = String::new();
+        let subscription_id = loop {
+            buf.clear();
+            let n = reader.read_line(&mut buf).await?;
+            if n == 0 {
+                bail!("Daemon closed subscription socket without acknowledgement");
+            }
+
+            let trimmed = buf.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            let response: Value = serde_json::from_str(trimmed)
+                .context("Failed to parse daemon subscription response")?;
+            if response.get("id").and_then(|value| value.as_str()) != Some(request_id.as_str()) {
+                continue;
+            }
+
+            if response
+                .get("success")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+            {
+                break response
+                    .get("data")
+                    .and_then(|value| value.get("subscriptionId"))
+                    .and_then(|value| value.as_str())
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_default();
+            }
+
+            let error = response
+                .get("error")
+                .and_then(|value| value.as_str())
+                .unwrap_or("Unknown daemon error");
+            bail!("{}", error);
+        };
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let reader_task = tokio::spawn(async move {
+            let mut reader = reader;
+            let mut buf = String::new();
+            loop {
+                buf.clear();
+                let Ok(n) = reader.read_line(&mut buf).await else {
+                    break;
+                };
+                if n == 0 {
+                    break;
+                }
+
+                let trimmed = buf.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+
+                let Ok(event) = serde_json::from_str::<Value>(trimmed) else {
+                    break;
+                };
+                if event.get("type").and_then(|value| value.as_str()) != Some("event")
+                    || event.get("event").and_then(|value| value.as_str()) != Some("inbox")
+                {
+                    continue;
+                }
+                if !subscription_id.is_empty()
+                    && event.get("subscriptionId").and_then(|value| value.as_str())
+                        != Some(subscription_id.as_str())
+                {
+                    continue;
+                }
+
+                if let Some(data) = event.get("data") {
+                    if tx.send(data.clone()).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(Self {
+            write_half,
+            receiver: rx,
+            reader_task,
+        })
+    }
+
+    async fn recv(&mut self) -> Option<Value> {
+        self.receiver.recv().await
+    }
+
+    async fn close(mut self) {
+        let _ = self.write_half.shutdown().await;
+        let _ = self.reader_task.await;
+    }
+}
+
 pub async fn run(opts: ServeOptions) -> Result<()> {
     let daemon = DaemonClient::new(&daemon_socket_path());
     if !daemon.is_running().await {
@@ -156,6 +296,62 @@ pub async fn run(opts: ServeOptions) -> Result<()> {
     let handlers = Arc::new(handlers);
     let active_count = Arc::new(AtomicUsize::new(0));
     let claimed_message_ids = Arc::new(Mutex::new(HashSet::<String>::new()));
+
+    let socket_path = daemon_socket_path();
+    let mut subscription = match DaemonInboxSubscription::connect(&socket_path).await {
+        Ok(subscription) => Some(subscription),
+        Err(error) => {
+            eprintln!("serve subscription warning: {error:#}; falling back to polling");
+            None
+        }
+    };
+
+    if let Err(error) = poll_once(
+        &daemon,
+        handlers.clone(),
+        active_count.clone(),
+        claimed_message_ids.clone(),
+        opts.max_concurrency,
+        opts.timeout_secs,
+        opts.format.as_str(),
+    )
+    .await
+    {
+        eprintln!("serve poll warning: {error:#}");
+    }
+
+    if let Some(mut subscription) = subscription.take() {
+        loop {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    subscription.close().await;
+                    if opts.format != "json" {
+                        println!("\nStopped serving.");
+                    }
+                    return Ok(());
+                }
+                maybe_message = subscription.recv() => {
+                    let Some(message) = maybe_message else {
+                        eprintln!("serve subscription ended; falling back to polling");
+                        break;
+                    };
+
+                    if let Err(error) = process_inbox_message(
+                        &daemon,
+                        message,
+                        handlers.clone(),
+                        active_count.clone(),
+                        claimed_message_ids.clone(),
+                        opts.max_concurrency,
+                        opts.timeout_secs,
+                        opts.format.as_str(),
+                    ).await {
+                        eprintln!("serve subscription warning: {error:#}");
+                    }
+                }
+            }
+        }
+    }
 
     loop {
         tokio::select! {
@@ -233,20 +429,7 @@ async fn poll_once(
     format: &str,
 ) -> Result<()> {
     let page = daemon
-        .send_command(
-            "inbox",
-            json!({
-                "limit": INBOX_POLL_LIMIT,
-                "unread": true,
-                "pagination": { "limit": INBOX_POLL_LIMIT },
-                "filter": {
-                    "direction": "inbound",
-                    "unreadOnly": true,
-                    "status": "pending",
-                    "type": "message",
-                },
-            }),
-        )
+        .send_command("inbox", serve_inbox_params(INBOX_POLL_LIMIT))
         .await?;
     let messages = page
         .get("messages")
@@ -255,192 +438,216 @@ async fn poll_once(
         .unwrap_or_default();
 
     for message in messages {
-        let dir = message
-            .get("direction")
-            .and_then(|value| value.as_str())
-            .unwrap_or("?");
-        if dir != "inbound" {
-            continue;
-        }
+        process_inbox_message(
+            daemon,
+            message,
+            handlers.clone(),
+            active_count.clone(),
+            claimed_message_ids.clone(),
+            max_concurrency,
+            timeout_secs,
+            format,
+        )
+        .await?;
+    }
 
-        let envelope = message.get("envelope").cloned().unwrap_or(Value::Null);
-        let etype = envelope
-            .get("type")
-            .and_then(|value| value.as_str())
-            .unwrap_or("?");
-        if etype != "message" {
-            continue;
-        }
+    Ok(())
+}
 
-        let protocol = envelope
-            .get("protocol")
-            .and_then(|value| value.as_str())
-            .unwrap_or("");
-        let payload = envelope.get("payload").cloned().unwrap_or(Value::Null);
+#[allow(clippy::too_many_arguments)]
+async fn process_inbox_message(
+    daemon: &DaemonClient,
+    message: Value,
+    handlers: Arc<Vec<HandlerEntry>>,
+    active_count: Arc<AtomicUsize>,
+    claimed_message_ids: Arc<Mutex<HashSet<String>>>,
+    max_concurrency: usize,
+    timeout_secs: u64,
+    format: &str,
+) -> Result<()> {
+    let dir = message
+        .get("direction")
+        .and_then(|value| value.as_str())
+        .unwrap_or("?");
+    if dir != "inbound" {
+        return Ok(());
+    }
 
-        let Some(handler) = handlers.iter().find(|entry| {
-            protocol_matches_capability(protocol, &entry.capability)
-                || payload.get("capability").and_then(|value| value.as_str())
-                    == Some(entry.capability.as_str())
-        }) else {
-            continue;
-        };
+    let envelope = message.get("envelope").cloned().unwrap_or(Value::Null);
+    let etype = envelope
+        .get("type")
+        .and_then(|value| value.as_str())
+        .unwrap_or("?");
+    if etype != "message" {
+        return Ok(());
+    }
 
-        let envelope_id = envelope
-            .get("id")
-            .and_then(|value| value.as_str())
-            .unwrap_or("");
-        if envelope_id.is_empty() {
-            continue;
-        }
-        if !claim_message(&claimed_message_ids, envelope_id).await {
-            continue;
-        }
+    let protocol = envelope
+        .get("protocol")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let payload = envelope.get("payload").cloned().unwrap_or(Value::Null);
 
-        let current = active_count.load(Ordering::SeqCst);
-        if current >= max_concurrency {
-            if format != "json" {
-                eprintln!(
-                    "[BUSY] Rejected {} from {}",
-                    envelope_id,
-                    envelope
-                        .get("from")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("unknown"),
-                );
-            }
-            let reply_result = send_reply(
-                daemon,
-                &envelope,
-                json!({ "error": "BUSY", "message": "Server at capacity, try again later" }),
-            )
-            .await;
-            if let Err(error) = reply_result {
-                eprintln!("serve busy reply warning for {envelope_id}: {error:#}");
-            } else {
-                mark_read(daemon, envelope_id).await;
-            }
-            release_message_claim(&claimed_message_ids, envelope_id).await;
-            continue;
-        }
+    let Some(handler) = handlers.iter().find(|entry| {
+        protocol_matches_capability(protocol, &entry.capability)
+            || payload.get("capability").and_then(|value| value.as_str())
+                == Some(entry.capability.as_str())
+    }) else {
+        return Ok(());
+    };
 
-        let payload_str = serde_json::to_string(&payload)?;
-        if payload_str.len() > MAX_PAYLOAD_BYTES {
-            let reply_result = send_reply(
-                daemon,
-                &envelope,
-                json!({
-                    "error": "PAYLOAD_TOO_LARGE",
-                    "message": format!("Max payload is {} bytes", MAX_PAYLOAD_BYTES),
-                }),
-            )
-            .await;
-            if let Err(error) = reply_result {
-                eprintln!("serve payload-too-large reply warning for {envelope_id}: {error:#}");
-            } else {
-                mark_read(daemon, envelope_id).await;
-            }
-            release_message_claim(&claimed_message_ids, envelope_id).await;
-            continue;
-        }
+    let envelope_id = envelope
+        .get("id")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    if envelope_id.is_empty() {
+        return Ok(());
+    }
+    if !claim_message(&claimed_message_ids, envelope_id).await {
+        return Ok(());
+    }
 
-        active_count.fetch_add(1, Ordering::SeqCst);
-        let daemon = DaemonClient::new(&daemon_socket_path());
-        let envelope_clone = envelope.clone();
-        let exec_path = handler.exec.clone();
-        let exec_args = handler.exec_args.clone();
-        let capability = handler.capability.clone();
-        let from = envelope
-            .get("from")
-            .and_then(|value| value.as_str())
-            .unwrap_or("unknown")
-            .to_string();
-        let envelope_id = envelope_id.to_string();
-        let active_count = active_count.clone();
-        let claimed_message_ids = claimed_message_ids.clone();
-        let format = format.to_string();
-
+    let current = active_count.load(Ordering::SeqCst);
+    if current >= max_concurrency {
         if format != "json" {
-            println!(
-                "[{}] {} <- {}",
-                chrono::Local::now().format("%H:%M:%S"),
-                capability,
-                from
+            eprintln!(
+                "[BUSY] Rejected {} from {}",
+                envelope_id,
+                envelope
+                    .get("from")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown"),
             );
         }
+        let reply_result = send_reply(
+            daemon,
+            &envelope,
+            json!({ "error": "BUSY", "message": "Server at capacity, try again later" }),
+        )
+        .await;
+        if let Err(error) = reply_result {
+            eprintln!("serve busy reply warning for {envelope_id}: {error:#}");
+        } else {
+            mark_read(daemon, envelope_id).await;
+        }
+        release_message_claim(&claimed_message_ids, envelope_id).await;
+        return Ok(());
+    }
 
-        tokio::spawn(async move {
-            let started_at = std::time::Instant::now();
-            let result = execute_handler(&exec_path, &exec_args, &payload, timeout_secs).await;
-            let latency_ms = started_at.elapsed().as_millis();
+    let payload_str = serde_json::to_string(&payload)?;
+    if payload_str.len() > MAX_PAYLOAD_BYTES {
+        let reply_result = send_reply(
+            daemon,
+            &envelope,
+            json!({
+                "error": "PAYLOAD_TOO_LARGE",
+                "message": format!("Max payload is {} bytes", MAX_PAYLOAD_BYTES),
+            }),
+        )
+        .await;
+        if let Err(error) = reply_result {
+            eprintln!("serve payload-too-large reply warning for {envelope_id}: {error:#}");
+        } else {
+            mark_read(daemon, envelope_id).await;
+        }
+        release_message_claim(&claimed_message_ids, envelope_id).await;
+        return Ok(());
+    }
 
-            let reply_result = match &result {
-                Ok(reply_payload) => {
-                    send_reply(&daemon, &envelope_clone, reply_payload.clone()).await
-                }
-                Err(error) => {
-                    let is_timeout = error.to_string().contains("timeout");
-                    send_reply(
-                        &daemon,
-                        &envelope_clone,
+    active_count.fetch_add(1, Ordering::SeqCst);
+    let daemon = DaemonClient::new(&daemon_socket_path());
+    let envelope_clone = envelope.clone();
+    let exec_path = handler.exec.clone();
+    let exec_args = handler.exec_args.clone();
+    let capability = handler.capability.clone();
+    let from = envelope
+        .get("from")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let envelope_id = envelope_id.to_string();
+    let active_count = active_count.clone();
+    let claimed_message_ids = claimed_message_ids.clone();
+    let format = format.to_string();
+
+    if format != "json" {
+        println!(
+            "[{}] {} <- {}",
+            chrono::Local::now().format("%H:%M:%S"),
+            capability,
+            from
+        );
+    }
+
+    tokio::spawn(async move {
+        let started_at = std::time::Instant::now();
+        let result = execute_handler(&exec_path, &exec_args, &payload, timeout_secs).await;
+        let latency_ms = started_at.elapsed().as_millis();
+
+        let reply_result = match &result {
+            Ok(reply_payload) => send_reply(&daemon, &envelope_clone, reply_payload.clone()).await,
+            Err(error) => {
+                let is_timeout = error.to_string().contains("timeout");
+                send_reply(
+                    &daemon,
+                    &envelope_clone,
+                    json!({
+                        "error": if is_timeout { "TIMEOUT" } else { "HANDLER_ERROR" },
+                        "message": error.to_string(),
+                    }),
+                )
+                .await
+            }
+        };
+
+        match (&result, &reply_result) {
+            (Ok(_), Ok(())) => {
+                mark_read(&daemon, &envelope_id).await;
+                if format == "json" {
+                    println!(
+                        "{}",
                         json!({
-                            "error": if is_timeout { "TIMEOUT" } else { "HANDLER_ERROR" },
-                            "message": error.to_string(),
-                        }),
-                    )
-                    .await
-                }
-            };
-
-            match (&result, &reply_result) {
-                (Ok(_), Ok(())) => {
-                    mark_read(&daemon, &envelope_id).await;
-                    if format == "json" {
-                        println!(
-                            "{}",
-                            json!({
-                                "event": "handled",
-                                "capability": capability,
-                                "from": envelope_clone.get("from").and_then(|v| v.as_str()).unwrap_or("unknown"),
-                                "latencyMs": latency_ms,
-                                "success": true,
-                            })
-                        );
-                    } else {
-                        println!("  -> responded in {}ms", latency_ms);
-                    }
-                }
-                (Err(error), Ok(())) => {
-                    mark_read(&daemon, &envelope_id).await;
-                    if format == "json" {
-                        println!(
-                            "{}",
-                            json!({
-                                "event": "error",
-                                "capability": capability,
-                                "from": envelope_clone.get("from").and_then(|v| v.as_str()).unwrap_or("unknown"),
-                                "latencyMs": latency_ms,
-                                "error": error.to_string(),
-                            })
-                        );
-                    } else {
-                        eprintln!("  -> error after {}ms: {}", latency_ms, error);
-                    }
-                }
-                (Ok(_), Err(error)) => {
-                    eprintln!("serve reply warning for {envelope_id}: {error:#}");
-                }
-                (Err(handler_error), Err(reply_error)) => {
-                    eprintln!(
-                        "serve handler+reply warning for {envelope_id}: handler={handler_error:#}; reply={reply_error:#}"
+                            "event": "handled",
+                            "capability": capability,
+                            "from": envelope_clone.get("from").and_then(|v| v.as_str()).unwrap_or("unknown"),
+                            "latencyMs": latency_ms,
+                            "success": true,
+                        })
                     );
+                } else {
+                    println!("  -> responded in {}ms", latency_ms);
                 }
             }
+            (Err(error), Ok(())) => {
+                mark_read(&daemon, &envelope_id).await;
+                if format == "json" {
+                    println!(
+                        "{}",
+                        json!({
+                            "event": "error",
+                            "capability": capability,
+                            "from": envelope_clone.get("from").and_then(|v| v.as_str()).unwrap_or("unknown"),
+                            "latencyMs": latency_ms,
+                            "error": error.to_string(),
+                        })
+                    );
+                } else {
+                    eprintln!("  -> error after {}ms: {}", latency_ms, error);
+                }
+            }
+            (Ok(_), Err(error)) => {
+                eprintln!("serve reply warning for {envelope_id}: {error:#}");
+            }
+            (Err(handler_error), Err(reply_error)) => {
+                eprintln!(
+                    "serve handler+reply warning for {envelope_id}: handler={handler_error:#}; reply={reply_error:#}"
+                );
+            }
+        }
 
-            active_count.fetch_sub(1, Ordering::SeqCst);
-            release_message_claim(&claimed_message_ids, &envelope_id).await;
-        });
-    }
+        active_count.fetch_sub(1, Ordering::SeqCst);
+        release_message_claim(&claimed_message_ids, &envelope_id).await;
+    });
 
     Ok(())
 }

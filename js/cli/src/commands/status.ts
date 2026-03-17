@@ -51,9 +51,22 @@ export function registerStatusCommand(program: Command): void {
           printKeyValue('Daemon', daemonRunning ? 'Running' : 'Stopped');
           printKeyValue('Reply Wait', daemonRunning ? 'Available' : 'Unavailable');
           if (daemon) {
+            printKeyValue('Runtime', daemon.runtime ?? 'unknown');
+            printKeyValue('Socket', daemon.socketPath ?? 'unknown');
             printKeyValue('Connected Relays', daemon.connectedRelays.join(', ') || 'None');
             printKeyValue('Known Relays', daemon.knownRelays?.join(', ') || 'None');
             printKeyValue('Peer Count', String(daemon.peerCount));
+            if (daemon.e2eHealth) {
+              printKeyValue('Current Device', daemon.e2eHealth.currentDeviceId ?? 'None');
+              printKeyValue('E2E Sessions', String(daemon.e2eHealth.sessionCount));
+              printKeyValue('One-Time Pre-Keys', String(daemon.e2eHealth.oneTimePreKeysRemaining));
+              printKeyValue(
+                'Signed Pre-Key Age',
+                daemon.e2eHealth.signedPreKeyAgeMs != null
+                  ? `${Math.round(daemon.e2eHealth.signedPreKeyAgeMs / 1000)}s`
+                  : 'Unknown',
+              );
+            }
             if (daemon.reachabilityPolicy) {
               printKeyValue('Reachability Mode', daemon.reachabilityPolicy.mode);
               printKeyValue('Target Providers', String(daemon.reachabilityPolicy.targetProviderCount));
@@ -83,9 +96,22 @@ export function registerStatusCommand(program: Command): void {
           llmKeyValue('  Daemon', daemonRunning ? 'running' : 'stopped');
           llmKeyValue('  Reply Wait', daemonRunning ? 'available' : 'unavailable');
           if (daemon) {
+            llmKeyValue('  Runtime', daemon.runtime ?? 'unknown');
+            llmKeyValue('  Socket', daemon.socketPath ?? 'unknown');
             llmKeyValue('  Connected Relays', daemon.connectedRelays.join(', ') || '(none)');
             llmKeyValue('  Known Relays', daemon.knownRelays?.join(', ') || '(none)');
             llmKeyValue('  Peer Count', String(daemon.peerCount));
+            if (daemon.e2eHealth) {
+              llmKeyValue('  Current Device', daemon.e2eHealth.currentDeviceId ?? '(none)');
+              llmKeyValue('  E2E Sessions', String(daemon.e2eHealth.sessionCount));
+              llmKeyValue('  One-Time Pre-Keys', String(daemon.e2eHealth.oneTimePreKeysRemaining));
+              llmKeyValue(
+                '  Signed Pre-Key Age Seconds',
+                daemon.e2eHealth.signedPreKeyAgeMs != null
+                  ? String(Math.round(daemon.e2eHealth.signedPreKeyAgeMs / 1000))
+                  : 'unknown',
+              );
+            }
             if (daemon.reachabilityPolicy) {
               llmKeyValue('  Reachability Mode', daemon.reachabilityPolicy.mode);
               llmKeyValue('  Target Providers', String(daemon.reachabilityPolicy.targetProviderCount));

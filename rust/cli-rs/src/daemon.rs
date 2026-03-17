@@ -4,6 +4,7 @@
 /// Response: {"id":"req_...","success":true,"data":{...}}\n
 use anyhow::{Context, Result};
 use dirs::home_dir;
+use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -12,8 +13,8 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
-use tokio::time::{sleep, timeout, Duration};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock};
+use tokio::time::{interval, sleep, timeout, Duration, MissedTickBehavior};
 use uuid::Uuid;
 
 use crate::config::{
@@ -28,8 +29,9 @@ use crate::protocol::{
 use crate::relay::connect_first_available;
 use crate::trust::{ActivityLevel, NetworkPosition, TrustEngine};
 use quadra_a_core::e2e::{
-    assert_published_sender_device_matches_prekey_message,
+    assert_published_sender_device_matches_prekey_message, current_device_state,
     decode_encrypted_application_envelope_payload, ensure_local_e2e_config,
+    resupply_local_device_one_time_pre_keys, rotate_local_device_signed_pre_key,
     DecodedEncryptedApplicationMessage, EncryptedApplicationEnvelopePayload,
     E2E_APPLICATION_ENVELOPE_PROTOCOL,
 };
@@ -56,6 +58,9 @@ use quadra_a_runtime::session_manager::ManagedRelayState;
 
 pub const DEFAULT_RS_DAEMON_SOCKET: &str = "/tmp/quadra-a-rs.sock";
 pub const DEFAULT_JS_DAEMON_SOCKET: &str = "/tmp/quadra-a.sock";
+const LOW_ONE_TIME_PREKEY_THRESHOLD: usize = 4;
+const STALE_SIGNED_PREKEY_AGE_MS: u64 = 14 * 24 * 60 * 60 * 1000;
+const PREKEY_MAINTENANCE_INTERVAL_MS: u64 = 60 * 60 * 1000;
 
 fn quadra_a_home() -> PathBuf {
     std::env::var("QUADRA_A_HOME")
@@ -210,6 +215,87 @@ struct InboxFilterSet<'a> {
     statuses: Option<&'a HashSet<String>>,
 }
 
+#[derive(Clone, Default)]
+struct InboxFilterConfig {
+    unread_only: bool,
+    thread_id: Option<String>,
+    directions: Option<HashSet<String>>,
+    from_dids: Option<HashSet<String>>,
+    to_dids: Option<HashSet<String>>,
+    protocols: Option<HashSet<String>>,
+    envelope_types: Option<HashSet<String>>,
+    reply_tos: Option<HashSet<String>>,
+    statuses: Option<HashSet<String>>,
+}
+
+impl InboxFilterConfig {
+    fn from_params(params: &Value) -> Self {
+        let filter = params.get("filter");
+        Self {
+            unread_only: params
+                .get("unread")
+                .or_else(|| filter.and_then(|f| f.get("unread")))
+                .or_else(|| filter.and_then(|f| f.get("unreadOnly")))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            thread_id: params
+                .get("threadId")
+                .or_else(|| filter.and_then(|f| f.get("threadId")))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            directions: json_string_filter(
+                params
+                    .get("direction")
+                    .or_else(|| filter.and_then(|f| f.get("direction"))),
+            ),
+            from_dids: json_string_filter(
+                params
+                    .get("fromDid")
+                    .or_else(|| filter.and_then(|f| f.get("fromDid"))),
+            ),
+            to_dids: json_string_filter(
+                params
+                    .get("toDid")
+                    .or_else(|| filter.and_then(|f| f.get("toDid"))),
+            ),
+            protocols: json_string_filter(
+                params
+                    .get("protocol")
+                    .or_else(|| filter.and_then(|f| f.get("protocol"))),
+            ),
+            envelope_types: json_string_filter(
+                params
+                    .get("type")
+                    .or_else(|| filter.and_then(|f| f.get("type"))),
+            ),
+            reply_tos: json_string_filter(
+                params
+                    .get("replyTo")
+                    .or_else(|| filter.and_then(|f| f.get("replyTo"))),
+            ),
+            statuses: json_string_filter(
+                params
+                    .get("status")
+                    .or_else(|| filter.and_then(|f| f.get("status"))),
+            ),
+        }
+    }
+
+    fn as_filter_set(&self) -> InboxFilterSet<'_> {
+        InboxFilterSet {
+            unread_only: self.unread_only,
+            thread_id: self.thread_id.as_deref(),
+            directions: self.directions.as_ref(),
+            from_dids: self.from_dids.as_ref(),
+            to_dids: self.to_dids.as_ref(),
+            protocols: self.protocols.as_ref(),
+            envelope_types: self.envelope_types.as_ref(),
+            reply_tos: self.reply_tos.as_ref(),
+            statuses: self.statuses.as_ref(),
+        }
+    }
+}
+
 fn inbox_message_matches(message: &StoredMessage, filters: &InboxFilterSet<'_>) -> bool {
     if filters.unread_only && message.read {
         return false;
@@ -350,11 +436,14 @@ pub struct DaemonState {
     pub config: Config,
     pub relay_runtime: ManagedRelayState,
     relay_sender: Option<mpsc::Sender<RelayWorkerCommand>>,
+    prekey_maintenance_stop: Option<oneshot::Sender<()>>,
     outbound_send_lock: Arc<Mutex<()>>,
     peer_session_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     recovery_coordinator: Arc<Mutex<RecoveryCoordinator>>,
+    inbox_events: broadcast::Sender<StoredMessage>,
     messages_path: PathBuf,
     pub messages: MessageStore,
+    prekey_maintenance: PreKeyMaintenanceState,
     pub running: bool,
 }
 
@@ -369,6 +458,215 @@ fn daemon_messages_path() -> PathBuf {
 fn merge_cli_fields_before_save(config: &mut Config) {
     if let Ok(fresh) = load_config() {
         config.aliases = fresh.aliases;
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct PreKeyMaintenanceSummary {
+    action: String,
+    #[serde(rename = "deviceId")]
+    device_id: String,
+    #[serde(rename = "oneTimePreKeysRemainingBefore")]
+    one_time_pre_keys_remaining_before: usize,
+    #[serde(rename = "signedPreKeyAgeMsBefore")]
+    signed_pre_key_age_ms_before: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct PreKeyMaintenanceState {
+    enabled: bool,
+    #[serde(rename = "intervalMs")]
+    interval_ms: u64,
+    #[serde(rename = "lastCheckedAt")]
+    last_checked_at: Option<u64>,
+    #[serde(rename = "lastAction")]
+    last_action: Option<String>,
+    #[serde(rename = "lastChangedAt")]
+    last_changed_at: Option<u64>,
+    #[serde(rename = "lastRepublishedAt")]
+    last_republished_at: Option<u64>,
+    #[serde(rename = "lastError")]
+    last_error: Option<String>,
+}
+
+impl Default for PreKeyMaintenanceState {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_ms: PREKEY_MAINTENANCE_INTERVAL_MS,
+            last_checked_at: None,
+            last_action: None,
+            last_changed_at: None,
+            last_republished_at: None,
+            last_error: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreKeyMaintenanceRunResult {
+    checked_at: u64,
+    summary: Option<PreKeyMaintenanceSummary>,
+    republished: bool,
+    republish_error: Option<String>,
+}
+
+fn maintain_current_device_prekey_health(
+    config: &mut Config,
+    checked_at: u64,
+) -> Result<Option<PreKeyMaintenanceSummary>> {
+    let identity = config
+        .identity
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("No identity found"))?
+        .clone();
+    let keypair = KeyPair::from_hex(&identity.private_key)?;
+    let e2e = config
+        .e2e
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("No E2E configuration found"))?;
+    let current_device = current_device_state(&e2e)?.clone();
+    let one_time_pre_keys_remaining = current_device
+        .one_time_pre_keys
+        .iter()
+        .filter(|key| key.claimed_at.is_none())
+        .count();
+    let signed_pre_key_age_ms = checked_at.saturating_sub(current_device.signed_pre_key.created_at);
+
+    if signed_pre_key_age_ms >= STALE_SIGNED_PREKEY_AGE_MS {
+        config.e2e = Some(rotate_local_device_signed_pre_key(
+            &keypair,
+            &e2e,
+            &e2e.current_device_id,
+            None,
+            None,
+            Some(checked_at),
+        )?);
+        return Ok(Some(PreKeyMaintenanceSummary {
+            action: "rotate-signed-prekey".to_string(),
+            device_id: e2e.current_device_id,
+            one_time_pre_keys_remaining_before: one_time_pre_keys_remaining,
+            signed_pre_key_age_ms_before: signed_pre_key_age_ms,
+        }));
+    }
+
+    if one_time_pre_keys_remaining <= LOW_ONE_TIME_PREKEY_THRESHOLD {
+        config.e2e = Some(resupply_local_device_one_time_pre_keys(
+            &e2e,
+            &e2e.current_device_id,
+            None,
+            Some(checked_at),
+        )?);
+        return Ok(Some(PreKeyMaintenanceSummary {
+            action: "resupply-otks".to_string(),
+            device_id: e2e.current_device_id,
+            one_time_pre_keys_remaining_before: one_time_pre_keys_remaining,
+            signed_pre_key_age_ms_before: signed_pre_key_age_ms,
+        }));
+    }
+
+    Ok(None)
+}
+
+fn apply_prekey_maintenance_result(
+    state: &mut PreKeyMaintenanceState,
+    result: &PreKeyMaintenanceRunResult,
+) {
+    state.last_checked_at = Some(result.checked_at);
+    state.last_action = Some(
+        result
+            .summary
+            .as_ref()
+            .map(|summary| summary.action.clone())
+            .unwrap_or_else(|| "none".to_string()),
+    );
+    if result.summary.is_some() {
+        state.last_changed_at = Some(result.checked_at);
+    }
+    if result.republished {
+        state.last_republished_at = Some(result.checked_at);
+    }
+    state.last_error = result.republish_error.clone();
+}
+
+fn record_prekey_maintenance_failure(
+    state: &mut PreKeyMaintenanceState,
+    checked_at: u64,
+    error: &str,
+) {
+    state.last_checked_at = Some(checked_at);
+    state.last_error = Some(error.to_string());
+}
+
+async fn publish_discovery_state_for_config(config: &Config) -> Result<()> {
+    let identity = config
+        .identity
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("No identity found"))?;
+    let keypair = KeyPair::from_hex(&identity.private_key)?;
+    let card = build_agent_card_from_config(config, identity)?;
+    let (mut session, _relay_url) =
+        connect_first_available(None, Some(config), &identity.did, &card, &keypair).await?;
+    let publish_result = session.publish_card().await;
+    let _ = session.goodbye().await;
+    publish_result
+}
+
+async fn run_prekey_maintenance_cycle(
+    state: Arc<RwLock<DaemonState>>,
+    republish_if_published: bool,
+) -> Result<PreKeyMaintenanceRunResult> {
+    let checked_at = now_ms();
+    let outcome: Result<(
+        Option<PreKeyMaintenanceSummary>,
+        Config,
+        bool,
+        Option<String>,
+    )> = async {
+        let (summary, next_config) = with_locked_config_transaction(|mut config| async move {
+            ensure_local_e2e_config(&mut config)?;
+            let summary = maintain_current_device_prekey_health(&mut config, checked_at)?;
+            Ok((summary, config))
+        })
+        .await?;
+
+        let mut republished = false;
+        let mut republish_error = None::<String>;
+        if republish_if_published && next_config.published == Some(true) && summary.is_some() {
+            if let Err(error) = publish_discovery_state_for_config(&next_config).await {
+                republish_error = Some(error.to_string());
+            } else {
+                republished = true;
+            }
+        }
+
+        Ok((summary, next_config, republished, republish_error))
+    }
+    .await;
+
+    match outcome {
+        Ok((summary, next_config, republished, republish_error)) => {
+            let result = PreKeyMaintenanceRunResult {
+                checked_at,
+                summary,
+                republished,
+                republish_error,
+            };
+            let mut state_guard = state.write().await;
+            state_guard.config = next_config;
+            apply_prekey_maintenance_result(&mut state_guard.prekey_maintenance, &result);
+            Ok(result)
+        }
+        Err(error) => {
+            let error_message = error.to_string();
+            let mut state_guard = state.write().await;
+            record_prekey_maintenance_failure(
+                &mut state_guard.prekey_maintenance,
+                checked_at,
+                &error_message,
+            );
+            Err(error)
+        }
     }
 }
 
@@ -397,8 +695,11 @@ fn persist_messages(state: &DaemonState) {
 }
 
 fn store_message(state: &mut DaemonState, message: StoredMessage) {
-    state.messages.store(message);
+    state.messages.store(message.clone());
     persist_messages(state);
+    if message.direction == MessageDirection::Inbound {
+        let _ = state.inbox_events.send(message);
+    }
 }
 
 fn mark_message_read(state: &mut DaemonState, message_id: &str) -> bool {
@@ -1130,6 +1431,21 @@ struct PendingSendBatch {
     accepted_config: Option<Config>,
 }
 
+pub(crate) fn should_fallback_to_plaintext_delivery(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    message.starts_with("No Agent Card found for ")
+        || message.contains("does not publish any E2E devices")
+        || message.contains("No claimed pre-key bundle available")
+}
+
+pub(crate) fn can_fallback_to_plaintext_delivery(
+    delivery_mode: crate::commands::tell::DeliveryMode,
+    error: &anyhow::Error,
+) -> bool {
+    delivery_mode == crate::commands::tell::DeliveryMode::Preferred
+        && should_fallback_to_plaintext_delivery(error)
+}
+
 fn delivery_state_from_report_status(status: &str) -> E2EDeliveryState {
     match status {
         "delivered" => E2EDeliveryState::Delivered,
@@ -1153,6 +1469,19 @@ fn delivery_error_from_event_status(status: &str) -> Option<String> {
         "unknown_recipient" => Some("Recipient not found on relay".to_string()),
         _ => None,
     }
+}
+
+fn build_plaintext_send_batches(envelope: &Envelope) -> Result<(Value, Vec<PendingSendBatch>)> {
+    let envelope_json = serde_json::to_value(envelope)?;
+    let envelope_bytes = encode_envelope_bytes(envelope)?;
+    Ok((
+        envelope_json,
+        vec![PendingSendBatch {
+            envelope_bytes,
+            delivery: None,
+            accepted_config: None,
+        }],
+    ))
 }
 
 async fn send_envelope_via_worker(
@@ -1646,15 +1975,19 @@ impl DaemonServer {
     pub fn new(config: Config, _keypair: KeyPair, socket_path: &str) -> Self {
         let reachability_policy = resolve_reachability_policy(None, Some(&config));
         let messages_path = daemon_messages_path();
+        let (inbox_events, _) = broadcast::channel(256);
         let state = DaemonState {
             config,
             relay_runtime: ManagedRelayState::new(reachability_policy),
             relay_sender: None,
+            prekey_maintenance_stop: None,
             outbound_send_lock: Arc::new(Mutex::new(())),
             peer_session_locks: Arc::new(Mutex::new(HashMap::new())),
             recovery_coordinator: Arc::new(Mutex::new(RecoveryCoordinator::default())),
+            inbox_events,
             messages: load_persisted_message_store(&messages_path),
             messages_path,
+            prekey_maintenance: PreKeyMaintenanceState::default(),
             running: true,
         };
 
@@ -1673,6 +2006,15 @@ impl DaemonServer {
         let listener = UnixListener::bind(&self.socket_path)
             .with_context(|| format!("Failed to bind to socket {}", self.socket_path))?;
 
+        let prekey_maintenance =
+            run_prekey_maintenance_cycle(Arc::clone(&self.state), false).await?;
+        if let Some(summary) = &prekey_maintenance.summary {
+            eprintln!(
+                "Maintained current device pre-key health on daemon start: {}",
+                serde_json::to_string(summary).unwrap_or_else(|_| summary.action.clone())
+            );
+        }
+
         {
             let mut state = self.state.write().await;
             let identity = state
@@ -1688,10 +2030,12 @@ impl DaemonServer {
             let invite_token = resolve_relay_invite_token(None, Some(&state.config));
             let (relay_tx, relay_rx) = mpsc::channel(32);
             let (event_tx, event_rx) = mpsc::channel(128);
+            let (prekey_stop_tx, prekey_stop_rx) = oneshot::channel();
 
             state.relay_runtime.reset(reachability_policy.clone());
             let relay_runtime = state.relay_runtime.clone();
             state.relay_sender = Some(relay_tx);
+            state.prekey_maintenance_stop = Some(prekey_stop_tx);
 
             eprintln!(
                 "Daemon managing relays: {}",
@@ -1710,6 +2054,11 @@ impl DaemonServer {
             };
             tokio::spawn(async move {
                 runtime_run_relay_worker(relay_runtime, relay_rx, event_tx, worker_options).await;
+            });
+
+            let state_clone = Arc::clone(&self.state);
+            tokio::spawn(async move {
+                Self::run_prekey_maintenance_task(state_clone, prekey_stop_rx).await;
             });
         }
 
@@ -1737,6 +2086,47 @@ impl DaemonServer {
 
         let _ = std::fs::remove_file(&self.socket_path);
         Ok(())
+    }
+
+    async fn run_prekey_maintenance_task(
+        state: Arc<RwLock<DaemonState>>,
+        mut stop_rx: oneshot::Receiver<()>,
+    ) {
+        let mut ticker = interval(Duration::from_millis(PREKEY_MAINTENANCE_INTERVAL_MS));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        ticker.tick().await;
+
+        loop {
+            tokio::select! {
+                _ = &mut stop_rx => break,
+                _ = ticker.tick() => {
+                    if !state.read().await.running {
+                        break;
+                    }
+
+                    match run_prekey_maintenance_cycle(Arc::clone(&state), true).await {
+                        Ok(result) => {
+                            if let Some(summary) = &result.summary {
+                                eprintln!(
+                                    "Maintained current device pre-key health in background: {}",
+                                    serde_json::to_string(summary)
+                                        .unwrap_or_else(|_| summary.action.clone())
+                                );
+                            }
+                            if let Some(error) = &result.republish_error {
+                                eprintln!(
+                                    "Failed to republish discovery state after background pre-key maintenance: {}",
+                                    error
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!("Background pre-key maintenance failed: {}", error);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     async fn process_relay_worker_events(
@@ -2423,56 +2813,127 @@ impl DaemonServer {
     async fn handle_client(stream: UnixStream, state: Arc<RwLock<DaemonState>>) -> Result<()> {
         let (read_half, mut write_half) = stream.into_split();
         let mut reader = BufReader::new(read_half);
+        let mut inbox_events = {
+            let state_guard = state.read().await;
+            state_guard.inbox_events.subscribe()
+        };
+        let mut subscriptions = HashMap::<String, InboxFilterConfig>::new();
         let mut buf = String::new();
 
         loop {
-            buf.clear();
-            let n = reader.read_line(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
+            tokio::select! {
+                read_result = async {
+                    buf.clear();
+                    reader.read_line(&mut buf).await
+                } => {
+                    let n = read_result?;
+                    if n == 0 {
+                        break;
+                    }
 
-            let trimmed = buf.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
+                    let trimmed = buf.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
 
-            let request: Value = match serde_json::from_str(trimmed) {
-                Ok(v) => v,
-                Err(e) => {
-                    let error_response = json!({
-                        "id": "unknown",
-                        "success": false,
-                        "error": format!("Invalid JSON: {}", e),
+                    let request: Value = match serde_json::from_str(trimmed) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let error_response = json!({
+                                "id": "unknown",
+                                "success": false,
+                                "error": format!("Invalid JSON: {}", e),
+                            });
+                            let mut line = serde_json::to_string(&error_response)?;
+                            line.push('\n');
+                            write_half.write_all(line.as_bytes()).await?;
+                            continue;
+                        }
+                    };
+
+                    let request_id = request
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    let command = request
+                        .get("command")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let params = request.get("params").cloned().unwrap_or(Value::Null);
+
+                    let response = match command {
+                        "subscribe_inbox" => {
+                            let subscription_id = format!(
+                                "sub_{}",
+                                Uuid::new_v4().to_string().replace('-', "")
+                            );
+                            subscriptions.insert(
+                                subscription_id.clone(),
+                                InboxFilterConfig::from_params(&params),
+                            );
+                            Ok(json!({ "subscriptionId": subscription_id }))
+                        }
+                        "unsubscribe" => {
+                            params
+                                .get("subscriptionId")
+                                .and_then(|value| value.as_str())
+                                .map(str::trim)
+                                .filter(|value| !value.is_empty())
+                                .ok_or_else(|| anyhow::anyhow!("Missing subscriptionId parameter"))
+                                .and_then(|subscription_id| {
+                                    if subscriptions.remove(subscription_id).is_some() {
+                                        Ok(json!({ "subscriptionId": subscription_id }))
+                                    } else {
+                                        Err(anyhow::anyhow!("Unknown subscriptionId: {}", subscription_id))
+                                    }
+                                })
+                        }
+                        _ => Self::handle_command(command, params, Arc::clone(&state)).await,
+                    };
+                    let response_json = json!({
+                        "id": request_id,
+                        "success": response.is_ok(),
+                        "data": response.as_ref().ok().cloned().unwrap_or(Value::Null),
+                        "error": response.as_ref().err().map(|e| e.to_string()).unwrap_or_default(),
                     });
-                    let mut line = serde_json::to_string(&error_response)?;
+
+                    let mut line = serde_json::to_string(&response_json)?;
                     line.push('\n');
                     write_half.write_all(line.as_bytes()).await?;
-                    continue;
                 }
-            };
+                event = inbox_events.recv(), if !subscriptions.is_empty() => {
+                    match event {
+                        Ok(message) => {
+                            let config = {
+                                let state_guard = state.read().await;
+                                state_guard.config.clone()
+                            };
+                            for (subscription_id, filters) in &subscriptions {
+                                let filter_set = filters.as_filter_set();
+                                if !inbox_message_visible(&message, &config)
+                                    || !inbox_message_matches(&message, &filter_set)
+                                {
+                                    continue;
+                                }
 
-            let request_id = request
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            let command = request
-                .get("command")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let params = request.get("params").cloned().unwrap_or(Value::Null);
-
-            let response = Self::handle_command(command, params, Arc::clone(&state)).await;
-            let response_json = json!({
-                "id": request_id,
-                "success": response.is_ok(),
-                "data": response.as_ref().ok().cloned().unwrap_or(Value::Null),
-                "error": response.as_ref().err().map(|e| e.to_string()).unwrap_or_default(),
-            });
-
-            let mut line = serde_json::to_string(&response_json)?;
-            line.push('\n');
-            write_half.write_all(line.as_bytes()).await?;
+                                let event_json = json!({
+                                    "type": "event",
+                                    "event": "inbox",
+                                    "subscriptionId": subscription_id,
+                                    "data": message_to_inbox_json(&message),
+                                });
+                                let mut line = serde_json::to_string(&event_json)?;
+                                line.push('\n');
+                                write_half.write_all(line.as_bytes()).await?;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            continue;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }
         }
 
         Ok(())
@@ -2546,12 +3007,18 @@ impl DaemonServer {
 }
 
 async fn handle_stop(state: Arc<RwLock<DaemonState>>) -> Result<Value> {
-    let relay_sender = {
+    let (relay_sender, prekey_maintenance_stop) = {
         let mut state_guard = state.write().await;
         state_guard.running = false;
         state_guard.relay_runtime.mark_disconnected();
-        state_guard.relay_sender.clone()
+        (
+            state_guard.relay_sender.clone(),
+            state_guard.prekey_maintenance_stop.take(),
+        )
     };
+    if let Some(stop) = prekey_maintenance_stop {
+        let _ = stop.send(());
+    }
     if let Some(relay_sender) = relay_sender {
         let _ = relay_sender.send(RelayWorkerCommand::Stop).await;
     }
@@ -2603,15 +3070,50 @@ async fn handle_status(state: Arc<RwLock<DaemonState>>) -> Result<Value> {
     let known_relays = state_guard.relay_runtime.known_relays.clone();
     let reachability_policy = state_guard.relay_runtime.reachability_policy.clone();
     let relay_failures = state_guard.relay_runtime.failure_snapshot();
+    let e2e_health = if let Some(e2e) = state_guard.config.e2e.as_ref() {
+        if let Some(device) = e2e.devices.get(&e2e.current_device_id) {
+            json!({
+                "available": true,
+                "currentDeviceId": e2e.current_device_id,
+                "deviceCount": e2e.devices.len(),
+                "sessionCount": device.sessions.len(),
+                "oneTimePreKeysRemaining": device.one_time_pre_keys.iter().filter(|key| key.claimed_at.is_none()).count(),
+                "signedPreKeyAgeMs": now_ms().saturating_sub(device.signed_pre_key.created_at),
+            })
+        } else {
+            json!({
+                "available": false,
+                "currentDeviceId": e2e.current_device_id,
+                "deviceCount": e2e.devices.len(),
+                "sessionCount": 0,
+                "oneTimePreKeysRemaining": 0,
+                "signedPreKeyAgeMs": Value::Null,
+            })
+        }
+    } else {
+        json!({
+            "available": false,
+            "currentDeviceId": Value::Null,
+            "deviceCount": 0,
+            "sessionCount": 0,
+            "oneTimePreKeysRemaining": 0,
+            "signedPreKeyAgeMs": Value::Null,
+        })
+    };
 
     Ok(json!({
         "running": state_guard.running,
+        "runtime": "rust",
+        "socketPath": daemon_server_socket_path(),
         "connected": state_guard.relay_runtime.connected,
         "messages": state_guard.messages.len(),
+        "messageStoreLoaded": true,
         "relay": state_guard.relay_runtime.relay_url.clone(),
         "connectedRelays": connected_relays.clone(),
         "knownRelays": known_relays.clone(),
         "peerCount": state_guard.messages.peer_count(),
+        "e2eHealth": e2e_health,
+        "preKeyMaintenance": state_guard.prekey_maintenance.clone(),
         "reachabilityPolicy": reachability_policy.clone(),
         "reachabilityStatus": {
             "connectedProviders": connected_relays,
@@ -2631,70 +3133,14 @@ async fn handle_status(state: Arc<RwLock<DaemonState>>) -> Result<Value> {
 
 async fn handle_inbox(params: Value, state: Arc<RwLock<DaemonState>>) -> Result<Value> {
     let state_guard = state.read().await;
-    let filter = params.get("filter");
     let limit = json_u64(
         params
             .get("limit")
             .or_else(|| params.get("pagination").and_then(|p| p.get("limit"))),
     )
     .unwrap_or(20) as usize;
-    let unread = params
-        .get("unread")
-        .or_else(|| filter.and_then(|f| f.get("unread")))
-        .or_else(|| filter.and_then(|f| f.get("unreadOnly")))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let thread_id = params
-        .get("threadId")
-        .or_else(|| filter.and_then(|f| f.get("threadId")))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let directions = json_string_filter(
-        params
-            .get("direction")
-            .or_else(|| filter.and_then(|f| f.get("direction"))),
-    );
-    let from_dids = json_string_filter(
-        params
-            .get("fromDid")
-            .or_else(|| filter.and_then(|f| f.get("fromDid"))),
-    );
-    let to_dids = json_string_filter(
-        params
-            .get("toDid")
-            .or_else(|| filter.and_then(|f| f.get("toDid"))),
-    );
-    let protocols = json_string_filter(
-        params
-            .get("protocol")
-            .or_else(|| filter.and_then(|f| f.get("protocol"))),
-    );
-    let envelope_types = json_string_filter(
-        params
-            .get("type")
-            .or_else(|| filter.and_then(|f| f.get("type"))),
-    );
-    let reply_tos = json_string_filter(
-        params
-            .get("replyTo")
-            .or_else(|| filter.and_then(|f| f.get("replyTo"))),
-    );
-    let statuses = json_string_filter(
-        params
-            .get("status")
-            .or_else(|| filter.and_then(|f| f.get("status"))),
-    );
-    let filters = InboxFilterSet {
-        unread_only: unread,
-        thread_id: thread_id.as_deref(),
-        directions: directions.as_ref(),
-        from_dids: from_dids.as_ref(),
-        to_dids: to_dids.as_ref(),
-        protocols: protocols.as_ref(),
-        envelope_types: envelope_types.as_ref(),
-        reply_tos: reply_tos.as_ref(),
-        statuses: statuses.as_ref(),
-    };
+    let filters = InboxFilterConfig::from_params(&params);
+    let filter_set = filters.as_filter_set();
 
     let mut selected = state_guard
         .messages
@@ -2702,7 +3148,7 @@ async fn handle_inbox(params: Value, state: Arc<RwLock<DaemonState>>) -> Result<
         .iter()
         .filter(|message| {
             inbox_message_visible(message, &state_guard.config)
-                && inbox_message_matches(message, &filters)
+                && inbox_message_matches(message, &filter_set)
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -2776,10 +3222,13 @@ async fn handle_send(params: Value, state: Arc<RwLock<DaemonState>>) -> Result<V
         return Err(peer_recovery_error(&to, &recovery));
     }
     let keypair = KeyPair::from_hex(&identity.private_key)?;
+    let delivery_mode = crate::commands::tell::DeliveryMode::parse(
+        params.get("deliveryMode").and_then(|value| value.as_str()),
+    )?;
 
     // Phase 2: Build envelope and E2E encrypt (no state lock held — allows
     // relay worker events to be processed concurrently).
-    let (message_id, thread_id, envelope_json, send_batches, initial_e2e) =
+    let (message_id, thread_id, envelope_json, send_batches, initial_e2e, delivery_path) =
         if let Some(envelope_hex) = params.get("envelope").and_then(|v| v.as_str()) {
             let bytes = hex::decode(envelope_hex).context("Invalid hex envelope")?;
             let envelope_json = parse_envelope_value(&bytes)?;
@@ -2792,6 +3241,15 @@ async fn handle_send(params: Value, state: Arc<RwLock<DaemonState>>) -> Result<V
                 .get("threadId")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
+            let delivery_path = if envelope_json
+                .get("protocol")
+                .and_then(|value| value.as_str())
+                == Some(E2E_APPLICATION_ENVELOPE_PROTOCOL)
+            {
+                "e2e"
+            } else {
+                "plaintext"
+            };
             (
                 message_id,
                 thread_id,
@@ -2802,6 +3260,7 @@ async fn handle_send(params: Value, state: Arc<RwLock<DaemonState>>) -> Result<V
                     accepted_config: None,
                 }],
                 None,
+                delivery_path,
             )
         } else {
             let msg_type = params
@@ -2831,9 +3290,39 @@ async fn handle_send(params: Value, state: Arc<RwLock<DaemonState>>) -> Result<V
                 crate::commands::tell::EnvelopeThreading::new(reply_to, thread_id.clone()),
                 &keypair,
             )?;
-            let (envelope_json, send_batches, initial_e2e) =
-                prepare_encrypted_send_batches_without_commit(&relay_url, &identity, envelope)
-                    .await?;
+            let (envelope_json, send_batches, initial_e2e, delivery_path) = match delivery_mode {
+                crate::commands::tell::DeliveryMode::Disabled => {
+                    let (envelope_json, send_batches) = build_plaintext_send_batches(&envelope)?;
+                    (envelope_json, send_batches, None, "plaintext")
+                }
+                crate::commands::tell::DeliveryMode::Required => {
+                    let (envelope_json, send_batches, initial_e2e) =
+                        prepare_encrypted_send_batches_without_commit(
+                            &relay_url, &identity, envelope,
+                        )
+                        .await?;
+                    (envelope_json, send_batches, Some(initial_e2e), "e2e")
+                }
+                crate::commands::tell::DeliveryMode::Preferred => {
+                    match prepare_encrypted_send_batches_without_commit(
+                        &relay_url,
+                        &identity,
+                        envelope.clone(),
+                    )
+                    .await
+                    {
+                        Ok((envelope_json, send_batches, initial_e2e)) => {
+                            (envelope_json, send_batches, Some(initial_e2e), "e2e")
+                        }
+                        Err(error) if can_fallback_to_plaintext_delivery(delivery_mode, &error) => {
+                            let (envelope_json, send_batches) =
+                                build_plaintext_send_batches(&envelope)?;
+                            (envelope_json, send_batches, None, "plaintext")
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+            };
             (
                 envelope_json
                     .get("id")
@@ -2843,7 +3332,8 @@ async fn handle_send(params: Value, state: Arc<RwLock<DaemonState>>) -> Result<V
                 thread_id,
                 envelope_json,
                 send_batches,
-                Some(initial_e2e),
+                initial_e2e,
+                delivery_path,
             )
         };
 
@@ -2868,6 +3358,7 @@ async fn handle_send(params: Value, state: Arc<RwLock<DaemonState>>) -> Result<V
 
     // Phase 4: Send via relay (no state lock — relay worker can process
     // incoming events freely while we await the send response).
+    let mut transport_status = String::from("accepted");
     for batch in send_batches {
         let PendingSendBatch {
             envelope_bytes,
@@ -2877,6 +3368,7 @@ async fn handle_send(params: Value, state: Arc<RwLock<DaemonState>>) -> Result<V
 
         match send_envelope_via_worker(&relay_sender, &to, envelope_bytes).await {
             Ok(outcome) => {
+                transport_status = outcome.status.clone();
                 if let Some(accepted_config) = accepted_config.as_ref() {
                     if let Err(error) = commit_e2e_state_after_accept(&state, accepted_config).await
                     {
@@ -2936,6 +3428,9 @@ async fn handle_send(params: Value, state: Arc<RwLock<DaemonState>>) -> Result<V
         "id": message_id,
         "messageId": message_id,
         "threadId": thread_id,
+        "deliveryMode": delivery_mode.as_str(),
+        "deliveryPath": delivery_path,
+        "transportStatus": transport_status,
     }))
 }
 
@@ -3505,12 +4000,29 @@ async fn handle_publish_card(params: Value, state: Arc<RwLock<DaemonState>>) -> 
     };
 
     next_config.agent_card = Some(next_card.clone());
+    let checked_at = now_ms();
+    let prekey_maintenance = maintain_current_device_prekey_health(&mut next_config, checked_at)?;
+    if let Some(summary) = &prekey_maintenance {
+        eprintln!(
+            "Maintained current device pre-key health before publish: {}",
+            serde_json::to_string(summary).unwrap_or_else(|_| summary.action.clone())
+        );
+    }
     merge_cli_fields_before_save(&mut next_config);
     save_config(&next_config)?;
 
     {
         let mut state_guard = state.write().await;
         state_guard.config = next_config.clone();
+        apply_prekey_maintenance_result(
+            &mut state_guard.prekey_maintenance,
+            &PreKeyMaintenanceRunResult {
+                checked_at,
+                summary: prekey_maintenance.clone(),
+                republished: false,
+                republish_error: None,
+            },
+        );
     }
 
     let keypair = KeyPair::from_hex(&identity.private_key)?;
@@ -3570,11 +4082,25 @@ async fn handle_query_card(params: Value, state: Arc<RwLock<DaemonState>>) -> Re
 async fn handle_reload_e2e(state: Arc<RwLock<DaemonState>>) -> Result<Value> {
     let (cancelled_replay_peers, cancelled_retry_peers) = clear_all_pending_recovery(&state).await;
     let cleared_recovering_peers = clear_all_peer_recoveries(&state).await;
-    let fresh_config = load_config()?;
-    let mut state_guard = state.write().await;
-    state_guard.config.e2e = fresh_config.e2e;
+    let prekey_maintenance = run_prekey_maintenance_cycle(Arc::clone(&state), true).await?;
+    let (device_id, session_count) = {
+        let state_guard = state.read().await;
+        let e2e = state_guard
+            .config
+            .e2e
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No E2E configuration found"))?;
+        let current_device = current_device_state(e2e)?;
+        (e2e.current_device_id.clone(), current_device.sessions.len())
+    };
+
     Ok(json!({
         "status": "reloaded",
+        "deviceId": device_id,
+        "sessionCount": session_count,
+        "preKeyMaintenance": prekey_maintenance.summary,
+        "republished": prekey_maintenance.republished,
+        "republishError": prekey_maintenance.republish_error,
         "cancelledReplayPeers": cancelled_replay_peers,
         "cancelledRetryPeers": cancelled_retry_peers,
         "clearedRecoveringPeers": cleared_recovering_peers,
@@ -3802,28 +4328,202 @@ impl DaemonClient {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_session_reset_ack_envelope, build_session_reset_envelope,
-        build_session_retry_envelope, clear_pending_peer_recovery, compute_local_interaction_score,
-        encode_envelope_bytes, get_peer_recovery_state, handle_e2e_reset_notify, handle_inbox,
-        handle_send, inbound_rejection_reason, DaemonState, PeerRecoveryState,
-        PendingDecryptFailure, PendingReplayRequest, RecoveryCoordinator, DEFAULT_JS_DAEMON_SOCKET,
-        DEFAULT_RS_DAEMON_SOCKET,
+        apply_prekey_maintenance_result, build_session_reset_ack_envelope,
+        build_session_reset_envelope, build_session_retry_envelope,
+        can_fallback_to_plaintext_delivery, clear_pending_peer_recovery,
+        compute_local_interaction_score, encode_envelope_bytes, get_peer_recovery_state,
+        handle_e2e_reset_notify, handle_inbox, handle_send, inbound_rejection_reason,
+        maintain_current_device_prekey_health, store_message, DaemonServer, DaemonState,
+        PeerRecoveryState, PendingDecryptFailure, PendingReplayRequest, PreKeyMaintenanceRunResult,
+        PreKeyMaintenanceState, PreKeyMaintenanceSummary, RecoveryCoordinator,
+        DEFAULT_JS_DAEMON_SOCKET, DEFAULT_RS_DAEMON_SOCKET, STALE_SIGNED_PREKEY_AGE_MS,
     };
+    use crate::commands::tell::DeliveryMode;
     use crate::config::{Config, IdentityConfig, TrustConfig};
     use crate::identity::KeyPair;
+    use quadra_a_core::e2e::ensure_local_e2e_config;
     use quadra_a_runtime::inbox::{parse_envelope_value, MessageDirection, StoredMessage};
     use quadra_a_runtime::relay_worker::{RelaySendOutcome, RelayWorkerCommand};
     use quadra_a_runtime::session_manager::ManagedRelayState;
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::Arc;
-    use tokio::sync::{mpsc, Mutex, RwLock};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+    use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
+
+    fn test_inbox_events() -> broadcast::Sender<StoredMessage> {
+        let (sender, _) = broadcast::channel(32);
+        sender
+    }
 
     #[test]
     fn default_constants_are_distinct() {
         assert_ne!(DEFAULT_RS_DAEMON_SOCKET, DEFAULT_JS_DAEMON_SOCKET);
         assert!(DEFAULT_RS_DAEMON_SOCKET.ends_with("-rs.sock"));
         assert!(!DEFAULT_JS_DAEMON_SOCKET.contains("-rs"));
+    }
+
+    #[test]
+    fn plaintext_fallback_requires_preferred_mode_and_known_e2e_prereq_errors() {
+        assert!(can_fallback_to_plaintext_delivery(
+            DeliveryMode::Preferred,
+            &anyhow::anyhow!("No Agent Card found for did:agent:zPeer"),
+        ));
+        assert!(!can_fallback_to_plaintext_delivery(
+            DeliveryMode::Required,
+            &anyhow::anyhow!("No Agent Card found for did:agent:zPeer"),
+        ));
+        assert!(!can_fallback_to_plaintext_delivery(
+            DeliveryMode::Preferred,
+            &anyhow::anyhow!("signature verification failed"),
+        ));
+    }
+
+    #[test]
+    fn maintain_current_device_prekey_health_resupplies_low_inventory_without_rotation() {
+        let keypair = KeyPair::generate();
+        let did = quadra_a_core::identity::derive_did(keypair.verifying_key.as_bytes());
+        let mut config = Config {
+            identity: Some(IdentityConfig {
+                did,
+                public_key: keypair.public_key_hex(),
+                private_key: keypair.private_key_hex(),
+            }),
+            ..Config::default()
+        };
+        ensure_local_e2e_config(&mut config).expect("e2e config created");
+        let device_id = config
+            .e2e
+            .as_ref()
+            .expect("e2e config present")
+            .current_device_id
+            .clone();
+        let device = config
+            .e2e
+            .as_mut()
+            .expect("e2e config present")
+            .devices
+            .get_mut(&device_id)
+            .expect("device present");
+        let signed_pre_key_id = device.signed_pre_key.signed_pre_key_id;
+        let signed_pre_key_public = device.signed_pre_key.public_key.clone();
+        device.one_time_pre_keys.truncate(2);
+        device.one_time_pre_keys[0].claimed_at = Some(111);
+
+        let summary = maintain_current_device_prekey_health(&mut config, 456789)
+            .expect("maintenance succeeds")
+            .expect("maintenance should run");
+        let next_device = config
+            .e2e
+            .as_ref()
+            .expect("e2e config present")
+            .devices
+            .get(&device_id)
+            .expect("device present");
+
+        assert_eq!(summary.action, "resupply-otks");
+        assert_eq!(summary.one_time_pre_keys_remaining_before, 1);
+        assert_eq!(next_device.one_time_pre_keys.len(), 16);
+        assert_eq!(
+            next_device.signed_pre_key.signed_pre_key_id,
+            signed_pre_key_id
+        );
+        assert_eq!(next_device.signed_pre_key.public_key, signed_pre_key_public);
+    }
+
+    #[test]
+    fn maintain_current_device_prekey_health_rotates_stale_signed_prekey() {
+        let keypair = KeyPair::generate();
+        let did = quadra_a_core::identity::derive_did(keypair.verifying_key.as_bytes());
+        let mut config = Config {
+            identity: Some(IdentityConfig {
+                did,
+                public_key: keypair.public_key_hex(),
+                private_key: keypair.private_key_hex(),
+            }),
+            ..Config::default()
+        };
+        ensure_local_e2e_config(&mut config).expect("e2e config created");
+        let device_id = config
+            .e2e
+            .as_ref()
+            .expect("e2e config present")
+            .current_device_id
+            .clone();
+        let current_device = config
+            .e2e
+            .as_mut()
+            .expect("e2e config present")
+            .devices
+            .get_mut(&device_id)
+            .expect("device present");
+        current_device.signed_pre_key.created_at = 1;
+        let signed_pre_key_id = current_device.signed_pre_key.signed_pre_key_id;
+
+        let summary =
+            maintain_current_device_prekey_health(&mut config, STALE_SIGNED_PREKEY_AGE_MS + 10)
+                .expect("maintenance succeeds")
+                .expect("maintenance should run");
+        let next_device = config
+            .e2e
+            .as_ref()
+            .expect("e2e config present")
+            .devices
+            .get(&device_id)
+            .expect("device present");
+
+        assert_eq!(summary.action, "rotate-signed-prekey");
+        assert!(next_device.signed_pre_key.signed_pre_key_id > signed_pre_key_id);
+        assert_eq!(next_device.one_time_pre_keys.len(), 16);
+    }
+
+    #[test]
+    fn apply_prekey_maintenance_result_tracks_last_change_and_republish_state() {
+        let mut state = PreKeyMaintenanceState::default();
+        apply_prekey_maintenance_result(
+            &mut state,
+            &PreKeyMaintenanceRunResult {
+                checked_at: 123,
+                summary: Some(PreKeyMaintenanceSummary {
+                    action: "resupply-otks".to_string(),
+                    device_id: "device-1".to_string(),
+                    one_time_pre_keys_remaining_before: 2,
+                    signed_pre_key_age_ms_before: 99,
+                }),
+                republished: true,
+                republish_error: None,
+            },
+        );
+
+        assert_eq!(state.last_checked_at, Some(123));
+        assert_eq!(state.last_action.as_deref(), Some("resupply-otks"));
+        assert_eq!(state.last_changed_at, Some(123));
+        assert_eq!(state.last_republished_at, Some(123));
+        assert_eq!(state.last_error, None);
+    }
+
+    #[test]
+    fn apply_prekey_maintenance_result_preserves_last_changed_at_when_no_rotation_occurs() {
+        let mut state = PreKeyMaintenanceState {
+            last_changed_at: Some(55),
+            ..PreKeyMaintenanceState::default()
+        };
+        apply_prekey_maintenance_result(
+            &mut state,
+            &PreKeyMaintenanceRunResult {
+                checked_at: 200,
+                summary: None,
+                republished: false,
+                republish_error: Some("republish failed".to_string()),
+            },
+        );
+
+        assert_eq!(state.last_checked_at, Some(200));
+        assert_eq!(state.last_action.as_deref(), Some("none"));
+        assert_eq!(state.last_changed_at, Some(55));
+        assert_eq!(state.last_republished_at, None);
+        assert_eq!(state.last_error.as_deref(), Some("republish failed"));
     }
 
     #[test]
@@ -3950,12 +4650,15 @@ mod tests {
             config,
             relay_runtime,
             relay_sender: Some(relay_tx),
+            prekey_maintenance_stop: None,
             outbound_send_lock: Arc::new(Mutex::new(())),
             peer_session_locks: Arc::new(Mutex::new(HashMap::new())),
             recovery_coordinator: Arc::new(Mutex::new(RecoveryCoordinator::default())),
+            inbox_events: test_inbox_events(),
             messages_path: std::env::temp_dir()
                 .join(format!("a4-daemon-messages-{}.json", uuid::Uuid::new_v4())),
             messages: quadra_a_runtime::inbox::MessageStore::default(),
+            prekey_maintenance: PreKeyMaintenanceState::default(),
             running: true,
         }));
 
@@ -4036,12 +4739,15 @@ mod tests {
                 quadra_a_core::config::ReachabilityPolicy::default(),
             ),
             relay_sender: None,
+            prekey_maintenance_stop: None,
             outbound_send_lock: Arc::new(Mutex::new(())),
             peer_session_locks: Arc::new(Mutex::new(HashMap::new())),
             recovery_coordinator: Arc::new(Mutex::new(RecoveryCoordinator::default())),
+            inbox_events: test_inbox_events(),
             messages_path: std::env::temp_dir()
                 .join(format!("a4-daemon-messages-{}.json", uuid::Uuid::new_v4())),
             messages: quadra_a_runtime::inbox::MessageStore::default(),
+            prekey_maintenance: PreKeyMaintenanceState::default(),
             running: true,
         }));
 
@@ -4101,12 +4807,15 @@ mod tests {
                 quadra_a_core::config::ReachabilityPolicy::default(),
             ),
             relay_sender: None,
+            prekey_maintenance_stop: None,
             outbound_send_lock: Arc::new(Mutex::new(())),
             peer_session_locks: Arc::new(Mutex::new(HashMap::new())),
             recovery_coordinator: Arc::new(Mutex::new(RecoveryCoordinator::default())),
+            inbox_events: test_inbox_events(),
             messages_path: std::env::temp_dir()
                 .join(format!("a4-daemon-messages-{}.json", uuid::Uuid::new_v4())),
             messages: quadra_a_runtime::inbox::MessageStore::default(),
+            prekey_maintenance: PreKeyMaintenanceState::default(),
             running: true,
         }));
 
@@ -4198,12 +4907,15 @@ mod tests {
                 quadra_a_core::config::ReachabilityPolicy::default(),
             ),
             relay_sender: None,
+            prekey_maintenance_stop: None,
             outbound_send_lock: Arc::new(Mutex::new(())),
             peer_session_locks: Arc::new(Mutex::new(HashMap::new())),
             recovery_coordinator: Arc::new(Mutex::new(RecoveryCoordinator::default())),
+            inbox_events: test_inbox_events(),
             messages_path: std::env::temp_dir()
                 .join(format!("a4-daemon-messages-{}.json", uuid::Uuid::new_v4())),
             messages: quadra_a_runtime::inbox::MessageStore::default(),
+            prekey_maintenance: PreKeyMaintenanceState::default(),
             running: true,
         }));
 
@@ -4282,12 +4994,15 @@ mod tests {
                 quadra_a_core::config::ReachabilityPolicy::default(),
             ),
             relay_sender: None,
+            prekey_maintenance_stop: None,
             outbound_send_lock: Arc::new(Mutex::new(())),
             peer_session_locks: Arc::new(Mutex::new(HashMap::new())),
             recovery_coordinator: Arc::new(Mutex::new(RecoveryCoordinator::default())),
+            inbox_events: test_inbox_events(),
             messages_path: std::env::temp_dir()
                 .join(format!("a4-daemon-messages-{}.json", uuid::Uuid::new_v4())),
             messages: quadra_a_runtime::inbox::MessageStore::default(),
+            prekey_maintenance: PreKeyMaintenanceState::default(),
             running: true,
         }));
 
@@ -4346,5 +5061,108 @@ mod tests {
             .expect("messages array present");
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["id"], "msg-outbound");
+    }
+
+    #[tokio::test]
+    async fn subscribe_inbox_streams_matching_inbound_messages() {
+        let state = Arc::new(RwLock::new(DaemonState {
+            config: Config::default(),
+            relay_runtime: ManagedRelayState::new(
+                quadra_a_core::config::ReachabilityPolicy::default(),
+            ),
+            relay_sender: None,
+            prekey_maintenance_stop: None,
+            outbound_send_lock: Arc::new(Mutex::new(())),
+            peer_session_locks: Arc::new(Mutex::new(HashMap::new())),
+            recovery_coordinator: Arc::new(Mutex::new(RecoveryCoordinator::default())),
+            inbox_events: test_inbox_events(),
+            messages_path: std::env::temp_dir()
+                .join(format!("a4-daemon-messages-{}.json", uuid::Uuid::new_v4())),
+            messages: quadra_a_runtime::inbox::MessageStore::default(),
+            prekey_maintenance: PreKeyMaintenanceState::default(),
+            running: true,
+        }));
+
+        let (client_stream, server_stream) = UnixStream::pair().expect("unix stream pair");
+        let server_task = tokio::spawn(DaemonServer::handle_client(
+            server_stream,
+            Arc::clone(&state),
+        ));
+
+        let (read_half, mut write_half) = client_stream.into_split();
+        let mut reader = BufReader::new(read_half);
+        let request = json!({
+            "id": "req-sub-1",
+            "command": "subscribe_inbox",
+            "params": {
+                "filter": {
+                    "direction": "inbound",
+                    "type": "message",
+                    "status": "pending"
+                }
+            }
+        });
+        let mut line = serde_json::to_string(&request).expect("subscription request serializes");
+        line.push('\n');
+        write_half
+            .write_all(line.as_bytes())
+            .await
+            .expect("subscription request writes");
+
+        let mut ack_line = String::new();
+        reader
+            .read_line(&mut ack_line)
+            .await
+            .expect("ack line reads");
+        let ack: serde_json::Value =
+            serde_json::from_str(ack_line.trim()).expect("ack parses as json");
+        assert_eq!(ack["success"], true);
+        let subscription_id = ack["data"]["subscriptionId"]
+            .as_str()
+            .expect("subscription id present")
+            .to_string();
+
+        {
+            let mut guard = state.write().await;
+            store_message(
+                &mut guard,
+                StoredMessage {
+                    id: "msg-sub-1".to_string(),
+                    from: "did:agent:peer".to_string(),
+                    to: "did:agent:me".to_string(),
+                    envelope: json!({
+                        "id": "msg-sub-1",
+                        "type": "message",
+                        "protocol": "/agent/msg/1.0.0",
+                        "payload": { "text": "hello" }
+                    }),
+                    timestamp: 1,
+                    thread_id: None,
+                    read: false,
+                    direction: MessageDirection::Inbound,
+                    e2e: None,
+                },
+            );
+        }
+
+        let mut event_line = String::new();
+        reader
+            .read_line(&mut event_line)
+            .await
+            .expect("event line reads");
+        let event: serde_json::Value =
+            serde_json::from_str(event_line.trim()).expect("event parses as json");
+        assert_eq!(event["type"], "event");
+        assert_eq!(event["event"], "inbox");
+        assert_eq!(event["subscriptionId"], subscription_id);
+        assert_eq!(event["data"]["id"], "msg-sub-1");
+        assert_eq!(event["data"]["direction"], "inbound");
+        assert_eq!(event["data"]["status"], "pending");
+
+        drop(write_half);
+        server_task
+            .await
+            .expect("server task joins")
+            .expect("server exits cleanly");
     }
 }

@@ -12,7 +12,7 @@ This repository is the main command-line surface for connecting to the network, 
 - `agent find` and `agent publish` cover discovery workflows
 - `agent tell` is the primary messaging command; legacy `send` and `discover` commands remain for compatibility
 - `agent trace <message-id>` reconstructs local queue, handoff, and reply state for one message
-- `agent inbox`, `alias`, `sessions`, `score`, `vouch`, and `endorsements` expose the broader local workflow surface
+- `agent inbox`, `alias`, `sessions`, `prekeys`, `score`, `vouch`, and `endorsements` expose the broader local workflow surface
 
 ## Quick start
 
@@ -62,10 +62,13 @@ agent inbox --unread --limit 20
 
 ```bash
 agent status
+agent prekeys --json
 agent peers
 agent serve --on echo --exec ./handler.sh --public
 agent stop
 ```
+
+The daemon now keeps local pre-key inventory healthy in the background: low one-time pre-key inventory is replenished automatically, stale signed pre-keys are rotated automatically, and `agent status --json` exposes the last maintenance check under `daemon.preKeyMaintenance`.
 
 `agent serve` runs your handler with the incoming message `payload` JSON on `stdin`, not the full message envelope. If the handler writes a JSON object to `stdout`, that object is sent back as the reply payload. If `stdout` is plain text, the CLI wraps it as `{"result":"<stdout>"}`. Non-zero exit codes send `HANDLER_ERROR`; timeouts send `TIMEOUT`.
 
