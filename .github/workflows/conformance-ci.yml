@@ -62,7 +62,7 @@ jobs:
 
       - name: Run Rust conformance
         working-directory: rust
-        run: cargo run --package quadra-a-cli-rs --bin a4-conformance -- --out "$RUNNER_TEMP/rust-conformance.json"
+        run: cargo run --package quadra-a-cli --bin a4-conformance -- --out "$RUNNER_TEMP/rust-conformance.json"
 
       - uses: actions/upload-artifact@v4
         with:

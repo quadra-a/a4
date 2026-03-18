@@ -1,5 +1,5 @@
 use anyhow::Result;
-use quadra_a_cli_rs::conformance::{default_spec_root, ensure_report_passes, run};
+use quadra_a_cli::conformance::{default_spec_root, ensure_report_passes, run};
 use std::path::PathBuf;
 
 fn parse_arg(flag: &str) -> Option<PathBuf> {
@@ -12,7 +12,7 @@ fn parse_arg(flag: &str) -> Option<PathBuf> {
     None
 }
 
-fn output_report(report: &quadra_a_cli_rs::conformance::ConformanceReport) -> Result<()> {
+fn output_report(report: &quadra_a_cli::conformance::ConformanceReport) -> Result<()> {
     if let Some(path) = parse_arg("--out") {
         std::fs::write(&path, serde_json::to_vec_pretty(report)?)?;
     } else {

@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use quadra_a_cli_rs::commands;
+use quadra_a_cli::commands;
 use std::env;
 
 const SERVE_AFTER_HELP: &str = "\

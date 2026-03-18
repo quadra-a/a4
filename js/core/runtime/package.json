@@ -39,6 +39,7 @@
     "prepack": "pnpm build"
   },
   "dependencies": {
+    "@noble/hashes": "^1.8.0",
     "conf": "^13.0.1",
     "@quadra-a/protocol": "workspace:*"
   },

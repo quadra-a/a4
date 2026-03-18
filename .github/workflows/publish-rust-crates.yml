@@ -73,7 +73,7 @@ jobs:
       - name: Wait for quadra-a-runtime index propagation
         run: sleep 30
 
-      - name: Publish quadra-a-cli-rs
-        run: cargo publish -p quadra-a-cli-rs --locked --token "${CRATES_IO_TOKEN}"
+      - name: Publish quadra-a-cli
+        run: cargo publish -p quadra-a-cli --locked --token "${CRATES_IO_TOKEN}"
         env:
           CRATES_IO_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}

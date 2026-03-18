@@ -108,7 +108,7 @@ Rust `LocalE2EConfig` 现在允许 `{}` 反序列化，并增加了统一的 `is
 - `pnpm --filter @quadra-a/runtime build`
 - `pnpm --filter @quadra-a/relay build`
 - `cargo test -p quadra-a-runtime`
-- `cargo test -p quadra-a-cli-rs`
+- `cargo test -p quadra-a-cli`
 - 本机 `1 relay + 2 Rust agent` 实测：ratchet mismatch 后，receiver 发送 `e2e/session-retry`，sender 自动 replay 原业务消息成功
 
 ### 8. Relay ACK / delivery 语义已修复

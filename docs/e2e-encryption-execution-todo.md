@@ -39,7 +39,7 @@ This document turns the agreed E2E direction into an implementation checklist th
   - `cargo test -p quadra-a-runtime publish_prekey_bundles_sends_expected_payload -- --nocapture` from `rust` ✅
   - `cargo test -p quadra-a-runtime fetch_prekey_bundle_returns_claimed_bundle_and_null_after_exhaustion -- --nocapture` from `rust` ✅
   - `pnpm exec vitest run src/e2e-send.test.ts` from `js/core/runtime` ✅
-  - `cargo check -p quadra-a-runtime -p quadra-a-cli-rs` from `rust` ✅
+  - `cargo check -p quadra-a-runtime -p quadra-a-cli` from `rust` ✅
   - `cargo test -p quadra-a-runtime e2e_send:: -- --nocapture` from `rust` ✅
   - `cargo test -p quadra-a-runtime inbox:: -- --nocapture` from `rust` ✅
   - `cargo test -p quadra-a-runtime publish_prekey_bundles_preserves_interleaved_deliver_messages -- --nocapture` from `rust` ✅

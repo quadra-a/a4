@@ -61,4 +61,4 @@ cargo package --workspace
 
 - npm publishing is performed with `pnpm publish`, not `npm publish`, so workspace dependencies are rewritten to concrete published versions inside packed manifests.
 - `rust/Cargo.lock` is expected to be committed so `--locked` release builds are reproducible.
-- Rust crate publishing is ordered `quadra-a-core` → `quadra-a-runtime` → `quadra-a-cli-rs` because the later crates depend on the earlier ones.
+- Rust crate publishing is ordered `quadra-a-core` → `quadra-a-runtime` → `quadra-a-cli` because the later crates depend on the earlier ones.

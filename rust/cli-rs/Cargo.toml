@@ -1,5 +1,5 @@
 [package]
-name = "quadra-a-cli-rs"
+name = "quadra-a-cli"
 version = "0.1.0-beta.1"
 edition = "2021"
 description = "Rust CLI for the quadra-a agent network"
