@@ -22,7 +22,6 @@ What it is NOT: task orchestration, payments, agent runtime, compute marketplace
 ## Specification
 
 See [docs/specification.md](docs/specification.md) for the protocol spec and [docs/e2e-operations.md](docs/e2e-operations.md) for the current E2E boundary, relay-visible metadata, and pre-key health signals.
-See [docs/architecture-optimization-2026-03-15.md](docs/architecture-optimization-2026-03-15.md) for a non-normative architecture review and optimization roadmap.
 
 ## Quick Start
 

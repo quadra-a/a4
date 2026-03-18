@@ -1,0 +1,14 @@
+[book]
+title = "quadra-a Documentation"
+description = "Agent identity, discovery, and secure messaging infrastructure"
+authors = ["quadra-a contributors"]
+language = "en"
+src = "."
+
+[build]
+build-dir = "../docs-build"
+
+[output.html]
+git-repository-url = "https://github.com/quadra-a/a4"
+edit-url-template = "https://github.com/quadra-a/a4/edit/main/docs/{path}"
+no-section-label = true

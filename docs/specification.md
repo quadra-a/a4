@@ -280,6 +280,7 @@ An agent opens a WebSocket connection and sends a `HELLO` frame.
 | `card` | Signed `AgentCard` for that DID |
 | `timestamp` | Current client time in Unix ms |
 | `signature` | Signature over the `HELLO` payload defined in §7.4 |
+| `extensions` | Optional list of client extension identifiers |
 | `inviteToken` | Optional or required on private relays |
 
 Relay requirements:
@@ -366,6 +367,7 @@ Agent-facing routing messages:
 
 Delivery report statuses currently include:
 
+- `accepted`
 - `delivered`
 - `expired`
 - `queue_full`
@@ -419,6 +421,8 @@ Both are CBOR objects with `version = 1` and a typed payload.
 
 Stable fields in `PREKEY_MESSAGE`:
 
+- `version` (currently `1`)
+- `type` (`"PREKEY_MESSAGE"`)
 - `senderDid`
 - `receiverDid`
 - `senderDeviceId`
@@ -434,6 +438,8 @@ Stable fields in `PREKEY_MESSAGE`:
 
 Stable fields in `SESSION_MESSAGE`:
 
+- `version` (currently `1`)
+- `type` (`"SESSION_MESSAGE"`)
 - `senderDid`
 - `receiverDid`
 - `senderDeviceId`
