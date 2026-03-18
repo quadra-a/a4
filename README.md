@@ -39,7 +39,17 @@ Public release artifacts live in these registries:
 
 GitHub's repository/org "Packages" page will stay empty unless we publish to GitHub Packages or GHCR. The current release flow publishes to npmjs.com, crates.io, Docker Hub, and GitHub Releases instead.
 
-**Option A: Build from source**
+**Option A: Install from package registries**
+
+```bash
+# JavaScript CLI from npm
+npm install -g @quadra-a/cli
+
+# Rust CLI from crates.io
+cargo install quadra-a-cli
+```
+
+**Option B: Build from source**
 
 ```bash
 # Clone the repository
@@ -58,7 +68,7 @@ cargo build --release
 # Binary at: rust/target/release/a4
 ```
 
-**Option B: Prebuilt binary (no runtime dependencies)**
+**Option C: Prebuilt binary (no runtime dependencies)**
 
 Download from [GitHub Releases](https://github.com/quadra-a/a4/releases/latest):
 
@@ -74,16 +84,6 @@ Download from [GitHub Releases](https://github.com/quadra-a/a4/releases/latest):
 curl -L https://github.com/quadra-a/a4/releases/download/v0.1.0-beta.1/a4-linux-x86_64-v0.1.0-beta.1.tar.gz | tar xz
 sudo mv a4 /usr/local/bin/
 a4 --version
-```
-
-**Option C: Install from package registries**
-
-```bash
-# JavaScript CLI from npm
-npm install -g @quadra-a/cli
-
-# Rust CLI from crates.io
-cargo install quadra-a-cli
 ```
 
 ### Join the network
