@@ -28,6 +28,17 @@ See [docs/architecture-optimization-2026-03-15.md](docs/architecture-optimizatio
 
 ### Install
 
+### Package registries
+
+Public release artifacts live in these registries:
+
+- npm packages: `@quadra-a/cli`, `@quadra-a/protocol`, `@quadra-a/runtime`, `@quadra-a/mcp-server`, `@quadra-a/relay`
+- crates.io: `quadra-a-cli`, `quadra-a-core`, `quadra-a-runtime`
+- Docker Hub: `quadraa/relay`
+- GitHub Releases: prebuilt `a4` binaries
+
+GitHub's repository/org "Packages" page will stay empty unless we publish to GitHub Packages or GHCR. The current release flow publishes to npmjs.com, crates.io, Docker Hub, and GitHub Releases instead.
+
 **Option A: Build from source**
 
 ```bash
@@ -53,16 +64,26 @@ Download from [GitHub Releases](https://github.com/quadra-a/a4/releases/latest):
 
 | Platform | File |
 |----------|------|
-| Linux x86_64 (CentOS 7+, Ubuntu 16.04+) | `a4-linux-x86_64.tar.gz` |
-| Linux ARM64 | `a4-linux-aarch64.tar.gz` |
-| macOS Intel | `a4-macos-x86_64.tar.gz` |
-| macOS Apple Silicon | `a4-macos-aarch64.tar.gz` |
+| Linux x86_64 (CentOS 7+, Ubuntu 16.04+) | `a4-linux-x86_64-v<version>.tar.gz` |
+| Linux ARM64 | `a4-linux-aarch64-v<version>.tar.gz` |
+| macOS Intel | `a4-macos-x86_64-v<version>.tar.gz` |
+| macOS Apple Silicon | `a4-macos-aarch64-v<version>.tar.gz` |
 
 ```bash
-# Example: Linux x86_64
-curl -L https://github.com/quadra-a/a4/releases/latest/download/a4-linux-x86_64.tar.gz | tar xz
+# Example: Linux x86_64 beta
+curl -L https://github.com/quadra-a/a4/releases/download/v0.1.0-beta.1/a4-linux-x86_64-v0.1.0-beta.1.tar.gz | tar xz
 sudo mv a4 /usr/local/bin/
 a4 --version
+```
+
+**Option C: Install from package registries**
+
+```bash
+# JavaScript CLI from npm
+npm install -g @quadra-a/cli
+
+# Rust CLI from crates.io
+cargo install quadra-a-cli
 ```
 
 ### Join the network
@@ -184,7 +205,7 @@ a4/
     mcp-server/    # MCP server for Claude integration
     relay/         # WebSocket relay server (~700 lines)
   rust/
-    cli-rs/        # Rust CLI (static binary, no runtime deps)
+    cli-rs/        # Rust crate quadra-a-cli and the a4 binary
 ```
 
 ## Development
@@ -207,12 +228,9 @@ cargo --manifest-path rust/Cargo.toml build --release
 
 ### Release tags
 
-- `protocol-v*` — Core protocol package
-- `runtime-v*` — Runtime helpers package
-- `cli-v*` — TypeScript CLI package
-- `mcp-server-v*` — MCP server package
-- `relay-v*` — Relay server package
-- `cli-rs-v*` — Rust CLI package
+- Use one coordinated tag such as `v0.1.0-beta.1`.
+- That single tag publishes npm packages, Rust crates, Rust release artifacts, and the relay Docker image.
+- GitHub Packages is not part of the current release surface.
 
 ## Status
 
@@ -223,7 +241,7 @@ cargo --manifest-path rust/Cargo.toml build --release
 | Relay Architecture (replace libp2p with WebSocket relay) | ✅ Complete |
 | Semantic CLI (a4 as command language) | ✅ Complete |
 | Async-First Messaging (tell + inbox) | ✅ Complete |
-| Distribution (MCP server + npm packages) | 🔜 In progress |
+| Distribution (npm + crates.io + Docker + release artifacts) | ✅ Beta published |
 
 **Performance:** Cold start <1s, discovery <200ms, zero infrastructure dependencies.
 
