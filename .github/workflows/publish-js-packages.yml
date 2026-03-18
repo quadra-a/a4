@@ -97,11 +97,11 @@ jobs:
       - name: Verify publish tarballs
         run: |
           mkdir -p "$RUNNER_TEMP/npm-packs"
-          pnpm --filter ./core/protocol pack --pack-destination "$RUNNER_TEMP/npm-packs"
-          pnpm --filter ./core/runtime pack --pack-destination "$RUNNER_TEMP/npm-packs"
-          pnpm --filter ./cli pack --pack-destination "$RUNNER_TEMP/npm-packs"
-          pnpm --filter ./mcp-server pack --pack-destination "$RUNNER_TEMP/npm-packs"
-          pnpm --filter ./relay pack --pack-destination "$RUNNER_TEMP/npm-packs"
+          pnpm --dir core/protocol pack --pack-destination "$RUNNER_TEMP/npm-packs"
+          pnpm --dir core/runtime pack --pack-destination "$RUNNER_TEMP/npm-packs"
+          pnpm --dir cli pack --pack-destination "$RUNNER_TEMP/npm-packs"
+          pnpm --dir mcp-server pack --pack-destination "$RUNNER_TEMP/npm-packs"
+          pnpm --dir relay pack --pack-destination "$RUNNER_TEMP/npm-packs"
 
       - name: Publish @quadra-a/protocol
         run: pnpm --filter ./core/protocol publish --access public --tag "${{ steps.release.outputs.npm_tag }}" --no-git-checks
